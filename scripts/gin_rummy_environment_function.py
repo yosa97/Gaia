@@ -47,6 +47,12 @@ DRAW_UPCARD_PENALTY = 0.02  # mild penalty when model draws upcard with no deadw
 CURRICULUM_INITIAL_MCTS_SIMS = 10   # easy opponent during early turn curriculum
 CURRICULUM_FINAL_MCTS_SIMS   = 50   # matches MCTS_CONFIG target at full curriculum
 
+# Curriculum turn progression
+CURRICULUM_INITIAL_MAX_TURN    = 5    # gin needs 10+ turns to complete; start at 5 for early signal
+CURRICULUM_FINAL_MAX_TURN      = 30   # full gin rummy game length
+CURRICULUM_ROLLOUTS_PER_STAGE  = 64   # advance 1 turn every ~5 optimizer steps at batch-size 14
+CURRICULUM_WARMUP_ROLLOUTS     = 0    # no warmup burn; start advancing from step 0
+
 # Comprehensive win strategy hint injected into early episodes (fades to 0 by end)
 _HINT_PROMPT = (
     "\n\n# Strategy Guide\n"
@@ -1241,26 +1247,23 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
         hint_decay_optimizer_steps = 100
 
         # Initialize curriculum scheduler.
-        # rollouts_per_stage=64 advances 1 turn every ~5 optimizer steps at batch-size 14.
-        # initial_max_turn=5 ensures games can partially play from step 0 (gin needs 10+ turns).
-        # warmup_rollouts=0 starts advancing immediately instead of burning 1280 rollouts at turn=1.
         rollout_last_prompt_and_completion_parallelized_curriculum.curriculum = CurriculumScheduler(
-            initial_max_turn=5,
-            final_max_turn=30,
-            rollouts_per_stage=64,
+            initial_max_turn=CURRICULUM_INITIAL_MAX_TURN,
+            final_max_turn=CURRICULUM_FINAL_MAX_TURN,
+            rollouts_per_stage=CURRICULUM_ROLLOUTS_PER_STAGE,
             initial_hint_prob=0.5,
             final_hint_prob=0.0,
             hint_decay_optimizer_steps=hint_decay_optimizer_steps,
-            warmup_rollouts=0,
+            warmup_rollouts=CURRICULUM_WARMUP_ROLLOUTS,
             mcts_warmup_optimizer_steps=mcts_warmup_optimizer_steps,
             initial_mcts_sims=CURRICULUM_INITIAL_MCTS_SIMS,
             final_mcts_sims=CURRICULUM_FINAL_MCTS_SIMS,
         )
 
         print(
-            f"[CURRICULUM] Initialized with initial_max_turn=5, final_max_turn={30}, "
-            f"rollouts_per_stage=64, "
-            f"rollout_warmup_rollouts=0, "
+            f"[CURRICULUM] Initialized with initial_max_turn={CURRICULUM_INITIAL_MAX_TURN}, final_max_turn={CURRICULUM_FINAL_MAX_TURN}, "
+            f"rollouts_per_stage={CURRICULUM_ROLLOUTS_PER_STAGE}, "
+            f"rollout_warmup_rollouts={CURRICULUM_WARMUP_ROLLOUTS}, "
             f"hint_decay_optimizer_steps={hint_decay_optimizer_steps}, "
             f"mcts_warmup_optimizer_steps={mcts_warmup_optimizer_steps}, "
             f"mcts_sims={CURRICULUM_INITIAL_MCTS_SIMS}->{CURRICULUM_FINAL_MCTS_SIMS} (progressive)"
@@ -1617,26 +1620,23 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
         hint_decay_optimizer_steps = 100
 
         # Initialize curriculum scheduler.
-        # rollouts_per_stage=64 advances 1 turn every ~5 optimizer steps at batch-size 14.
-        # initial_max_turn=5 ensures games can partially play from step 0 (gin needs 10+ turns).
-        # warmup_rollouts=0 starts advancing immediately instead of burning 1280 rollouts at turn=1.
         rollout_full_prompt_and_completion_parallelized_curriculum.curriculum = CurriculumScheduler(
-            initial_max_turn=5,
-            final_max_turn=30,
-            rollouts_per_stage=64,
+            initial_max_turn=CURRICULUM_INITIAL_MAX_TURN,
+            final_max_turn=CURRICULUM_FINAL_MAX_TURN,
+            rollouts_per_stage=CURRICULUM_ROLLOUTS_PER_STAGE,
             initial_hint_prob=0.5,
             final_hint_prob=0.0,
             hint_decay_optimizer_steps=hint_decay_optimizer_steps,
-            warmup_rollouts=0,
+            warmup_rollouts=CURRICULUM_WARMUP_ROLLOUTS,
             mcts_warmup_optimizer_steps=mcts_warmup_optimizer_steps,
             initial_mcts_sims=CURRICULUM_INITIAL_MCTS_SIMS,
             final_mcts_sims=CURRICULUM_FINAL_MCTS_SIMS,
         )
 
         print(
-            f"[CURRICULUM] Initialized with initial_max_turn=5, final_max_turn={30}, "
-            f"rollouts_per_stage=64, "
-            f"rollout_warmup_rollouts=0, "
+            f"[CURRICULUM] Initialized with initial_max_turn={CURRICULUM_INITIAL_MAX_TURN}, final_max_turn={CURRICULUM_FINAL_MAX_TURN}, "
+            f"rollouts_per_stage={CURRICULUM_ROLLOUTS_PER_STAGE}, "
+            f"rollout_warmup_rollouts={CURRICULUM_WARMUP_ROLLOUTS}, "
             f"hint_decay_optimizer_steps={hint_decay_optimizer_steps}, "
             f"mcts_warmup_optimizer_steps={mcts_warmup_optimizer_steps}, "
             f"mcts_sims={CURRICULUM_INITIAL_MCTS_SIMS}->{CURRICULUM_FINAL_MCTS_SIMS} (progressive)"
