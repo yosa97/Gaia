@@ -27,8 +27,8 @@ MCTS_CONFIG = {
 # Reward constants — aligns with validator "higher is better" scoring
 TERMINAL_WIN_REWARD = 1.0
 TERMINAL_LOSS_REWARD = -1.0
-GIN_BONUS = 0.25           # extra for 0-deadwood win (Gin = all melds)
-KNOCK_BONUS = 0.1          # extra for winning via knock (tournament: reward timely knock)
+GIN_BONUS = 0.5            # extra for 0-deadwood win (Gin = all melds); was 0.25 — too small vs clip
+KNOCK_BONUS = 0.15         # extra for winning via knock (tournament: reward timely knock); was 0.1
 DEADWOOD_WEIGHT = 0.4      # was 0.5 — reduced for MCTS(50,1): terminal signal dominates more
 INVALID_PENALTY = -0.1
 INVALID_TOTAL_CLIP = -0.3
@@ -1036,7 +1036,12 @@ class RewardCalculator:
         invalid_total = sum(r for r in step_rewards if r < 0)
         invalid_total = max(invalid_total, INVALID_TOTAL_CLIP)
 
-        raw = deadwood_component + terminal + invalid_total
+        # 4. Discard safety component — penalises discards the opponent picks up face-up.
+        #    compute_discard_safety() walks GameState pairs and returns a value in [-0.1, 0.0].
+        #    Was defined but never called; now wired in as a persistent game-quality signal.
+        discard_safety = RewardCalculator.compute_discard_safety(all_states) if all_states else 0.0
+
+        raw = deadwood_component + terminal + invalid_total + discard_safety
         # Clip to [-1, 1] for validator alignment (higher = better)
         return max(min(raw, TERMINAL_REWARD_CLIP), -TERMINAL_REWARD_CLIP)
     

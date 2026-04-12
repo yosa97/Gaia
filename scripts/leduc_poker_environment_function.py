@@ -193,6 +193,8 @@ class RewardCalculator:
         reward = 0.0
         if curr_state.get("has_pair"):
             reward += self.pair_bonus
+            if action == ACTION_RAISE:
+                reward += 1.5  # Nash-optimal: raise aggressively with pairs (not just hold them)
         elif curr_state.get("private_card"):
             reward += self.high_card_bonus * _RANK_STRENGTH.get(curr_state["private_card"][0], 1)
         # Penalize fold without pair on round 1 (overly passive)

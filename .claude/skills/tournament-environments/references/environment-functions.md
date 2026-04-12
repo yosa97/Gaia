@@ -85,8 +85,8 @@ Current role:
 - `MCTS_CONFIG` — `{"opponent": "mcts", "mcts_max_simulations": 50, "mcts_num_rollouts": 1}`
 - `TERMINAL_WIN_REWARD = 1.0`
 - `TERMINAL_LOSS_REWARD = -1.0`
-- `GIN_BONUS = 0.25` — bonus for 0-deadwood win
-- `KNOCK_BONUS = 0.1` — bonus for winning via knock
+- `GIN_BONUS = 0.5` — bonus for 0-deadwood win; was 0.25 (too small vs ±1.0 clip to differentiate Gin from knock)
+- `KNOCK_BONUS = 0.15` — bonus for winning via knock; was 0.1
 - `DEADWOOD_WEIGHT = 0.4` — reduced from 0.5 for MCTS(50,1); terminal signal dominates more
 - `INVALID_PENALTY = -0.1`
 - `INVALID_TOTAL_CLIP = -0.3`
@@ -225,7 +225,7 @@ Current rollout characteristics:
 - Uses a semaphore to serialize generation calls.
 - Augments later observations with dead-card and Bayesian summaries.
 - Calls `/reset` and `/step` against `ENVIRONMENT_SERVER_URLS`.
-- Computes final training reward from deadwood improvement, terminal result, and invalid-action penalties.
+- Computes final training reward from deadwood improvement, terminal result, invalid-action penalties, and **discard safety** (`compute_discard_safety()` now active — was defined but never called).
 
 ## `scripts/liars_dice_environment_function.py`
 
@@ -241,7 +241,7 @@ Current rollout characteristics:
 - `CURRICULUM_INITIAL_TURN = 2` — fixed constant (trainer.args.initial_max_turn holds MCTS sim count, NOT turn count)
 - `INVALID_ACTION_PENALTY = 0.10`
 - `PASS_MISSED_CHALLENGE_PENALTY = 0.04` — reduced from 0.06 for MCTS(225,1) stronger opponent
-- `BID_PLAUSIBILITY_BONUS = 0.03` — reduced from 0.04
+- `BID_PLAUSIBILITY_BONUS = 0.09` — was 0.03 (3× scale so plausible bids outweigh the 0.04 penalty)
 - `BID_PLAUSIBILITY_PENALTY = 0.04`
 - `SHAPING_REWARD_CLIP = 0.35` — reduced from 0.50; tighter clip so terminal dominates
 - `TERMINAL_REWARD_CLIP = 1.00`
@@ -324,6 +324,7 @@ Current rollout characteristics:
 - Separates classic bid plausibility from the single-die accept/doubt variant.
 - Hint prob defaults: `CURRICULUM_INITIAL_HINT_PROB=0.5` and `CURRICULUM_FINAL_HINT_PROB=0.0` (env vars override).
 - Init log prints: `[CURRICULUM] Initialized: turns {initial}→{final}, mcts_sims=225, hints 0.5→0.0`
+- `_score_challenge_decision`: correct non-challenge reward raised to `PASS_MISSED_CHALLENGE_PENALTY` (0.04) — was 0.01; now symmetric with the missed-challenge penalty (7× asymmetry fixed).
 
 ## `scripts/leduc_poker_environment_function.py`
 
@@ -367,11 +368,12 @@ Current rollout characteristics:
 
 Current shaping signals:
 
-- pair bonus
-- high-card strength bonus
-- early weak-fold penalty
-- pot growth reward
-- scaled terminal payoff
+- pair bonus (`pair_bonus = 5.0`)
+- raise-with-pair bonus (`+1.5` when agent RAISES while holding a pair — Nash-optimal action, not just state)
+- high-card strength bonus (`high_card_bonus = 1.5 × rank_strength`)
+- early weak-fold penalty (Round 1 fold without pair: `fold_penalty × 0.5 = -1.5`)
+- pot growth reward (`+0.3` when pot increases)
+- scaled terminal payoff (`final_env_reward × 30.0`, clipped to ±30)
 
 ### Rollout helpers and entry points
 

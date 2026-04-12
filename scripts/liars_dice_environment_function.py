@@ -40,7 +40,7 @@ CURRICULUM_INITIAL_TURN = 2    # start simple: one claim/challenge exchange
 # Reduced shaping magnitudes so terminal outcome dominates (avoids reward hacking).
 INVALID_ACTION_PENALTY = 0.10
 PASS_MISSED_CHALLENGE_PENALTY = 0.04   # was 0.06 — strong opponent makes legitimate bids
-BID_PLAUSIBILITY_BONUS = 0.03          # was 0.04
+BID_PLAUSIBILITY_BONUS = 0.09          # was 0.03 — 3× scale so plausible bids outweigh penalty
 BID_PLAUSIBILITY_PENALTY = 0.04
 SHAPING_REWARD_CLIP = 0.35             # was 0.50 — tighter clip, terminal dominates more
 TERMINAL_REWARD_CLIP = 1.00
@@ -640,7 +640,7 @@ def _score_challenge_decision(
                 1.0 + _clamp((0.10 - current_bid_truth_probability) / 0.10, 0.0, 1.0)
             )
         elif current_bid_truth_probability >= 0.55:
-            reward += 0.01
+            reward += PASS_MISSED_CHALLENGE_PENALTY  # was 0.01; now symmetric with missed-challenge penalty
 
     return reward, {
         "current_bid_z": current_bid_z,
