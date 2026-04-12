@@ -85,9 +85,9 @@ Current role:
 - `MCTS_CONFIG` — `{"opponent": "mcts", "mcts_max_simulations": 50, "mcts_num_rollouts": 1}`
 - `TERMINAL_WIN_REWARD = 1.0`
 - `TERMINAL_LOSS_REWARD = -1.0`
-- `GIN_BONUS = 0.5` — bonus for 0-deadwood win; was 0.25 (too small vs ±1.0 clip to differentiate Gin from knock)
+- `GIN_BONUS = 0.6` — bonus for 0-deadwood win; was 0.5 (gin more achievable with fixed curriculum)
 - `KNOCK_BONUS = 0.15` — bonus for winning via knock; was 0.1
-- `DEADWOOD_WEIGHT = 0.4` — reduced from 0.5 for MCTS(50,1); terminal signal dominates more
+- `DEADWOOD_WEIGHT = 0.3` — reduced from 0.4; more games reach terminal with fixed curriculum
 - `INVALID_PENALTY = -0.1`
 - `INVALID_TOTAL_CLIP = -0.3`
 - `TERMINAL_REWARD_CLIP = 1.0`
@@ -95,8 +95,13 @@ Current role:
 - `DANGEROUS_DISCARD_PENALTY = 0.02`
 - `DRAW_UPCARD_BONUS = 0.03`
 - `DRAW_UPCARD_PENALTY = 0.02`
+- `CURRICULUM_INITIAL_MAX_TURN = 5` — gin needs 10+ turns; start at 5 for early signal
+- `CURRICULUM_FINAL_MAX_TURN = 30` — full gin rummy game length
+- `CURRICULUM_ROLLOUTS_PER_STAGE = 64` — advances 1 turn every ~5 optimizer steps
+- `CURRICULUM_WARMUP_ROLLOUTS = 0` — no warmup; start advancing from step 0
 - `CURRICULUM_INITIAL_MCTS_SIMS = 10` — progressive MCTS warmup start
 - `CURRICULUM_FINAL_MCTS_SIMS = 50` — matches MCTS_CONFIG target
+- `hint_decay_optimizer_steps = 300` — hints persist through curriculum ramp (50% of 600 max_steps)
 - `_HINT_PROMPT` — module-level strategy guide injected into early episodes (50%→0% via hint curriculum)
 
 ### Card and meld helpers
@@ -239,6 +244,11 @@ Current rollout characteristics:
 - `MAX_PROMPT_LEN = 16384 - 512`
 - `MCTS_CONFIG` — `{"opponent": "mcts", "mcts_max_simulations": 225, "mcts_num_rollouts": 1}`
 - `CURRICULUM_INITIAL_TURN = 2` — fixed constant (trainer.args.initial_max_turn holds MCTS sim count, NOT turn count)
+- `CURRICULUM_FINAL_TURN = 12` — games rarely exceed 10 turns; was 20
+- `CURRICULUM_ROLLOUTS_PER_STAGE = 256` — advances 1 turn every ~18 optimizer steps; was 1280
+- `CURRICULUM_WARMUP_ROLLOUTS = 64` — was 128
+- `CURRICULUM_INITIAL_MCTS_SIMS = 10` — progressive MCTS warmup start (NEW: liars dice now has progressive MCTS)
+- `CURRICULUM_FINAL_MCTS_SIMS = 225` — matches MCTS_CONFIG target
 - `INVALID_ACTION_PENALTY = 0.10`
 - `PASS_MISSED_CHALLENGE_PENALTY = 0.04` — reduced from 0.06 for MCTS(225,1) stronger opponent
 - `BID_PLAUSIBILITY_BONUS = 0.09` — was 0.03 (3× scale so plausible bids outweigh the 0.04 penalty)
@@ -300,7 +310,7 @@ These are the core probability and decision-quality functions for liar's-dice sh
 
 - `_build_env_pool(server_urls)`
 - `_initialize_rollout_state(trainer)`
-- `_reset_environment(env_endpoint, game_id, timeout)`
+- `_reset_environment(env_endpoint, game_id, timeout, mcts_sims=None)` — accepts optional MCTS sim override for progressive warmup
 - `_step_environment(env_endpoint, episode_id, action_to_send, timeout)`
 - `_last_prompt_fallback_result()`
 - `_full_prompt_fallback_result()`
@@ -323,7 +333,9 @@ Current rollout characteristics:
 - Contains fallback action logic when parsing fails.
 - Separates classic bid plausibility from the single-die accept/doubt variant.
 - Hint prob defaults: `CURRICULUM_INITIAL_HINT_PROB=0.5` and `CURRICULUM_FINAL_HINT_PROB=0.0` (env vars override).
-- Init log prints: `[CURRICULUM] Initialized: turns {initial}→{final}, mcts_sims=225, hints 0.5→0.0`
+- Progressive MCTS: ramps from `CURRICULUM_INITIAL_MCTS_SIMS=10` to `CURRICULUM_FINAL_MCTS_SIMS=225` alongside turn curriculum
+- Init log prints: `[CURRICULUM] Initialized: turns {initial}→{final}, mcts_sims 10→225, hints 0.5→0.0`
+- wandb logs `curriculum/mcts_sims` metric each batch
 - `_score_challenge_decision`: correct non-challenge reward raised to `PASS_MISSED_CHALLENGE_PENALTY` (0.04) — was 0.01; now symmetric with the missed-challenge penalty (7× asymmetry fixed).
 
 ## `scripts/leduc_poker_environment_function.py`
@@ -337,7 +349,7 @@ Current rollout characteristics:
 - `MCTS_CONFIG` — `{"opponent": "mcts", "mcts_max_simulations": 50, "mcts_num_rollouts": 1}`
 - `CURRICULUM_INITIAL_TURN = 2` — start simple: one bet/response round
 - `CURRICULUM_FINAL_TURN = 8` — full game length (2 rounds × up to 4 bets)
-- `CURRICULUM_ROLLOUTS_PER_STAGE = 512` — 6 stages × 512 = 3072 rollouts to reach max
+- `CURRICULUM_ROLLOUTS_PER_STAGE = 256` — 6 stages × 256 = 1536 rollouts to reach max; was 512
 - `CURRICULUM_WARMUP_ROLLOUTS = 128`
 - `CURRICULUM_INITIAL_HINT_PROB = 0.5` — 50% of early episodes include Nash strategy hints
 - `CURRICULUM_FINAL_HINT_PROB = 0.0` — no hints by end of training

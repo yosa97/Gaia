@@ -33,8 +33,9 @@ Use this skill when the task touches environment GRPO training, environment-serv
 - Preserve the default tournament opponent as MCTS unless the task explicitly says otherwise.
 - Use these target MCTS settings as the default rule:
   - Gin Rummy: `MCTS(50,1)` — IS-MCTS, progressive warmup from 10 sims
-  - Liars Dice: `MCTS(225,1)` — classic UCT, highest sim count
+  - Liars Dice: `MCTS(225,1)` — classic UCT, progressive warmup from 10 sims
   - Leduc Poker: `MCTS(50,1)` — classic UCT, progressive warmup from 10 sims
+- All 3 games now use progressive MCTS warmup via `CurriculumScheduler.get_mcts_sims()` — opponent starts weak (10 sims) and ramps to target alongside turn curriculum.
 - The MCTS opponent uses `SafeRandomRolloutEvaluator(n_rollouts=1)` with `uct_c=1.414` — NOT a neural network. This means:
   - Very high evaluation variance per node (1 random rollout only)
   - No Nash equilibrium convergence at low sim counts

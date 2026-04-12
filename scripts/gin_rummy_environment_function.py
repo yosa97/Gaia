@@ -27,9 +27,9 @@ MCTS_CONFIG = {
 # Reward constants — aligns with validator "higher is better" scoring
 TERMINAL_WIN_REWARD = 1.0
 TERMINAL_LOSS_REWARD = -1.0
-GIN_BONUS = 0.5            # extra for 0-deadwood win (Gin = all melds); was 0.25 — too small vs clip
+GIN_BONUS = 0.6            # extra for 0-deadwood win (Gin = all melds); was 0.5 — gin more achievable with fixed curriculum
 KNOCK_BONUS = 0.15         # extra for winning via knock (tournament: reward timely knock); was 0.1
-DEADWOOD_WEIGHT = 0.4      # was 0.5 — reduced for MCTS(50,1): terminal signal dominates more
+DEADWOOD_WEIGHT = 0.3      # was 0.4 — more games reach terminal now; terminal signal dominates
 INVALID_PENALTY = -0.1
 INVALID_TOTAL_CLIP = -0.3
 TERMINAL_REWARD_CLIP = 1.0 # final clip for validator alignment
@@ -1244,7 +1244,7 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
         mcts_warmup_optimizer_steps = getattr(
             trainer.args, "mcts_warmup_optimizer_steps", None
         )
-        hint_decay_optimizer_steps = 100
+        hint_decay_optimizer_steps = 300
 
         # Initialize curriculum scheduler.
         rollout_last_prompt_and_completion_parallelized_curriculum.curriculum = CurriculumScheduler(
@@ -1617,7 +1617,7 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
         mcts_warmup_optimizer_steps = getattr(
             trainer.args, "mcts_warmup_optimizer_steps", None
         )
-        hint_decay_optimizer_steps = 100
+        hint_decay_optimizer_steps = 300
 
         # Initialize curriculum scheduler.
         rollout_full_prompt_and_completion_parallelized_curriculum.curriculum = CurriculumScheduler(
