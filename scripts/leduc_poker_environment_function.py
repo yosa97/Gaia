@@ -235,7 +235,15 @@ _HINT_PROMPT = (
     "READING OPPONENT:\n"
     "- Opponent raised R1 then checked R2 → likely missed pair (caught bluffing)\n"
     "- Opponent raised both rounds → likely has a pair; be cautious without one\n"
-    "- Opponent folded to your raise → bet was credible; note their threshold\n"
+    "- Opponent folded to your raise → bet was credible; note their threshold\n\n"
+    "EXPLOITING THE MCTS OPPONENT (50 simulations, 1 random rollout per node):\n"
+    "- Leduc Poker has only 936 total information states; at 50 sims MCTS covers < 10% per decision\n"
+    "- MCTS uses random rollouts (not Nash equilibrium) → it underestimates bluffing value\n"
+    "- Random rollouts from any position win ~1/3 of the time → MCTS sees all positions as similar\n"
+    "- Play Nash equilibrium (the strategy guide above) — it ALWAYS outperforms MCTS pure strategy\n"
+    "- Key exploit: MCTS is overly passive with J — raise with K/Q more than MCTS expects\n"
+    "- Key exploit: MCTS folds too rarely vs aggressive raises — raise more with pairs in R2\n"
+    "- MCTS cannot adapt its strategy based on your betting history — consistent patterns are safe\n"
 )
 
 

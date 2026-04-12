@@ -76,6 +76,14 @@ READING OPPONENT:
 - Opponent switches face values → they've hit the limit for prior face; new face might be weak
 - Opponent makes a large jump (e.g., "3 twos" → "6 twos") → bluff OR very strong hand; call if you have 0 matching
 - 6 is wild: bid "3 fours" means ≥3 dice showing EITHER 4 OR 6; always count your 6s as matching
+
+EXPLOITING THE MCTS OPPONENT (225 simulations, 1 random rollout per node):
+- MCTS evaluates each position with a SINGLE random dice rollout — this causes very high evaluation variance
+- The "exploit zone" is needed=2 (54% probability): MCTS random rollouts cannot reliably distinguish bluff vs truth here
+- Bid aggressively into this zone: claim your_match + 2 more often — MCTS will frequently mis-evaluate it
+- Challenge firmly at needed=3+: MCTS sometimes incorrectly evaluates a 21% bid as safe due to lucky rollouts
+- Do NOT deviate from the math thresholds above — MCTS plays probabilistically and the thresholds beat it long-run
+- MCTS cannot track your historical bluff rate — a pattern of "always bid +2" will NOT be detected and countered
 """
 
 # FSICFR / Neller–Lanctot "Liar's die": one s-sided die, rank claims, Doubt vs Accept.
@@ -99,6 +107,13 @@ HOW TO CLAIM (when you hold the die and must announce a rank):
 - High roll (5-6): Claim truthfully — already maximum pressure; no need to over-bluff
 - If the required minimum is already high (≥ 5): claim your actual roll; lying higher risks an easy Doubt win
 - NEVER claim rank 6 unless you rolled 6 — Doubt at 6 wins outright for the doubter ~83% of rounds
+
+EXPLOITING THE MCTS OPPONENT (225 simulations, 1 random rollout per node):
+- MCTS evaluates this single-die game with ONE random die rollout per leaf — variance per node is extremely high (6 outcomes)
+- MCTS will correctly Doubt at rank 6 (17% win rate) but STRUGGLES with rank 4-5 (33-50% range)
+- Bluff at rank 4 on a low roll (1-2): MCTS random rollout evaluation at 33% win probability is noisy — it will sometimes Accept incorrectly
+- Force many rounds via Accept when you hold a mid roll (3-4) — each additional round reduces MCTS's evaluation accuracy as history lengthens
+- MCTS cannot adapt its thresholds based on your claim history — consistent bluffing at rank +1 above your roll will not be learned against
 """
 
 REASONING_TAG_PAIRS = [

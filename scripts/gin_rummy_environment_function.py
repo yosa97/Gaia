@@ -76,7 +76,15 @@ _HINT_PROMPT = (
     "- Opponent drew your discard → that card fits their meld; don't discard same rank/suit again\n"
     "- Opponent passed the upcard → they don't need that rank/suit right now (safer to discard nearby)\n"
     "- Opponent discarding high cards (K/Q/J) late game → they're building runs, not sets\n"
-    "- 'Dead cards' shown in observation = cards in discard pile, safe to build around\n"
+    "- 'Dead cards' shown in observation = cards in discard pile, safe to build around\n\n"
+    "EXPLOITING THE MCTS OPPONENT (50 simulations, IS-MCTS with 1 random rollout per node):\n"
+    "- MCTS uses IS-MCTS: each simulation RESAMPLES the opponent's unknown hand from remaining cards\n"
+    "- With only 50 samples, MCTS cannot accurately evaluate all possible opponent hand configurations\n"
+    "- 'Dead cards' are eliminated from ALL MCTS samples — always treat dead-card analysis as reliable\n"
+    "- Knock EARLIER than feels right: MCTS with 1 rollout UNDERESTIMATES the value of waiting for Gin\n"
+    "- MCTS struggles most when stock pile is 10-20 cards (many unseen cards → high sample variance)\n"
+    "- Upcard decisions: MCTS evaluates these accurately (upcard is known) → only take if it truly helps\n"
+    "- Safe discard strategy beats MCTS: 'dead' card discards force MCTS into samples it can't exploit\n"
 )
 
 

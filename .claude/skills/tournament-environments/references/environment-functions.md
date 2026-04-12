@@ -24,11 +24,29 @@ Most environment files follow the same structure:
 
 Unless a task explicitly asks for a different opponent setting, keep the tournament default opponent as MCTS with these target settings:
 
-- Gin Rummy: `MCTS(50,1)`
-- Liars Dice: `MCTS(225,1)`
-- Leduc Poker: `MCTS(50,1)`
+- Gin Rummy: `MCTS(50,1)` — IS-MCTS (information set sampling for hidden cards), progressive warmup from 10 sims
+- Liars Dice: `MCTS(225,1)` — classic UCT MCTS, highest sim count for strongest opponent
+- Leduc Poker: `MCTS(50,1)` — classic UCT MCTS, progressive warmup from 10 sims
 
 When curriculum is present, weaker warmup settings can ramp toward these targets, but these are the steady-state defaults that should be preserved.
+
+## MCTS Engine Details (from `open_spiel/open_spiel/algorithms/mcts.h` + `affinetes/environments/openspiel/env.py`)
+
+These facts are important when tuning strategy hints and understanding opponent behavior:
+
+- **Evaluator**: `SafeRandomRolloutEvaluator(n_rollouts=n_rollouts)` — uses random playouts (NOT neural net priors)
+- **n_rollouts=1** for all 3 active games — a single random rollout per leaf node, causing very high evaluation variance
+- **UCT exploration constant**: `uct_c = 1.414` (√2) — standard exploration-exploitation trade-off
+- **Action selection**: Highest visit count after all simulations (not highest value)
+- **Hidden information**: Gin Rummy uses IS-MCTS which resamples opponent's unknown hand each simulation
+- **No learning**: MCTS does not adapt to opponent history or bluff patterns — each game is evaluated fresh
+- **Config override**: Training payload (`mcts_max_simulations`, `mcts_num_rollouts`) overrides agent-file defaults like `(3000,200)`
+
+Key weaknesses exploitable by the LLM agent:
+- n_rollouts=1 → **high variance** in evaluation, especially in the 40-60% probability range
+- No Nash equilibrium convergence at low sim counts → LLM playing Nash strategy beats MCTS pure strategy
+- No bluff history tracking → consistent bluffing patterns are safe and undetected
+- IS-MCTS with 50 sims → very limited hand sampling for Gin Rummy (~50 of millions of possible hands)
 
 ## `scripts/goof_spiel_environment_function.py`
 
@@ -64,21 +82,22 @@ Current role:
 
 - `CARD_VALUES`
 - `RANK_ORDER`
-- `MCTS_CONFIG`
-- `TERMINAL_WIN_REWARD`
-- `TERMINAL_LOSS_REWARD`
-- `GIN_BONUS`
-- `KNOCK_BONUS`
-- `DEADWOOD_WEIGHT`
-- `INVALID_PENALTY`
-- `INVALID_TOTAL_CLIP`
-- `TERMINAL_REWARD_CLIP`
-- `SAFE_DISCARD_BONUS`
-- `DANGEROUS_DISCARD_PENALTY`
-- `DRAW_UPCARD_BONUS`
-- `DRAW_UPCARD_PENALTY`
-- `CURRICULUM_INITIAL_MCTS_SIMS`
-- `CURRICULUM_FINAL_MCTS_SIMS`
+- `MCTS_CONFIG` — `{"opponent": "mcts", "mcts_max_simulations": 50, "mcts_num_rollouts": 1}`
+- `TERMINAL_WIN_REWARD = 1.0`
+- `TERMINAL_LOSS_REWARD = -1.0`
+- `GIN_BONUS = 0.25` — bonus for 0-deadwood win
+- `KNOCK_BONUS = 0.1` — bonus for winning via knock
+- `DEADWOOD_WEIGHT = 0.4` — reduced from 0.5 for MCTS(50,1); terminal signal dominates more
+- `INVALID_PENALTY = -0.1`
+- `INVALID_TOTAL_CLIP = -0.3`
+- `TERMINAL_REWARD_CLIP = 1.0`
+- `SAFE_DISCARD_BONUS = 0.02`
+- `DANGEROUS_DISCARD_PENALTY = 0.02`
+- `DRAW_UPCARD_BONUS = 0.03`
+- `DRAW_UPCARD_PENALTY = 0.02`
+- `CURRICULUM_INITIAL_MCTS_SIMS = 10` — progressive MCTS warmup start
+- `CURRICULUM_FINAL_MCTS_SIMS = 50` — matches MCTS_CONFIG target
+- `_HINT_PROMPT` — module-level strategy guide injected into early episodes (50%→0% via hint curriculum)
 
 ### Card and meld helpers
 
@@ -187,8 +206,10 @@ Important current assumptions:
 Current behavior:
 
 - Curriculum separately ramps turns, hint probability, and MCTS simulations.
-- Hint decay uses optimizer steps.
-- MCTS difficulty ramps from `CURRICULUM_INITIAL_MCTS_SIMS` to `CURRICULUM_FINAL_MCTS_SIMS`.
+- Hint decay uses optimizer steps (`hint_decay_optimizer_steps=100`).
+- MCTS difficulty ramps from `CURRICULUM_INITIAL_MCTS_SIMS=10` to `CURRICULUM_FINAL_MCTS_SIMS=50`.
+- Hint probability starts at `0.5` and decays to `0.0` — both CurriculumScheduler instances pass these explicitly.
+- `_HINT_PROMPT` contains phase-by-phase decision guide + IS-MCTS exploitation section.
 
 ### Rollout entry points
 
@@ -211,30 +232,30 @@ Current rollout characteristics:
 ### Core constants and variants
 
 - `GAME_TO_TASK_ID_RANGE`
-- `SELECTED_GAME`
-- `REQUEST_TIMEOUT_SECONDS`
-- `INIT_TIMEOUT_SECONDS`
-- `MAX_EPISODE_TOKENS`
-- `MAX_PROMPT_LEN`
-- `MCTS_CONFIG`
-- `CURRICULUM_INITIAL_TURN`
-- `INVALID_ACTION_PENALTY`
-- `PASS_MISSED_CHALLENGE_PENALTY`
-- `BID_PLAUSIBILITY_BONUS`
-- `BID_PLAUSIBILITY_PENALTY`
-- `SHAPING_REWARD_CLIP`
-- `TERMINAL_REWARD_CLIP`
-- `CURRICULUM_INITIAL_HINT_PROB`
-- `CURRICULUM_FINAL_HINT_PROB`
-- `RULESET_CLASSIC`
-- `RULESET_LIARS_DIE`
-- `STRATEGY_TIPS_CLASSIC`
-- `STRATEGY_TIPS_LIARS_DIE`
+- `SELECTED_GAME = "liars_dice"`
+- `REQUEST_TIMEOUT_SECONDS = 2400`
+- `INIT_TIMEOUT_SECONDS = 300`
+- `MAX_EPISODE_TOKENS = 16384`
+- `MAX_PROMPT_LEN = 16384 - 512`
+- `MCTS_CONFIG` — `{"opponent": "mcts", "mcts_max_simulations": 225, "mcts_num_rollouts": 1}`
+- `CURRICULUM_INITIAL_TURN = 2` — fixed constant (trainer.args.initial_max_turn holds MCTS sim count, NOT turn count)
+- `INVALID_ACTION_PENALTY = 0.10`
+- `PASS_MISSED_CHALLENGE_PENALTY = 0.04` — reduced from 0.06 for MCTS(225,1) stronger opponent
+- `BID_PLAUSIBILITY_BONUS = 0.03` — reduced from 0.04
+- `BID_PLAUSIBILITY_PENALTY = 0.04`
+- `SHAPING_REWARD_CLIP = 0.35` — reduced from 0.50; tighter clip so terminal dominates
+- `TERMINAL_REWARD_CLIP = 1.00`
+- `CURRICULUM_INITIAL_HINT_PROB = 0.5` — default for env var `LIARS_DICE_INITIAL_HINT_PROB`
+- `CURRICULUM_FINAL_HINT_PROB = 0.0` — default for env var `LIARS_DICE_FINAL_HINT_PROB`
+- `RULESET_CLASSIC = "classic"`
+- `RULESET_LIARS_DIE = "liars_die"`
+- `STRATEGY_TIPS_CLASSIC` — probability-anchored guide with MCTS exploitation section
+- `STRATEGY_TIPS_LIARS_DIE` — single-die variant guide with MCTS exploitation section
 
 The file supports both:
 
-- classic multi-dice liar's dice
-- a single-die "liars_die" variant
+- classic multi-dice liar's dice (2 players × 5 dice = 10 total; 6s are wild)
+- a single-die "liars_die" variant (FSICFR-style rank claims, Doubt vs Accept)
 
 ### Generic helpers
 
@@ -301,26 +322,28 @@ Current rollout characteristics:
 - Can emit full action masks for `ActionMaskedGRPOTrainer`.
 - Contains fallback action logic when parsing fails.
 - Separates classic bid plausibility from the single-die accept/doubt variant.
+- Hint prob defaults: `CURRICULUM_INITIAL_HINT_PROB=0.5` and `CURRICULUM_FINAL_HINT_PROB=0.0` (env vars override).
+- Init log prints: `[CURRICULUM] Initialized: turns {initial}→{final}, mcts_sims=225, hints 0.5→0.0`
 
 ## `scripts/leduc_poker_environment_function.py`
 
 ### Core constants
 
 - `GAME_TO_TASK_ID_RANGE`
-- `SELECTED_GAME`
-- `TIMEOUT`
-- `ACTION_FOLD`
-- `ACTION_CALL`
-- `ACTION_RAISE`
-- `MCTS_CONFIG`
-- `CURRICULUM_INITIAL_TURN`
-- `CURRICULUM_FINAL_TURN`
-- `CURRICULUM_ROLLOUTS_PER_STAGE`
-- `CURRICULUM_WARMUP_ROLLOUTS`
-- `CURRICULUM_INITIAL_HINT_PROB`
-- `CURRICULUM_FINAL_HINT_PROB`
-- `CURRICULUM_INITIAL_MCTS_SIMS`
-- `CURRICULUM_FINAL_MCTS_SIMS`
+- `SELECTED_GAME = "leduc_poker"`
+- `TIMEOUT = 2400`
+- `ACTION_FOLD = "0"`, `ACTION_CALL = "1"`, `ACTION_RAISE = "2"`
+- `MCTS_CONFIG` — `{"opponent": "mcts", "mcts_max_simulations": 50, "mcts_num_rollouts": 1}`
+- `CURRICULUM_INITIAL_TURN = 2` — start simple: one bet/response round
+- `CURRICULUM_FINAL_TURN = 8` — full game length (2 rounds × up to 4 bets)
+- `CURRICULUM_ROLLOUTS_PER_STAGE = 512` — 6 stages × 512 = 3072 rollouts to reach max
+- `CURRICULUM_WARMUP_ROLLOUTS = 128`
+- `CURRICULUM_INITIAL_HINT_PROB = 0.5` — 50% of early episodes include Nash strategy hints
+- `CURRICULUM_FINAL_HINT_PROB = 0.0` — no hints by end of training
+- `CURRICULUM_INITIAL_MCTS_SIMS = 10` — weaker opponent during early curriculum
+- `CURRICULUM_FINAL_MCTS_SIMS = 50` — matches MCTS_CONFIG at full curriculum
+- `_HINT_PROMPT` — Nash equilibrium strategy guide (Round 1/2 decisions + MCTS exploitation section)
+- `_SYSTEM_PROMPT` — game rules prompt (Leduc Poker deck, actions, hand ranking)
 
 ### Helpers
 
