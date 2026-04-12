@@ -18,12 +18,18 @@ CARD_VALUES = {
 
 RANK_ORDER = ['A', '2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K']
 
+MCTS_CONFIG = {
+    "opponent": "mcts",
+    "mcts_max_simulations": 50,
+    "mcts_num_rollouts": 1,
+}
+
 # Reward constants — aligns with validator "higher is better" scoring
 TERMINAL_WIN_REWARD = 1.0
 TERMINAL_LOSS_REWARD = -1.0
 GIN_BONUS = 0.25           # extra for 0-deadwood win (Gin = all melds)
 KNOCK_BONUS = 0.1          # extra for winning via knock (tournament: reward timely knock)
-DEADWOOD_WEIGHT = 0.5      # fraction of total reward from deadwood improvement
+DEADWOOD_WEIGHT = 0.4      # was 0.5 — reduced for MCTS(50,1): terminal signal dominates more
 INVALID_PENALTY = -0.1
 INVALID_TOTAL_CLIP = -0.3
 TERMINAL_REWARD_CLIP = 1.0 # final clip for validator alignment
@@ -1158,7 +1164,7 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
             try:
                 print(f"[INIT] Initializing env on server {idx}: {base_url}")
                 # Initialize with a test reset to ensure server is ready
-                payload = {"task_id": games_to_task_id_range[selected_game][0], "seed": 42, "opponent": "mcts", "mcts_max_simulations": 50, "mcts_num_rollouts": 1}
+                payload = {"task_id": games_to_task_id_range[selected_game][0], "seed": 42, **MCTS_CONFIG}
                 res = requests.post(f"{base_url}/reset", json=payload, timeout=300)
                 res.raise_for_status()
                 env_pool.append({"base_url": base_url})
@@ -1187,7 +1193,7 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
 
         # Initialize curriculum scheduler
         rollout_last_prompt_and_completion_parallelized_curriculum.curriculum = CurriculumScheduler(
-            initial_max_turn=trainer.args.initial_max_turn,
+            initial_max_turn=1,   # fixed: trainer.args.initial_max_turn holds MCTS sim count, not turn count
             final_max_turn=30,
             rollouts_per_stage=trainer.args.rollouts_per_stage,
             initial_hint_prob=0.5,
@@ -1200,7 +1206,7 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
         )
 
         print(
-            f"[CURRICULUM] Initialized with initial_max_turn={trainer.args.initial_max_turn}, final_max_turn={30}, "
+            f"[CURRICULUM] Initialized with initial_max_turn=1, final_max_turn={30}, "
             f"rollouts_per_stage={trainer.args.rollouts_per_stage}, "
             f"rollout_warmup_rollouts={rollout_warmup_rollouts}, "
             f"hint_decay_optimizer_steps={hint_decay_optimizer_steps}, "
@@ -1527,7 +1533,7 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
             try:
                 print(f"[INIT] Initializing env on server {idx}: {base_url}")
                 # Initialize with a test reset to ensure server is ready
-                payload = {"task_id": games_to_task_id_range[selected_game][0], "seed": 42, "opponent": "mcts", "mcts_max_simulations": 50, "mcts_num_rollouts": 1}
+                payload = {"task_id": games_to_task_id_range[selected_game][0], "seed": 42, **MCTS_CONFIG}
                 res = requests.post(f"{base_url}/reset", json=payload, timeout=300)
                 res.raise_for_status()
                 env_pool.append({"base_url": base_url})
@@ -1556,7 +1562,7 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
 
         # Initialize curriculum scheduler
         rollout_full_prompt_and_completion_parallelized_curriculum.curriculum = CurriculumScheduler(
-            initial_max_turn=trainer.args.initial_max_turn,
+            initial_max_turn=1,   # fixed: trainer.args.initial_max_turn holds MCTS sim count, not turn count
             final_max_turn=30,
             rollouts_per_stage=trainer.args.rollouts_per_stage,
             initial_hint_prob=0.5,
@@ -1569,7 +1575,7 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
         )
 
         print(
-            f"[CURRICULUM] Initialized with initial_max_turn={trainer.args.initial_max_turn}, final_max_turn={30}, "
+            f"[CURRICULUM] Initialized with initial_max_turn=1, final_max_turn={30}, "
             f"rollouts_per_stage={trainer.args.rollouts_per_stage}, "
             f"rollout_warmup_rollouts={rollout_warmup_rollouts}, "
             f"hint_decay_optimizer_steps={hint_decay_optimizer_steps}, "

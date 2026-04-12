@@ -33,6 +33,12 @@ MCTS_CONFIG = {
     "mcts_num_rollouts": 1,
 }
 
+# Curriculum: Leduc Poker max game length = 8 turns (2 rounds × up to 4 bets each)
+CURRICULUM_INITIAL_TURN = 2       # start simple: one bet/response round
+CURRICULUM_FINAL_TURN = 8         # full game length
+CURRICULUM_ROLLOUTS_PER_STAGE = 512   # 6 stages × 512 = 3072 rollouts to reach max
+CURRICULUM_WARMUP_ROLLOUTS = 128  # short warmup before progression starts
+
 REASONING_TAG_PAIRS = [
     ("think", "think"),
     ("thinking", "thinking"),
@@ -208,15 +214,20 @@ def _ensure_initialized(fn, trainer) -> None:
     server_urls = [u.strip() for u in os.environ.get("ENVIRONMENT_SERVER_URLS", "").split(",") if u.strip()]
     if not server_urls: raise RuntimeError("ENVIRONMENT_SERVER_URLS is empty")
     env_pool = []
-    init_payload = {"task_id": GAME_TO_TASK_ID_RANGE[SELECTED_GAME][0], "seed": 42, "opponent": "mcts", "mcts_max_simulations": 50, "mcts_num_rollouts": 1}
+    init_payload = {"task_id": GAME_TO_TASK_ID_RANGE[SELECTED_GAME][0], "seed": 42, **MCTS_CONFIG}
     for idx, base_url in enumerate(server_urls):
         res = requests.post(f"{base_url}/reset", json=init_payload, timeout=300)
         res.raise_for_status(); env_pool.append({"base_url": base_url}); print(f"[INIT] Server {idx} ready")
     fn.rank = rank; fn.env_pool = env_pool; fn.num_servers = len(env_pool)
     fn.thread_pool = ThreadPoolExecutor(max_workers=len(env_pool)); fn.generation_semaphore = Semaphore(1)
-    fn.curriculum = CurriculumScheduler(initial_max_turn=trainer.args.initial_max_turn, final_max_turn=8, rollouts_per_stage=trainer.args.rollouts_per_stage, warmup_rollouts=trainer.args.rollouts_per_stage)
+    fn.curriculum = CurriculumScheduler(
+        initial_max_turn=CURRICULUM_INITIAL_TURN,
+        final_max_turn=CURRICULUM_FINAL_TURN,
+        rollouts_per_stage=CURRICULUM_ROLLOUTS_PER_STAGE,
+        warmup_rollouts=CURRICULUM_WARMUP_ROLLOUTS,
+    )
     fn.initialized = True
-    print(f"[CURRICULUM] Initialized: initial_max_turn={trainer.args.initial_max_turn}, final_max_turn=8")
+    print(f"[CURRICULUM] Initialized: turns {CURRICULUM_INITIAL_TURN}→{CURRICULUM_FINAL_TURN}, mcts_sims={MCTS_CONFIG['mcts_max_simulations']}")
 
 
 def rollout_last_prompt_and_completion_parallelized_curriculum(prompts, trainer, max_turns=30):

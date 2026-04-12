@@ -33,12 +33,16 @@ MCTS_CONFIG = {
     "mcts_num_rollouts": 1,
 }
 
-# Reward settings
+# Curriculum: Liars Dice typical game length is 5-10 moves, max ~20
+CURRICULUM_INITIAL_TURN = 2    # start simple: one claim/challenge exchange
+
+# Reward settings — tuned for MCTS(225,1), 4.5× stronger than previous (50,1).
+# Reduced shaping magnitudes so terminal outcome dominates (avoids reward hacking).
 INVALID_ACTION_PENALTY = 0.10
-PASS_MISSED_CHALLENGE_PENALTY = 0.06
-BID_PLAUSIBILITY_BONUS = 0.04
+PASS_MISSED_CHALLENGE_PENALTY = 0.04   # was 0.06 — strong opponent makes legitimate bids
+BID_PLAUSIBILITY_BONUS = 0.03          # was 0.04
 BID_PLAUSIBILITY_PENALTY = 0.04
-SHAPING_REWARD_CLIP = 0.50
+SHAPING_REWARD_CLIP = 0.35             # was 0.50 — tighter clip, terminal dominates more
 TERMINAL_REWARD_CLIP = 1.00
 
 STRATEGY_TIPS_CLASSIC = """
@@ -682,7 +686,7 @@ def _initialize_rollout_state(trainer) -> None:
 
     env_pool = _build_env_pool(server_urls)
     rollout_per_stage = int(getattr(trainer.args, "rollouts_per_stage", 1280))
-    initial_max_turn = int(getattr(trainer.args, "initial_max_turn", 2))
+    initial_max_turn = CURRICULUM_INITIAL_TURN  # fixed: trainer.args.initial_max_turn holds MCTS sim count, not turn count
     final_max_turn = int(os.environ.get("LIARS_DICE_FINAL_MAX_TURN", "20"))
     initial_hint_prob = float(os.environ.get("LIARS_DICE_INITIAL_HINT_PROB", "0.0"))
     final_hint_prob = float(os.environ.get("LIARS_DICE_FINAL_HINT_PROB", "0.0"))
