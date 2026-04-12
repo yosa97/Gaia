@@ -828,11 +828,11 @@ def main():
         print("train_ds.column_names: ", train_ds.column_names)
 
         if training_args.environment_name == "liars_dice":
-            max_steps = 900
+            max_steps = 1800
         elif training_args.environment_name == "gin_rummy":
-            max_steps = 300
+            max_steps = 600
         elif training_args.environment_name == "leduc_poker":
-            max_steps = 300
+            max_steps = 600
         else:
             max_steps = train_request.get("max_steps", -1)
         log_info(f"max_steps: {max_steps}")
