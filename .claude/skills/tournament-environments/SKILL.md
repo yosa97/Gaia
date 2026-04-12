@@ -30,6 +30,11 @@ Use this skill when the task touches environment GRPO training, environment-serv
 
 - Treat each environment function file as the source of truth for that game's parser, curriculum, rollout loop, and reward shaping.
 - For non-trivial reward, curriculum, parsing, or backend-interface changes, use MCP sequential thinking before editing so the dependency chain is explicit.
+- Preserve the default tournament opponent as MCTS unless the task explicitly says otherwise.
+- Use these target MCTS settings as the default rule:
+  - Gin Rummy: `MCTS(50,1)`
+  - Liars Dice: `MCTS(225,1)`
+  - Leduc Poker: `MCTS(50,1)`
 - When changing `action_mask`, verify it stays aligned with `completion_ids`; `ActionMaskedGRPOTrainer` validates lengths and shape.
 - When changing curriculum, inspect both the environment file and `scripts/grpo_env_config.py`; some rollout schedulers derive values from trainer args.
 - When changing observation parsing, verify the corresponding backend formatter in `affinetes/environments/openspiel/agents/`.

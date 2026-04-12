@@ -20,6 +20,16 @@ Most environment files follow the same structure:
    - return rollout artifacts
 6. `rollout_reward_func(...)` that forwards environment rewards to TRL.
 
+## Tournament MCTS Rule
+
+Unless a task explicitly asks for a different opponent setting, keep the tournament default opponent as MCTS with these target settings:
+
+- Gin Rummy: `MCTS(50,1)`
+- Liars Dice: `MCTS(225,1)`
+- Leduc Poker: `MCTS(50,1)`
+
+When curriculum is present, weaker warmup settings can ramp toward these targets, but these are the steady-state defaults that should be preserved.
+
 ## `scripts/goof_spiel_environment_function.py`
 
 Main helpers:
