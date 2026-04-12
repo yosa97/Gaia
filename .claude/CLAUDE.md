@@ -9,7 +9,7 @@ project-root/
 │   ├── affinetes/                              # Backend environment code
 │   │   └── environments/                       # Source game rule implementations
 |   |      └── openspiel/                       # OpenSpiel game implementations
-|   |           └── agents/                     # game agent ex: (gin_rummy, liar_dice, leduc_poker)
+|   |           └── agents/                     # game agent ex: (gin_rummy.py, liars_dice_agent.py, leduc_poker_agent.py)
 │   ├── grpo_env_config.py                      # GRPO training configurations
 │   ├── train_grpo_env.py                       # Main GRPO training execution loop
 │   │
