@@ -33,6 +33,14 @@ MCTS_CONFIG = {
     "mcts_num_rollouts": 1,
 }
 
+REASONING_TAG_PAIRS = [
+    ("think", "think"),
+    ("thinking", "thinking"),
+    ("reasoning", "reasoning"),
+    ("thought", "thought"),
+    ("reflection", "reflection"),
+]
+
 class CurriculumScheduler:
     """Progressive turn-limit curriculum."""
 
@@ -198,7 +206,7 @@ def _ensure_initialized(fn, trainer) -> None:
     server_urls = [u.strip() for u in os.environ.get("ENVIRONMENT_SERVER_URLS", "").split(",") if u.strip()]
     if not server_urls: raise RuntimeError("ENVIRONMENT_SERVER_URLS is empty")
     env_pool = []
-    init_payload = {"task_id": GAMES_TO_TASK_ID_RANGE[SELECTED_GAME][0], "seed": 42, "opponent": "mcts", "mcts_max_simulations": 50, "mcts_num_rollouts": 1}
+    init_payload = {"task_id": GAME_TO_TASK_ID_RANGE[SELECTED_GAME][0], "seed": 42, "opponent": "mcts", "mcts_max_simulations": 50, "mcts_num_rollouts": 1}
     for idx, base_url in enumerate(server_urls):
         res = requests.post(f"{base_url}/reset", json=init_payload, timeout=300)
         res.raise_for_status(); env_pool.append({"base_url": base_url}); print(f"[INIT] Server {idx} ready")
@@ -238,7 +246,7 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(prompts, trainer,
                 out = generate_rollout_completions(trainer, prompts=[messages], as_chat=True)[0]
             prompt_ids = out.get("prompt_ids", []); completion_ids = out.get("completion_ids", []); logprobs = out.get("logprobs", [])
             completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
-            messages.append({"role": "assistant", "content": completion_text}); action_to_send = _parse_action(completion_text)
+            messages.append({"role": "assistant", "content": completion_text}); action_to_send = parse_action(completion_text)
             try:
                 sr = requests.post(f"{env_endpoint}/step", json={"action": action_to_send, "episode_id": episode_id}, timeout=TIMEOUT)
                 sr.raise_for_status(); sb = sr.json()["result"]
@@ -309,7 +317,7 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(prompts, trainer,
             if completion_ids:
                 ep_comp_ids.extend(completion_ids); ep_logprobs.extend(logprobs); ep_mask.extend([1]*len(completion_ids))
                 if prev_full_ids is not None: prev_full_ids = prev_full_ids + completion_ids
-            messages.append({"role": "assistant", "content": completion_text}); action_to_send = _parse_action(completion_text)
+            messages.append({"role": "assistant", "content": completion_text}); action_to_send = parse_action(completion_text)
             try:
                 sr = requests.post(f"{env_endpoint}/step", json={"action": action_to_send, "episode_id": episode_id}, timeout=TIMEOUT)
                 sr.raise_for_status(); sb = sr.json()["result"]
