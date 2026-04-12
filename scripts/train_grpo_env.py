@@ -991,6 +991,27 @@ def main():
                 ],
             )
 
+        # ── Pre-initialize wandb so we control timeout + offline fallback ──────
+        # HF WandbCallback calls wandb.init() inside on_train_begin(). If a run
+        # is already active it reuses it (no-op). We pre-init here with a longer
+        # timeout; if it still fails we switch to offline so training never crashes.
+        if training_args.report_to and "wandb" in training_args.report_to:
+            try:
+                import wandb as _wandb
+                if _wandb.run is None:
+                    _wandb.init(
+                        project=os.environ.get("WANDB_PROJECT", "tournament-environments"),
+                        name=os.environ.get("WANDB_NAME"),
+                        id=os.environ.get("WANDB_RUN_ID"),
+                        resume="allow",
+                        settings=_wandb.Settings(init_timeout=300),
+                    )
+                    print(f"[WANDB] Pre-initialized: {_wandb.run.url if _wandb.run else 'offline'}")
+            except Exception as _e:
+                print(f"[WANDB] Init failed ({_e}), switching to OFFLINE mode")
+                os.environ["WANDB_MODE"] = "offline"
+        # ────────────────────────────────────────────────────────────────────────
+
         trainer.train()
     except Exception as e:
         import traceback
