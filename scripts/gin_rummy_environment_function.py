@@ -1515,12 +1515,26 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
     list_results = [r for r in results if r is not None]
     
     # Log batch statistics
+    n = len(list_results)
     finished = sum(1 for r in list_results if r["final_score"] != 0)
     wins = sum(1 for r in list_results if r["final_score"] > 0.5)
-    avg_return = sum(r["reward"] for r in list_results) / len(list_results) if list_results else 0
-    
-    print(f"[BATCH] Finished:{finished}/{len(list_results)} Wins:{wins} AvgReturn:{avg_return:.3f}")
+    avg_return = sum(r["reward"] for r in list_results) / n if n else 0
 
+    print(f"[BATCH] Finished:{finished}/{n} Wins:{wins} WinRate:{wins/n:.2f} AvgReturn:{avg_return:.3f}")
+    try:
+        import wandb as _wandb
+        if _wandb.run is not None:
+            _wandb.log({
+                "env/win_rate":         wins / n if n else 0.0,
+                "env/avg_return":       avg_return,
+                "env/completion_rate":  finished / n if n else 0.0,
+                "curriculum/max_turn":  current_max_turn,
+                "curriculum/mcts_sims": current_mcts_sims,
+                "curriculum/hint_prob": current_hint_prob,
+                "curriculum/rollouts":  curriculum.total_rollouts,
+            }, commit=False)
+    except Exception:
+        pass
 
     # ---- Aggregate ----
     return {
@@ -1874,12 +1888,26 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
     list_results = [r for r in results if r is not None]
     
     # Log batch statistics
+    n = len(list_results)
     finished = sum(1 for r in list_results if r["final_score"] != 0)
     wins = sum(1 for r in list_results if r["final_score"] > 0.5)
-    avg_return = sum(r["reward"] for r in list_results) / len(list_results) if list_results else 0
-    
-    print(f"[BATCH] Finished:{finished}/{len(list_results)} Wins:{wins} AvgReturn:{avg_return:.3f}")
+    avg_return = sum(r["reward"] for r in list_results) / n if n else 0
 
+    print(f"[BATCH] Finished:{finished}/{n} Wins:{wins} WinRate:{wins/n:.2f} AvgReturn:{avg_return:.3f}")
+    try:
+        import wandb as _wandb
+        if _wandb.run is not None:
+            _wandb.log({
+                "env/win_rate":         wins / n if n else 0.0,
+                "env/avg_return":       avg_return,
+                "env/completion_rate":  finished / n if n else 0.0,
+                "curriculum/max_turn":  current_max_turn,
+                "curriculum/mcts_sims": current_mcts_sims,
+                "curriculum/hint_prob": current_hint_prob,
+                "curriculum/rollouts":  curriculum.total_rollouts,
+            }, commit=False)
+    except Exception:
+        pass
 
     # ---- Aggregate ----
     return {

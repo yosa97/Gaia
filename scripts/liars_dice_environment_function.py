@@ -1206,6 +1206,21 @@ def _rollout_parallelized_curriculum(
 
     curriculum.step(len(prompts))
     _log_batch_statistics(list_results)
+    try:
+        import wandb as _wandb
+        if _wandb.run is not None:
+            n = len(list_results)
+            wins = sum(1 for r in list_results if r.get("final_score", 0) > 0.5)
+            avg_ret = sum(r["reward"] for r in list_results) / n if n else 0.0
+            _wandb.log({
+                "env/win_rate":         wins / n if n else 0.0,
+                "env/avg_return":       avg_ret,
+                "curriculum/max_turn":  current_max_turn,
+                "curriculum/hint_prob": current_hint_prob,
+                "curriculum/rollouts":  curriculum.total_rollouts,
+            }, commit=False)
+    except Exception:
+        pass
 
     if include_action_mask:
         return {

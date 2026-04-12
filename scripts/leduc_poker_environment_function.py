@@ -333,8 +333,23 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(prompts, trainer,
         idx, res = f.result()
         results[idx] = res if res is not None else {"prompt_ids": [1], "completion_ids": [1], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0}
     fn.curriculum.step(len(prompts)); valid = [r for r in results if r is not None]
-    avg_ret = sum(r["reward"] for r in valid) / len(valid) if valid else 0
-    print(f"[LAST-BATCH] AvgReturn: {avg_ret:.2f}")
+    n = len(valid)
+    wins = sum(1 for r in valid if r.get("final_score", 0) > 0)
+    avg_ret = sum(r["reward"] for r in valid) / n if n else 0
+    print(f"[LAST-BATCH] AvgReturn: {avg_ret:.2f} Wins:{wins}/{n}")
+    try:
+        import wandb as _wandb
+        if _wandb.run is not None:
+            _wandb.log({
+                "env/win_rate":         wins / n if n else 0.0,
+                "env/avg_return":       avg_ret,
+                "curriculum/max_turn":  current_max_turn,
+                "curriculum/mcts_sims": current_mcts_sims,
+                "curriculum/hint_prob": current_hint_prob,
+                "curriculum/rollouts":  fn.curriculum.total_rollouts,
+            }, commit=False)
+    except Exception:
+        pass
     return {"prompt_ids": [r["prompt_ids"] for r in results], "completion_ids": [r["completion_ids"] for r in results], "logprobs": [r["logprobs"] for r in results], "env_rewards": [r["reward"] for r in results]}
 
 
@@ -408,8 +423,25 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(prompts, trainer,
     for f in as_completed([fn.thread_pool.submit(run_single, i, p) for i, p in enumerate(prompts)]):
         idx, res = f.result()
         results[idx] = res if res is not None else {"prompt_ids": [1], "completion_ids": [1], "action_mask": [0], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0}
-    fn.curriculum.step(len(prompts)); valid = [r for r in results if r is not None]
-    avg_ret = sum(r["reward"] for r in valid) / len(valid) if valid else 0; print(f"[FULL-BATCH] AvgReturn: {avg_ret:.2f}")
+    fn.curriculum.step(len(prompts))
+    valid = [r for r in results if r is not None]
+    n = len(valid)
+    wins = sum(1 for r in valid if r.get("final_score", 0) > 0)
+    avg_ret = sum(r["reward"] for r in valid) / n if n else 0
+    print(f"[FULL-BATCH] AvgReturn: {avg_ret:.2f} Wins:{wins}/{n}")
+    try:
+        import wandb as _wandb
+        if _wandb.run is not None:
+            _wandb.log({
+                "env/win_rate":         wins / n if n else 0.0,
+                "env/avg_return":       avg_ret,
+                "curriculum/max_turn":  current_max_turn,
+                "curriculum/mcts_sims": current_mcts_sims,
+                "curriculum/hint_prob": current_hint_prob,
+                "curriculum/rollouts":  fn.curriculum.total_rollouts,
+            }, commit=False)
+    except Exception:
+        pass
     return {"prompt_ids": [r["prompt_ids"] for r in results], "completion_ids": [r["completion_ids"] for r in results], "action_mask": [r["action_mask"] for r in results], "logprobs": [r["logprobs"] for r in results], "env_rewards": [r["reward"] for r in results]}
 
 
