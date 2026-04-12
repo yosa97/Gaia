@@ -1,34 +1,64 @@
-# Tournament Environments Project Instructions
+---
+name: environment-manager
+description: Manage and detail the environment tasks for Gin Rummy, Liar's Dice, and Leduc Poker. Use when configuring routing, MCTS opponents, or reward shaping.
+license: MIT
+compatibility: Requires an agent with MCP sequential thinking server.
+allowed-tools: mcp-server-sequential-thinking Bash(git:*)
+metadata:
+  version: "1.0"
+---
 
-## Project Structure
+# Environment Task Management Skill
+
+This skill provides the structure, configuration details, and directives for maintaining the server-based game environments in this repository.
+
+## Core Directives (MCP Thinking & Execution)
+When adjusting the environments, debugging configurations, or modifying reward shaping logic, **you must use your MCP sequential thinking server** (`mcp-server-sequential-thinking` or internal chain-of-thought blocks) to plan the mathematical impacts of your changes **before** generating any code. Map out curriculum dependencies and probability distributions explicitly.
+
+## Project Structure Overview
 
 ```text
 project-root/
-├── scripts/                                    # Core framework and training code
+├── scripts/
 │   ├── dockerfiles/                            # Core Docker image configurations
-│   ├── affinetes/                              # Backend environment code
-│   │   └── environments/                       # Source game rule implementations
-|   |      └── openspiel/                       # OpenSpiel game implementations
-|   |           └── agents/                     # game agent ex: (gin_rummy.py, liars_dice_agent.py, leduc_poker_agent.py)
-│   ├── grpo_env_config.py                      # GRPO training configurations
+│   ├── affinetes/                              # Submodule: Backend environment servers
+│   ├── open_spiel/                             # Submodule: OpenSpiel game definitions
 │   ├── train_grpo_env.py                       # Main GRPO training execution loop
-│   │
-│   │   # Environment Task Functions
-│   │   # These interface with the game servers to handle rollouts, curriculum scheduling, 
-│   │   # strategy hints, MCTS opponents, and reward shaping per game.
-│   ├── gin_rummy_environment_function.py       # Gin Rummy: MCTS(50,1) config, Bayesian reward shaping, and deadwood evaluation.
-│   ├── liars_dice_environment_function.py      # Liar's Dice: MCTS(225,1) config, bid plausibility tracking, and bluff penalties.
-│   └── leduc_poker_environment_function.py     # Leduc Poker: MCTS(50,1) config, mixed strategy rewards, and progressive curriculum.
-│
-├── .claude/
-│   └── skills/                                 # Claude Code skills
+│   ├── gin_rummy_environment_function.py       # Gin Rummy Env Task
+│   ├── liars_dice_environment_function.py      # Liar's Dice Env Task
+│   └── leduc_poker_environment_function.py     # Leduc Poker Env Task
 ```
 
-### Environment Tasks Overview
-The primary focus of this repository is training agents via GRPO to optimally play turn-based game environments. The game interaction logic is completely isolated into the `*_environment_function.py` scripts. 
+## Detailed Environment Configurations
 
-For each game environment, the task script manages:
-1. **Curriculum Scheduling**: Progressively ramping up difficulty by extending the maximum allowed turns (`max_turns`), reducing strategy hints (`hint_prob`), and increasing the strength of the baseline programmatic opponent (`mcts_sims`).
-2. **Server Communication**: Hitting external API endpoints (`/reset` and `/step`) to initialize games and register actions against the MCTS player.
-3. **Reward Shaping**: Translating binary terminal outputs (Win/Loss) into dense internal rewards, calculating immediate payoffs for intermediate decisions (e.g., Pot Growth in Leduc Poker, Bid Plausibility in Liar's Dice, or Deadwood improvement in Gin Rummy).
-4. **Action Parsing**: Cleaning `<thought>` reasoning tags before translating the LLM string outputs into actionable network states.
+### 1. Curriculum Scheduler (`CurriculumScheduler`)
+All environment functions use a `CurriculumScheduler` class to incrementally scale the difficulty during training. It controls:
+- `max_turn`: Progressively extending the length of the allowed game (e.g., fast checkmate scenarios to full-length games).
+- `mcts_sims`: Linearly increasing the strength of the backend opponent.
+- `hint_prob`: Fading out strategy guide prompts from 50% appearance to 0%.
+
+### 2. Gin Rummy (`gin_rummy_environment_function.py`)
+- **MCTS Opponent**: Configured for target MCTS(50, 1) simulations.
+- **Reward Shaping**: 
+  - `DEADWOOD_WEIGHT = 0.4`
+  - Highly detailed shaping rewards that track the Bayesian estimate of the agent's hand deadwood. Bonuses (`DRAW_UPCARD_BONUS`) for selecting valid meld cards.
+- **Strategy Hints**: Injected text instructing the agent on proper upcard evaluation and safe discarding using action index integers.
+
+### 3. Liar's Dice (`liars_dice_environment_function.py`)
+- **MCTS Opponent**: Highly aggressive MCTS(225, 1).
+- **Curriculum**: Progresses from `TURN=2` (one claim/challenge exchange) to a cap of `20`.
+- **Reward Shaping**: 
+  - `PASS_MISSED_CHALLENGE_PENALTY`: -0.04 tuning for balancing bluff detection against an artificially strong opponent making legitimate high bids.
+  - Plausibility penalties limit the model's reward when submitting mathematically outrageous bids.
+
+### 4. Leduc Poker (`leduc_poker_environment_function.py`)
+- **MCTS Opponent**: Progressive MCTS(10, 1) ramping to MCTS(50, 1).
+- **Curriculum**: Game length caps at strictly 8 bounds. 
+- **Reward Shaping**: 
+  - Win/Loss terminal values multiplied up to +/- 30.
+  - Mild penalties (-3.0) for poor folds and small bonuses (1.5) for preserving highest card strength in R1 without prematurely folding.
+
+## Backend Interaction Flow
+1. **Initialize (`_ensure_initialized`)**: Reads external URLs and pings HTTP `/reset` arrays initializing concurrent MCTS environments based on `MCTS_CONFIG`.
+2. **Rollout Extractor**: Strips reasoning wrappers (`<thought>`, `<thinking>`) to isolate the strict action index from completions.
+3. **HTTP Step**: Pushes action indexes asynchronously via `/step` payload to return new observation strings.
