@@ -43,6 +43,42 @@ DANGEROUS_DISCARD_PENALTY = 0.02  # penalty for discarding a card that directly 
 DRAW_UPCARD_BONUS = 0.03    # bonus when model draws upcard that reduces optimal deadwood
 DRAW_UPCARD_PENALTY = 0.02  # mild penalty when model draws upcard with no deadwood benefit
 
+# Curriculum MCTS difficulty: progressive 10→50 sims alongside turn curriculum
+CURRICULUM_INITIAL_MCTS_SIMS = 10   # easy opponent during early turn curriculum
+CURRICULUM_FINAL_MCTS_SIMS   = 50   # matches MCTS_CONFIG target at full curriculum
+
+# Comprehensive win strategy hint injected into early episodes (fades to 0 by end)
+_HINT_PROMPT = (
+    "\n\n# Strategy Guide\n"
+    "FIRSTUPCARD PHASE (52=Draw upcard, 54=Pass):\n"
+    "- Take upcard (52) ONLY if it completes or extends a run/set in your hand (reduces deadwood)\n"
+    "- Pass (54) if the upcard doesn't connect to your hand — let the opponent decide\n\n"
+    "DRAW PHASE (52=Draw upcard, 53=Draw stock):\n"
+    "- Draw upcard (52) ONLY when it directly reduces your optimal deadwood (fits a meld)\n"
+    "- Taking the upcard reveals your hand structure to the opponent — avoid it for marginal benefit\n"
+    "- Draw stock (53) when the upcard doesn't clearly help — hidden information costs nothing\n\n"
+    "DISCARD PHASE (card index from Legal Actions):\n"
+    "- Discard highest-value isolated cards first: K/Q/J cost 10 deadwood pts each\n"
+    "- Prefer discarding cards with NO neighbors in your hand (no run extensions, no rank matches)\n"
+    "- NEVER discard a card that is part of a completed meld or a 2-card partial meld\n"
+    "- 'Safe discard': choose cards whose partners already appear in the discard pile (they are dead)\n"
+    "- DANGER: avoid discarding a card in the same suit/rank as what the opponent just drew\n\n"
+    "KNOCK TIMING:\n"
+    "- Knock IMMEDIATELY when deadwood ≤ knock_card if opponent shows no sign of being close to Gin\n"
+    "- If stock pile is low (< 8 cards), always knock rather than chase Gin — forced draw ends badly\n"
+    "- Pursue Gin (0 deadwood) only when already ≤ 5 deadwood AND 1-2 cards away from completion\n"
+    "- Gin bonus (+25 pts equivalent) is worth chasing only when stock is healthy (≥ 15 cards)\n\n"
+    "LAYOFF PHASE (after opponent knocks — add cards to their melds or 54=Pass):\n"
+    "- Always layoff your highest-value cards first: K(13), Q(12), J(11) = 10 pts each\n"
+    "- Extend opponent's runs at either end if your card fits\n"
+    "- Pass (54) only when you have no valid layoff cards\n\n"
+    "OPPONENT READING:\n"
+    "- Opponent drew your discard → that card fits their meld; don't discard same rank/suit again\n"
+    "- Opponent passed the upcard → they don't need that rank/suit right now (safer to discard nearby)\n"
+    "- Opponent discarding high cards (K/Q/J) late game → they're building runs, not sets\n"
+    "- 'Dead cards' shown in observation = cards in discard pile, safe to build around\n"
+)
+
 
 def get_rank(card: str) -> str:
     """Get rank from card (e.g., '7c' -> '7')"""
@@ -1201,8 +1237,8 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
             hint_decay_optimizer_steps=hint_decay_optimizer_steps,
             warmup_rollouts=rollout_warmup_rollouts,
             mcts_warmup_optimizer_steps=mcts_warmup_optimizer_steps,
-            initial_mcts_sims=50,
-            final_mcts_sims=50,
+            initial_mcts_sims=CURRICULUM_INITIAL_MCTS_SIMS,
+            final_mcts_sims=CURRICULUM_FINAL_MCTS_SIMS,
         )
 
         print(
@@ -1211,7 +1247,7 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
             f"rollout_warmup_rollouts={rollout_warmup_rollouts}, "
             f"hint_decay_optimizer_steps={hint_decay_optimizer_steps}, "
             f"mcts_warmup_optimizer_steps={mcts_warmup_optimizer_steps}, "
-            f"mcts_sims=50->50 (constant)"
+            f"mcts_sims={CURRICULUM_INITIAL_MCTS_SIMS}->{CURRICULUM_FINAL_MCTS_SIMS} (progressive)"
         )
 
     # Retrieve static variables
@@ -1298,24 +1334,14 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
         # Fisrt make system prompt
         system_prompt = "You are playing gin_rummy.\n\n# Game Rules\nGIN RUMMY RULES:\n\nSETUP:\n- 52-card deck, each player receives 7-10 cards (variant dependent)\n- Goal: Form MELDS to minimize DEADWOOD (unmelded cards)\n\nMELDS (Valid Combinations):\n1. SET: 3+ cards of SAME RANK (e.g., 7\u2660 7\u2665 7\u2663)\n2. RUN: 3+ CONSECUTIVE cards of SAME SUIT (e.g., 5\u2666 6\u2666 7\u2666)\nExamples:\n- Valid runs: A\u2660-2\u2660-3\u2660, 9\u2665-10\u2665-J\u2665-Q\u2665, 10\u2663-J\u2663-Q\u2663-K\u2663\n- Invalid: K\u2660-A\u2660-2\u2660 (Ace is LOW only, not wraparound)\n\nCARD NOTATION:\n- Ranks: A(Ace), 2-9, T(10), J(Jack), Q(Queen), K(King)\n- Suits: s(spades\u2660), h(hearts\u2665), d(diamonds\u2666), c(clubs\u2663)\n- Example: 7c = 7 of clubs, Th = 10 of hearts, As = Ace of spades\n\nGAME PHASES:\n1. FirstUpcard: Choose to draw first upcard or pass (action IDs: 52=Draw upcard, 54=Pass)\n2. Draw: Choose to draw from upcard or stock pile (action IDs: 52=Draw upcard, 53=Draw stock)\n3. Discard: Choose which card to discard (action ID = card's index number, shown in Legal Actions)\n4. Layoff: After opponent knocks, add cards to their melds or pass (action IDs: card indices or 54=Pass)\n5. Knock: Declare end of hand when deadwood \u2264 knock_card value\n\nEACH TURN:\n1. DRAW phase: Pick from stock pile (53) OR discard pile upcard (52)\n2. DISCARD phase: Choose ONE card from hand to discard (use card's action ID from Legal Actions)\n\nKNOCKING:\n- When deadwood \u2264 knock_card value (8-10), you MAY knock to end hand\n- Gin: ALL cards form melds (0 deadwood) = 25-point bonus\n\nSCORING: Winner scores difference in deadwood point values.\nCard Values: A=1, 2-10=face value, J=11, Q=12, K=13\n\nIMPORTANT: Always respond with the action ID number ONLY, never card names.\n\n\n# Output Format\nYou must respond with ONLY the action ID (a single number).\nDo NOT include descriptions or explanations.\n\nExamples:\n- For action \"0 -> roll\": respond \"0\"\n- For action \"89 -> a3\": respond \"89\""
         
-        # Add suggestion for playing strategy based on curriculum
+        # Add strategy hints based on curriculum (fades from 50% → 0% over training)
         if use_hints:
-            suggestion_prompt = (
-                "\n\n# Strategy Tips\n"
-                "- Early game: Draw from deck to see more cards\n"
-                "- Build runs and sets to reduce deadwood\n"
-                "- Track opponent's discards to guess their hand\n"
-                "- Knock when you have ≤10 deadwood points and think you're ahead\n"
-                "- Go for Gin (0 deadwood) when close for bonus points\n"
-                "- In Layoff phase: use 'Dead cards' hint to find extension opportunities\n"
-                "- IMPORTANT: YOU MUST PICK THE ACTION ID FROM THE LEGAL ACTIONS."
-            )
-            system_prompt += suggestion_prompt
+            system_prompt += _HINT_PROMPT
 
         messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": formatted_observation}]
 
         # --- Interaction Loop ---
-        while not done and (turn_number < current_max_turn):                
+        while not done and (turn_number < current_max_turn):
             # Generate Rollout Completion
             # Only allow one thread to generate rollout completions at a time
             with rollout_last_prompt_and_completion_parallelized_curriculum.generation_semaphore:
@@ -1570,8 +1596,8 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
             hint_decay_optimizer_steps=hint_decay_optimizer_steps,
             warmup_rollouts=rollout_warmup_rollouts,
             mcts_warmup_optimizer_steps=mcts_warmup_optimizer_steps,
-            initial_mcts_sims=50,
-            final_mcts_sims=50,
+            initial_mcts_sims=CURRICULUM_INITIAL_MCTS_SIMS,
+            final_mcts_sims=CURRICULUM_FINAL_MCTS_SIMS,
         )
 
         print(
@@ -1580,7 +1606,7 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
             f"rollout_warmup_rollouts={rollout_warmup_rollouts}, "
             f"hint_decay_optimizer_steps={hint_decay_optimizer_steps}, "
             f"mcts_warmup_optimizer_steps={mcts_warmup_optimizer_steps}, "
-            f"mcts_sims=50->50 (constant)"
+            f"mcts_sims={CURRICULUM_INITIAL_MCTS_SIMS}->{CURRICULUM_FINAL_MCTS_SIMS} (progressive)"
         )
 
     # Retrieve static variables
@@ -1664,24 +1690,14 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
         # Fisrt make system prompt
         system_prompt = "You are playing gin_rummy.\n\n# Game Rules\nGIN RUMMY RULES:\n\nSETUP:\n- 52-card deck, each player receives 7-10 cards (variant dependent)\n- Goal: Form MELDS to minimize DEADWOOD (unmelded cards)\n\nMELDS (Valid Combinations):\n1. SET: 3+ cards of SAME RANK (e.g., 7\u2660 7\u2665 7\u2663)\n2. RUN: 3+ CONSECUTIVE cards of SAME SUIT (e.g., 5\u2666 6\u2666 7\u2666)\nExamples:\n- Valid runs: A\u2660-2\u2660-3\u2660, 9\u2665-10\u2665-J\u2665-Q\u2665, 10\u2663-J\u2663-Q\u2663-K\u2663\n- Invalid: K\u2660-A\u2660-2\u2660 (Ace is LOW only, not wraparound)\n\nCARD NOTATION:\n- Ranks: A(Ace), 2-9, T(10), J(Jack), Q(Queen), K(King)\n- Suits: s(spades\u2660), h(hearts\u2665), d(diamonds\u2666), c(clubs\u2663)\n- Example: 7c = 7 of clubs, Th = 10 of hearts, As = Ace of spades\n\nGAME PHASES:\n1. FirstUpcard: Choose to draw first upcard or pass (action IDs: 52=Draw upcard, 54=Pass)\n2. Draw: Choose to draw from upcard or stock pile (action IDs: 52=Draw upcard, 53=Draw stock)\n3. Discard: Choose which card to discard (action ID = card's index number, shown in Legal Actions)\n4. Layoff: After opponent knocks, add cards to their melds or pass (action IDs: card indices or 54=Pass)\n5. Knock: Declare end of hand when deadwood \u2264 knock_card value\n\nEACH TURN:\n1. DRAW phase: Pick from stock pile (53) OR discard pile upcard (52)\n2. DISCARD phase: Choose ONE card from hand to discard (use card's action ID from Legal Actions)\n\nKNOCKING:\n- When deadwood \u2264 knock_card value (8-10), you MAY knock to end hand\n- Gin: ALL cards form melds (0 deadwood) = 25-point bonus\n\nSCORING: Winner scores difference in deadwood point values.\nCard Values: A=1, 2-10=face value, J=11, Q=12, K=13\n\nIMPORTANT: Always respond with the action ID number ONLY, never card names.\n\n\n# Output Format\nYou must respond with ONLY the action ID (a single number).\nDo NOT include descriptions or explanations.\n\nExamples:\n- For action \"0 -> roll\": respond \"0\"\n- For action \"89 -> a3\": respond \"89\""
         
-        # Add suggestion for playing strategy based on curriculum
+        # Add strategy hints based on curriculum (fades from 50% → 0% over training)
         if use_hints:
-            suggestion_prompt = (
-                "\n\n# Strategy Tips\n"
-                "- Early game: Draw from deck to see more cards\n"
-                "- Build runs and sets to reduce deadwood\n"
-                "- Track opponent's discards to guess their hand\n"
-                "- Knock when you have ≤10 deadwood points and think you're ahead\n"
-                "- Go for Gin (0 deadwood) when close for bonus points\n"
-                "- In Layoff phase: use 'Dead cards' hint to find extension opportunities\n"
-                "- IMPORTANT: YOU MUST PICK THE ACTION ID FROM THE LEGAL ACTIONS."
-            )
-            system_prompt += suggestion_prompt
+            system_prompt += _HINT_PROMPT
 
         messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": formatted_observation}]
 
         # --- Interaction Loop ---
-        while not done and (turn_number < current_max_turn):                
+        while not done and (turn_number < current_max_turn):
             # Generate Rollout Completion
             # Only allow one thread to generate rollout completions at a time
             with rollout_full_prompt_and_completion_parallelized_curriculum.generation_semaphore:
