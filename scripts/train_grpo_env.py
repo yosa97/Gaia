@@ -831,6 +831,8 @@ def main():
             max_steps = 900
         elif training_args.environment_name == "gin_rummy":
             max_steps = 300
+        elif training_args.environment_name == "leduc_poker":
+            max_steps = 300
         else:
             max_steps = train_request.get("max_steps", -1)
         log_info(f"max_steps: {max_steps}")
