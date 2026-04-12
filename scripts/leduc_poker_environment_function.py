@@ -39,6 +39,14 @@ CURRICULUM_FINAL_TURN = 8         # full game length
 CURRICULUM_ROLLOUTS_PER_STAGE = 512   # 6 stages × 512 = 3072 rollouts to reach max
 CURRICULUM_WARMUP_ROLLOUTS = 128  # short warmup before progression starts
 
+# Hint curriculum: 50% of early episodes include Nash strategy tips, fading to 0%
+CURRICULUM_INITIAL_HINT_PROB = 0.5
+CURRICULUM_FINAL_HINT_PROB   = 0.0
+
+# Progressive MCTS difficulty: easy 10-sim opponent → target 50-sim alongside turn curriculum
+CURRICULUM_INITIAL_MCTS_SIMS = 10    # weaker opponent while agent learns basic play
+CURRICULUM_FINAL_MCTS_SIMS   = 50    # matches MCTS_CONFIG target at full curriculum
+
 REASONING_TAG_PAIRS = [
     ("think", "think"),
     ("thinking", "thinking"),
@@ -58,6 +66,8 @@ class CurriculumScheduler:
         initial_hint_prob: float = 0.0,
         final_hint_prob: float = 0.0,
         warmup_rollouts: int = 128,
+        initial_mcts_sims: int = 10,
+        final_mcts_sims: int = 50,
     ):
         self.initial_max_turn = initial_max_turn
         self.final_max_turn = final_max_turn
@@ -65,6 +75,8 @@ class CurriculumScheduler:
         self.initial_hint_prob = initial_hint_prob
         self.final_hint_prob = final_hint_prob
         self.warmup_rollouts = warmup_rollouts
+        self.initial_mcts_sims = initial_mcts_sims
+        self.final_mcts_sims = final_mcts_sims
         self.total_rollouts = 0
 
     def get_max_turn(self) -> int:
@@ -83,6 +95,16 @@ class CurriculumScheduler:
         progress = min(adjusted_rollouts / total_decay_rollouts, 1.0)
         current_prob = self.initial_hint_prob - progress * (self.initial_hint_prob - self.final_hint_prob)
         return max(current_prob, self.final_hint_prob)
+
+    def get_mcts_sims(self) -> int:
+        """Progressive MCTS difficulty: ramps alongside turn progression."""
+        if self.total_rollouts < self.warmup_rollouts:
+            return self.initial_mcts_sims
+        total_stages = max(self.final_max_turn - self.initial_max_turn, 1)
+        adjusted = self.total_rollouts - self.warmup_rollouts
+        stage = adjusted // self.rollouts_per_stage
+        progress = min(stage / total_stages, 1.0)
+        return int(self.initial_mcts_sims + progress * (self.final_mcts_sims - self.initial_mcts_sims))
 
     def step(self, num_rollouts: int = 1) -> None:
         self.total_rollouts += num_rollouts
@@ -200,11 +222,20 @@ _SYSTEM_PROMPT = (
     'Example: For action "1 -> call": respond "1"'
 )
 _HINT_PROMPT = (
-    "\n\n# Strategy Tips\n"
-    "- With a pair (private matches public) → raise aggressively\n"
-    "- With K → call or raise in round 1, see the public card\n"
-    "- With J → fold to aggressive raises if no pair\n"
-    "- Track opponent betting pattern to detect bluffs"
+    "\n\n# Strategy Guide\n"
+    "ROUND 1:\n"
+    "- K in hand → Raise (strongest non-pair; builds pot for potential R2 pair)\n"
+    "- Q in hand → Call (middle hand; wait to see public card)\n"
+    "- J in hand → Call; fold if opponent raises twice (weakest hand, bad pot odds)\n\n"
+    "ROUND 2 (public card now visible):\n"
+    "- Public card SAME RANK as your card → PAIR → always Raise (dominant hand)\n"
+    "- No pair + K → Call opponent raises (K beats Q and J without pair)\n"
+    "- No pair + Q → Call if opponent only called; Fold to raises\n"
+    "- No pair + J → Fold to any Raise (weakest non-pair)\n\n"
+    "READING OPPONENT:\n"
+    "- Opponent raised R1 then checked R2 → likely missed pair (caught bluffing)\n"
+    "- Opponent raised both rounds → likely has a pair; be cautious without one\n"
+    "- Opponent folded to your raise → bet was credible; note their threshold\n"
 )
 
 
@@ -225,9 +256,15 @@ def _ensure_initialized(fn, trainer) -> None:
         final_max_turn=CURRICULUM_FINAL_TURN,
         rollouts_per_stage=CURRICULUM_ROLLOUTS_PER_STAGE,
         warmup_rollouts=CURRICULUM_WARMUP_ROLLOUTS,
+        initial_hint_prob=CURRICULUM_INITIAL_HINT_PROB,
+        final_hint_prob=CURRICULUM_FINAL_HINT_PROB,
+        initial_mcts_sims=CURRICULUM_INITIAL_MCTS_SIMS,
+        final_mcts_sims=CURRICULUM_FINAL_MCTS_SIMS,
     )
     fn.initialized = True
-    print(f"[CURRICULUM] Initialized: turns {CURRICULUM_INITIAL_TURN}→{CURRICULUM_FINAL_TURN}, mcts_sims={MCTS_CONFIG['mcts_max_simulations']}")
+    print(f"[CURRICULUM] Initialized: turns {CURRICULUM_INITIAL_TURN}→{CURRICULUM_FINAL_TURN}, "
+          f"mcts_sims {CURRICULUM_INITIAL_MCTS_SIMS}→{CURRICULUM_FINAL_MCTS_SIMS}, "
+          f"hints {CURRICULUM_INITIAL_HINT_PROB}→{CURRICULUM_FINAL_HINT_PROB}")
 
 
 def rollout_last_prompt_and_completion_parallelized_curriculum(prompts, trainer, max_turns=30):
@@ -235,7 +272,8 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(prompts, trainer,
     fn = rollout_last_prompt_and_completion_parallelized_curriculum
     tokenizer = trainer.processing_class
     current_max_turn = fn.curriculum.get_max_turn(); current_hint_prob = fn.curriculum.get_hint_prob()
-    print(f"[CURRICULUM] Rollout {fn.curriculum.total_rollouts}: max_turn={current_max_turn}, hint_prob={current_hint_prob:.2f}")
+    current_mcts_sims = fn.curriculum.get_mcts_sims()
+    print(f"[CURRICULUM] Rollout {fn.curriculum.total_rollouts}: max_turn={current_max_turn}, hint_prob={current_hint_prob:.2f}, mcts_sims={current_mcts_sims}")
 
     def run_single(index, prompt):
         game_id = int(prompt); env_endpoint = fn.env_pool[(index + fn.rank) % fn.num_servers]["base_url"]
@@ -243,7 +281,9 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(prompts, trainer,
         rewards = []; prev_state = None; prompt_ids = []; completion_ids = []; logprobs = []
         use_hints = random.random() < current_hint_prob; calculator = RewardCalculator()
 
-        payload = {"task_id": game_id, "seed": game_id, "opponent": "mcts", "mcts_max_simulations": 50, "mcts_num_rollouts": 1}
+        payload = {"task_id": game_id, "seed": game_id, "opponent": "mcts",
+                   "mcts_max_simulations": current_mcts_sims,
+                   "mcts_num_rollouts": MCTS_CONFIG["mcts_num_rollouts"]}
         try:
             res = requests.post(f"{env_endpoint}/reset", json=payload, timeout=TIMEOUT)
             res.raise_for_status(); rb = res.json()["result"]
@@ -293,7 +333,8 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(prompts, trainer,
     _ensure_initialized(rollout_full_prompt_and_completion_parallelized_curriculum, trainer)
     fn = rollout_full_prompt_and_completion_parallelized_curriculum; tokenizer = trainer.processing_class
     current_max_turn = fn.curriculum.get_max_turn(); current_hint_prob = fn.curriculum.get_hint_prob()
-    print(f"[CURRICULUM] Rollout {fn.curriculum.total_rollouts}: max_turn={current_max_turn}, hint_prob={current_hint_prob:.2f}")
+    current_mcts_sims = fn.curriculum.get_mcts_sims()
+    print(f"[CURRICULUM] Rollout {fn.curriculum.total_rollouts}: max_turn={current_max_turn}, hint_prob={current_hint_prob:.2f}, mcts_sims={current_mcts_sims}")
 
     def run_single(index, prompt):
         game_id = int(prompt); env_endpoint = fn.env_pool[(index + fn.rank) % fn.num_servers]["base_url"]
@@ -302,7 +343,9 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(prompts, trainer,
         rewards = []; prev_state = None; calculator = RewardCalculator()
         use_hints = random.random() < current_hint_prob
 
-        payload = {"task_id": game_id, "seed": game_id, "opponent": "mcts", "mcts_max_simulations": 50, "mcts_num_rollouts": 1}
+        payload = {"task_id": game_id, "seed": game_id, "opponent": "mcts",
+                   "mcts_max_simulations": current_mcts_sims,
+                   "mcts_num_rollouts": MCTS_CONFIG["mcts_num_rollouts"]}
         try:
             res = requests.post(f"{env_endpoint}/reset", json=payload, timeout=TIMEOUT)
             res.raise_for_status(); rb = res.json()["result"]
