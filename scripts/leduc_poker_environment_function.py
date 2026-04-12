@@ -151,13 +151,15 @@ _RANK_STRENGTH = {"J": 1, "Q": 2, "K": 3, "A": 4}
 class RewardCalculator:
     def __init__(self, gamma: float = 0.99):
         self.gamma = gamma
-        self.pair_bonus     =  8.0
-        self.high_card_bonus =  2.0
-        self.fold_penalty   = -5.0
+        # Tuned for MCTS(50,1) — 2× stronger opponent than previous (25,1).
+        # Reduced shaping magnitudes so terminal outcome dominates (avoids reward hacking).
+        self.pair_bonus      =  5.0   # was 8.0 — less dominant, agent learns mixed strategy
+        self.high_card_bonus =  1.5   # was 2.0
+        self.fold_penalty    = -3.0   # was -5.0 — correct folds vs strong opponent less penalised
 
     def calculate_step_reward(self, prev_state, curr_state, action, is_invalid, is_terminal, final_env_reward=0.0):
         if is_terminal:
-            return max(min(final_env_reward * 50.0, 50.0), -50.0)
+            return max(min(final_env_reward * 30.0, 30.0), -30.0)  # was ×50; reduced for GRPO stability
         if is_invalid:
             return -5.0
         reward = 0.0
@@ -168,9 +170,9 @@ class RewardCalculator:
         # Penalize fold without pair on round 1 (overly passive)
         if action == ACTION_FOLD and curr_state.get("round", 1) == 1 and not curr_state.get("has_pair"):
             reward += self.fold_penalty * 0.5
-        # Pot-growth signal (winning more chips in pot = positive)
+        # Pot-growth signal
         if prev_state and curr_state.get("pot", 0) > prev_state.get("pot", 0):
-            reward += 0.5  # pot escalation is fine
+            reward += 0.3  # was 0.5 — scaled down with other shaping
         return reward
 
     def calculate_discounted_return(self, rewards: list[float]) -> float:
