@@ -11,7 +11,7 @@ from model_utility import (
 from copy import deepcopy
 from lrs_lookup import get_grpo_lr
 allow_find_lk_lr = False
-
+# jembut crot 1
 GRPO_CONFIG = {
     "0_1_b": {
         "lr": 3e-5,
