@@ -4,3 +4,7 @@
 [submodule "open_spiel"]
 	path = open_spiel
 	url = https://github.com/google-deepmind/open_spiel.git
+[submodule "G.O.D"]
+	path = G.O.D
+	url = https://github.com/gradients-ai/G.O.D.git
+
