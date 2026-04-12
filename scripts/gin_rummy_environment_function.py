@@ -1240,24 +1240,27 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
         )
         hint_decay_optimizer_steps = 100
 
-        # Initialize curriculum scheduler
+        # Initialize curriculum scheduler.
+        # rollouts_per_stage=64 advances 1 turn every ~5 optimizer steps at batch-size 14.
+        # initial_max_turn=5 ensures games can partially play from step 0 (gin needs 10+ turns).
+        # warmup_rollouts=0 starts advancing immediately instead of burning 1280 rollouts at turn=1.
         rollout_last_prompt_and_completion_parallelized_curriculum.curriculum = CurriculumScheduler(
-            initial_max_turn=1,   # fixed: trainer.args.initial_max_turn holds MCTS sim count, not turn count
+            initial_max_turn=5,
             final_max_turn=30,
-            rollouts_per_stage=trainer.args.rollouts_per_stage,
+            rollouts_per_stage=64,
             initial_hint_prob=0.5,
             final_hint_prob=0.0,
             hint_decay_optimizer_steps=hint_decay_optimizer_steps,
-            warmup_rollouts=rollout_warmup_rollouts,
+            warmup_rollouts=0,
             mcts_warmup_optimizer_steps=mcts_warmup_optimizer_steps,
             initial_mcts_sims=CURRICULUM_INITIAL_MCTS_SIMS,
             final_mcts_sims=CURRICULUM_FINAL_MCTS_SIMS,
         )
 
         print(
-            f"[CURRICULUM] Initialized with initial_max_turn=1, final_max_turn={30}, "
-            f"rollouts_per_stage={trainer.args.rollouts_per_stage}, "
-            f"rollout_warmup_rollouts={rollout_warmup_rollouts}, "
+            f"[CURRICULUM] Initialized with initial_max_turn=5, final_max_turn={30}, "
+            f"rollouts_per_stage=64, "
+            f"rollout_warmup_rollouts=0, "
             f"hint_decay_optimizer_steps={hint_decay_optimizer_steps}, "
             f"mcts_warmup_optimizer_steps={mcts_warmup_optimizer_steps}, "
             f"mcts_sims={CURRICULUM_INITIAL_MCTS_SIMS}->{CURRICULUM_FINAL_MCTS_SIMS} (progressive)"
@@ -1613,24 +1616,27 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
         )
         hint_decay_optimizer_steps = 100
 
-        # Initialize curriculum scheduler
+        # Initialize curriculum scheduler.
+        # rollouts_per_stage=64 advances 1 turn every ~5 optimizer steps at batch-size 14.
+        # initial_max_turn=5 ensures games can partially play from step 0 (gin needs 10+ turns).
+        # warmup_rollouts=0 starts advancing immediately instead of burning 1280 rollouts at turn=1.
         rollout_full_prompt_and_completion_parallelized_curriculum.curriculum = CurriculumScheduler(
-            initial_max_turn=1,   # fixed: trainer.args.initial_max_turn holds MCTS sim count, not turn count
+            initial_max_turn=5,
             final_max_turn=30,
-            rollouts_per_stage=trainer.args.rollouts_per_stage,
+            rollouts_per_stage=64,
             initial_hint_prob=0.5,
             final_hint_prob=0.0,
             hint_decay_optimizer_steps=hint_decay_optimizer_steps,
-            warmup_rollouts=rollout_warmup_rollouts,
+            warmup_rollouts=0,
             mcts_warmup_optimizer_steps=mcts_warmup_optimizer_steps,
             initial_mcts_sims=CURRICULUM_INITIAL_MCTS_SIMS,
             final_mcts_sims=CURRICULUM_FINAL_MCTS_SIMS,
         )
 
         print(
-            f"[CURRICULUM] Initialized with initial_max_turn=1, final_max_turn={30}, "
-            f"rollouts_per_stage={trainer.args.rollouts_per_stage}, "
-            f"rollout_warmup_rollouts={rollout_warmup_rollouts}, "
+            f"[CURRICULUM] Initialized with initial_max_turn=5, final_max_turn={30}, "
+            f"rollouts_per_stage=64, "
+            f"rollout_warmup_rollouts=0, "
             f"hint_decay_optimizer_steps={hint_decay_optimizer_steps}, "
             f"mcts_warmup_optimizer_steps={mcts_warmup_optimizer_steps}, "
             f"mcts_sims={CURRICULUM_INITIAL_MCTS_SIMS}->{CURRICULUM_FINAL_MCTS_SIMS} (progressive)"
