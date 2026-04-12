@@ -8,5 +8,5 @@ god-environment-tourn-e6ab686cb297ca9c-20260406-position-1/
 │   ├── dockerfiles /       # Core image Docker
 │   ├── affinetes /         # Environment code
 │       ├── environments /  # Game Code
-├── .claude/skills/       # Claude Code skills
+├── .claude/skills/         # Claude Code skills
 ```
