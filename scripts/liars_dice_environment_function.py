@@ -45,23 +45,60 @@ BID_PLAUSIBILITY_PENALTY = 0.04
 SHAPING_REWARD_CLIP = 0.35             # was 0.50 — tighter clip, terminal dominates more
 TERMINAL_REWARD_CLIP = 1.00
 
+# Curriculum hint probability: 50% of early episodes include strategy guide, fades to 0%
+CURRICULUM_INITIAL_HINT_PROB = 0.5
+CURRICULUM_FINAL_HINT_PROB   = 0.0
+
 STRATEGY_TIPS_CLASSIC = """
-STRATEGY TIPS:
-- Keep bids minimally stronger than current bid when uncertain.
-- Use your own dice + wild 6s to estimate plausible total counts.
-- Prefer calling Liar when the required quantity is implausibly high.
-- Avoid large overbids unless your private dice strongly support it.
+# Strategy Guide (Classic Liar's Dice — 2 players, N dice each)
+
+BID ANCHORING — use your own dice to set safe bids:
+- Count your matching dice: your_match = count(face) + count(6)  [6 is WILD for every face]
+- Conservative bid: claim your_match total (you provably support this)
+- Normal bid: claim your_match + 1 (expect ~1 matching from opponent per 5 dice)
+- Aggressive bid: claim your_match + 2 (opponent needs 2 matching — ~54% probable)
+
+CHALLENGE THRESHOLDS — call Liar based on how many opponent needs to have:
+- needed_from_opponent = bid_quantity - your_match
+- needed ≤ 1 from 5 dice: ~87% chance true → do NOT challenge
+- needed = 2: ~54% chance → neutral; consider prior bid history
+- needed = 3: ~21% chance → CHALLENGE (unlikely bid)
+- needed ≥ 4: < 5% chance → ALWAYS challenge (implausible)
+
+RAISING THE BID:
+- Raise face value by 1 (NOT quantity) when uncertain — keeps quantity manageable
+- Raise quantity only when your dice strongly support the higher count
+- Never jump both quantity AND face value simultaneously (too big a claim)
+- Bluff on faces where you have ≥ 1 matching die — harder to catch than a completely fabricated face
+
+READING OPPONENT:
+- Opponent raises quantity repeatedly → they likely have many of that face; stay cautious
+- Opponent switches face values → they've hit the limit for prior face; new face might be weak
+- Opponent makes a large jump (e.g., "3 twos" → "6 twos") → bluff OR very strong hand; call if you have 0 matching
+- 6 is wild: bid "3 fours" means ≥3 dice showing EITHER 4 OR 6; always count your 6s as matching
 """
 
 # FSICFR / Neller–Lanctot "Liar's die": one s-sided die, rank claims, Doubt vs Accept.
 STRATEGY_TIPS_LIARS_DIE = """
-STRATEGY TIPS (Liar's die):
-- You only know your own current roll; each claim names a die rank (face value).
-- After a claim, the opponent may Doubt (the roll is revealed) or Accept (they reroll and must claim strictly higher).
-- On Doubt, the claimant wins if their hidden roll is at least the claimed rank; otherwise the doubter wins.
-- Low rolls: bluffing upward is often necessary—telling the truth with a very low roll loses often once play continues.
-- After a high prior claim, Doubt is attractive—the claimant may be bluffing out of necessity.
-- Sometimes Accepting preserves a chance to roll high and escalate, especially early.
+# Strategy Guide (Liar's Die — single-die rank-claim variant)
+
+WHEN TO DOUBT (challenge the opponent's claimed rank):
+- Doubt when claimed rank is HIGH (5 or 6) — probability of rolling ≥ 5 is only 2/6 = 33%
+- Doubt when the round has had many Accepts — required rank keeps rising → harder to roll truthfully
+- Example: Opponent claims rank 5 after 3 Accept rounds → P(roll ≥ 5) = 33% → Doubt is profitable
+- Doubt freely at claimed rank 6 — opponent must have rolled exactly 6 (P = 1/6 = 17%)
+
+WHEN TO ACCEPT (pass the die without revealing):
+- Accept when opponent claimed a LOW rank (2-3) — high probability they're truthful, Don't risk it
+- Accept early in the round when you expect to roll high yourself and escalate further
+- Accept to deny opponent information — consistent Accept pattern hides your threshold
+
+HOW TO CLAIM (when you hold the die and must announce a rank):
+- Low roll (1-2): Bluff UP — claim rank 3 or 4; truthful claim of 1-2 forces opponent to Doubt easily
+- Mid roll (3-4): Claim truthfully or +1 above — safe and still creates doubt for opponent
+- High roll (5-6): Claim truthfully — already maximum pressure; no need to over-bluff
+- If the required minimum is already high (≥ 5): claim your actual roll; lying higher risks an easy Doubt win
+- NEVER claim rank 6 unless you rolled 6 — Doubt at 6 wins outright for the doubter ~83% of rounds
 """
 
 REASONING_TAG_PAIRS = [
@@ -688,8 +725,8 @@ def _initialize_rollout_state(trainer) -> None:
     rollout_per_stage = int(getattr(trainer.args, "rollouts_per_stage", 1280))
     initial_max_turn = CURRICULUM_INITIAL_TURN  # fixed: trainer.args.initial_max_turn holds MCTS sim count, not turn count
     final_max_turn = int(os.environ.get("LIARS_DICE_FINAL_MAX_TURN", "20"))
-    initial_hint_prob = float(os.environ.get("LIARS_DICE_INITIAL_HINT_PROB", "0.0"))
-    final_hint_prob = float(os.environ.get("LIARS_DICE_FINAL_HINT_PROB", "0.0"))
+    initial_hint_prob = float(os.environ.get("LIARS_DICE_INITIAL_HINT_PROB", str(CURRICULUM_INITIAL_HINT_PROB)))
+    final_hint_prob = float(os.environ.get("LIARS_DICE_FINAL_HINT_PROB", str(CURRICULUM_FINAL_HINT_PROB)))
 
     _ROLLOUT_STATE["rank"] = rank
     _ROLLOUT_STATE["env_pool"] = env_pool
@@ -705,6 +742,11 @@ def _initialize_rollout_state(trainer) -> None:
         warmup_rollouts=128,
     )
     _ROLLOUT_STATE["initialized"] = True
+    print(
+        f"[CURRICULUM] Initialized: turns {initial_max_turn}→{final_max_turn}, "
+        f"mcts_sims={MCTS_CONFIG['mcts_max_simulations']}, "
+        f"hints {initial_hint_prob}→{final_hint_prob}"
+    )
 
     trace_enabled = _is_truthy_env(os.environ.get("EPISODE_TRACE_ENABLED", "1"))
     trace_dir = os.environ.get("EPISODE_TRACE_DIR", "").strip()
