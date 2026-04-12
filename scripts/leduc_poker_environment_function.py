@@ -36,7 +36,7 @@ MCTS_CONFIG = {
 # Curriculum: Leduc Poker max game length = 8 turns (2 rounds × up to 4 bets each)
 CURRICULUM_INITIAL_TURN = 2       # start simple: one bet/response round
 CURRICULUM_FINAL_TURN = 8         # full game length
-CURRICULUM_ROLLOUTS_PER_STAGE = 512   # 6 stages × 512 = 3072 rollouts to reach max
+CURRICULUM_ROLLOUTS_PER_STAGE = 256   # 6 stages × 256 = 1536 rollouts to reach max
 CURRICULUM_WARMUP_ROLLOUTS = 128  # short warmup before progression starts
 
 # Hint curriculum: 50% of early episodes include Nash strategy tips, fading to 0%
