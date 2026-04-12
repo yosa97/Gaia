@@ -230,3 +230,4 @@ scripts/test_data
 eval_results/
 outputs/
 secure_checkpoints/
+examples
