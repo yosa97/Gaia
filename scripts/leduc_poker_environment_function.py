@@ -8,8 +8,15 @@ from threading import Semaphore
 
 from trl.experimental.openenv import generate_rollout_completions
 
-GAMES_TO_TASK_ID_RANGE = {
-    "leduc_poker": (200000000, 299999999)
+GAME_TO_TASK_ID_RANGE = {
+    "goofspiel": (0, 99999999),
+    "liars_dice": (100000000, 199999999),
+    "leduc_poker": (200000000, 299999999),
+    "gin_rummy": (300000000, 399999999),
+    "othello": (400000000, 499999999),
+    "backgammon": (500000000, 599999999),
+    "hex": (600000000, 699999999),
+    "clobber": (700000000, 799999999),
 }
 
 SELECTED_GAME = "leduc_poker"
