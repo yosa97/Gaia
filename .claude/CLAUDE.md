@@ -34,6 +34,8 @@ Use this file as the fast entry point, and open the reference files when you nee
   Proxy trainer service used by validator/orchestrator flows.
 - `affinetes/environments/openspiel/`
   Backend OpenSpiel actor, game config, and game-agent formatting used by the environment server.
+- `open_spiel/`
+  Upstream OpenSpiel engine submodule. This repo usually touches it through the `affinetes/environments/openspiel/` wrapper layer, not by editing the upstream engine directly.
 
 ## Current Code Truths
 
@@ -42,6 +44,7 @@ Use this file as the fast entry point, and open the reference files when you nee
 - `ActionMaskedGRPOTrainer` expects rollout functions to return `action_mask` aligned exactly with `completion_ids`.
 - `scripts/grpo_env_config.py` is for environment GRPO. `scripts/grpo_config.py` is the separate generic text-GRPO config path.
 - `train_grpo_env.py` samples up to 200,000 task ids from the selected range and uses those ids as prompts.
+- The game stack is layered as: `scripts/*_environment_function.py` -> `affinetes/environments/openspiel/` -> upstream `open_spiel/` via `pyspiel` and `open_spiel.python.*`.
 
 ## Thinking Guidance
 

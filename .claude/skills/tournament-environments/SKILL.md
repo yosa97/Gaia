@@ -14,6 +14,7 @@ Use this skill when the task touches environment GRPO training, environment-serv
    - Hyperparameters or launch command generation: `scripts/grpo_env_config.py`
    - Game-specific rollout/parsing/reward logic: `scripts/*_environment_function.py`
    - Backend observation/legal-action formatting: `affinetes/environments/openspiel/`
+   - Upstream game engine internals: `open_spiel/`
    - Containerized orchestration: `run_environment_task.sh`, `run_environment_env.sh`, `trainer/`
 
 2. Confirm the currently active code path.
@@ -41,6 +42,7 @@ Use this skill when the task touches environment GRPO training, environment-serv
 - `gin_rummy` has extra state augmentation with dead-card and Bayesian summaries.
 - `liars_dice` supports both classic multi-dice play and a single-die "liars_die" variant.
 - `grpo_env_config.py` is environment-specific; `grpo_config.py` is the separate generic GRPO path.
+- Most repo-level game changes should happen in `scripts/` or `affinetes/environments/openspiel/`; `open_spiel/` is the upstream engine layer underneath.
 
 ## References
 

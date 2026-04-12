@@ -16,6 +16,19 @@ This reference maps the main code paths for environment GRPO training in the cur
    Resets episodes via `/reset`, steps the environment via `/step`, parses observations, computes shaping rewards, manages curriculum state, and returns rollout artifacts such as `prompt_ids`, `completion_ids`, `logprobs`, and optionally `action_mask`.
 6. `affinetes/environments/openspiel/`
    Produces the backend game observations, legal actions, and MCTS opponent behavior that the rollout functions depend on.
+7. `open_spiel/`
+   Provides the upstream game engine, `pyspiel`, and `open_spiel.python.*` modules used by the Affinetes OpenSpiel wrapper.
+
+## Layer Relationship
+
+For the active board/card/dice games in this repo, the practical stack is:
+
+1. `scripts/*_environment_function.py`
+   Training-side rollout, shaping, parsing, and curriculum.
+2. `affinetes/environments/openspiel/`
+   Environment-server wrapper that formats observations, maps task ids, constructs agents, and runs MCTS or other opponents.
+3. `open_spiel/`
+   Upstream engine and Python bindings such as `pyspiel` and `open_spiel.python.algorithms.mcts`.
 
 ## Main Training Entry Point
 
@@ -181,6 +194,13 @@ Important current `Actor` methods:
 - `affinetes/environments/openspiel/agents/leduc_poker_agent.py`
 - `affinetes/environments/openspiel/agents/goofspiel.py`
   These agent files are the best place to inspect how the backend formats rules and observations for the corresponding game.
+
+### Upstream engine files
+
+- `open_spiel/`
+  This is a separate submodule from Google DeepMind.
+- In the current repo architecture, it is usually not the first place to edit.
+- The Affinetes wrapper imports from it directly, for example `import pyspiel` and `from open_spiel.python.algorithms import mcts`.
 
 ## Other Training Code In This Repo
 
