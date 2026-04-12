@@ -1,3 +1,6 @@
 [submodule "affinetes"]
 	path = affinetes
 	url = https://github.com/AffineFoundation/affinetes.git
+[submodule "open_spiel"]
+	path = open_spiel
+	url = https://github.com/google-deepmind/open_spiel.git
