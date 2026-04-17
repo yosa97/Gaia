@@ -26,7 +26,7 @@ _SELECTED_GAME = "gin_rummy"
 _MAX_EPISODE_TOKENS = 16384
 _MAX_PROMPT_LEN = 16384 - 256
 _TIMEOUT = 2400
-_MCTS_SIMS = 25
+_MCTS_SIMS = 50
 
 CARD_VALUES = {
     'A': 1, '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9,
