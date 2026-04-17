@@ -27,9 +27,9 @@ MCTS_CONFIG = {
 # Reward constants — aligns with validator "higher is better" scoring
 TERMINAL_WIN_REWARD = 1.0
 TERMINAL_LOSS_REWARD = -1.0
-GIN_BONUS = 0.6            # extra for 0-deadwood win (Gin = all melds); was 0.5 — gin more achievable with fixed curriculum
-KNOCK_BONUS = 0.15         # extra for winning via knock (tournament: reward timely knock); was 0.1
-DEADWOOD_WEIGHT = 0.3      # was 0.4 — more games reach terminal now; terminal signal dominates
+GIN_BONUS = 0.25           # extra for 0-deadwood win (Gin = all melds)
+KNOCK_BONUS = 0.1          # extra for winning via knock (tournament: reward timely knock)
+DEADWOOD_WEIGHT = 0.5      # fraction of total reward from deadwood improvement
 INVALID_PENALTY = -0.1
 INVALID_TOTAL_CLIP = -0.3
 TERMINAL_REWARD_CLIP = 1.0 # final clip for validator alignment
@@ -1042,12 +1042,7 @@ class RewardCalculator:
         invalid_total = sum(r for r in step_rewards if r < 0)
         invalid_total = max(invalid_total, INVALID_TOTAL_CLIP)
 
-        # 4. Discard safety component — penalises discards the opponent picks up face-up.
-        #    compute_discard_safety() walks GameState pairs and returns a value in [-0.1, 0.0].
-        #    Was defined but never called; now wired in as a persistent game-quality signal.
-        discard_safety = RewardCalculator.compute_discard_safety(all_states) if all_states else 0.0
-
-        raw = deadwood_component + terminal + invalid_total + discard_safety
+        raw = deadwood_component + terminal + invalid_total
         # Clip to [-1, 1] for validator alignment (higher = better)
         return max(min(raw, TERMINAL_REWARD_CLIP), -TERMINAL_REWARD_CLIP)
     
@@ -1244,29 +1239,20 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
         mcts_warmup_optimizer_steps = getattr(
             trainer.args, "mcts_warmup_optimizer_steps", None
         )
-        hint_decay_optimizer_steps = 300
+        hint_decay_optimizer_steps = 100
 
         # Initialize curriculum scheduler.
         rollout_last_prompt_and_completion_parallelized_curriculum.curriculum = CurriculumScheduler(
-            initial_max_turn=CURRICULUM_INITIAL_MAX_TURN,
+            initial_max_turn=trainer.args.initial_max_turn,
             final_max_turn=CURRICULUM_FINAL_MAX_TURN,
-            rollouts_per_stage=CURRICULUM_ROLLOUTS_PER_STAGE,
+            rollouts_per_stage=trainer.args.rollouts_per_stage,
             initial_hint_prob=0.5,
             final_hint_prob=0.0,
             hint_decay_optimizer_steps=hint_decay_optimizer_steps,
-            warmup_rollouts=CURRICULUM_WARMUP_ROLLOUTS,
+            warmup_rollouts=rollout_warmup_rollouts,
             mcts_warmup_optimizer_steps=mcts_warmup_optimizer_steps,
             initial_mcts_sims=CURRICULUM_INITIAL_MCTS_SIMS,
             final_mcts_sims=CURRICULUM_FINAL_MCTS_SIMS,
-        )
-
-        print(
-            f"[CURRICULUM] Initialized with initial_max_turn={CURRICULUM_INITIAL_MAX_TURN}, final_max_turn={CURRICULUM_FINAL_MAX_TURN}, "
-            f"rollouts_per_stage={CURRICULUM_ROLLOUTS_PER_STAGE}, "
-            f"rollout_warmup_rollouts={CURRICULUM_WARMUP_ROLLOUTS}, "
-            f"hint_decay_optimizer_steps={hint_decay_optimizer_steps}, "
-            f"mcts_warmup_optimizer_steps={mcts_warmup_optimizer_steps}, "
-            f"mcts_sims={CURRICULUM_INITIAL_MCTS_SIMS}->{CURRICULUM_FINAL_MCTS_SIMS} (progressive)"
         )
 
     # Retrieve static variables
@@ -1617,29 +1603,20 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
         mcts_warmup_optimizer_steps = getattr(
             trainer.args, "mcts_warmup_optimizer_steps", None
         )
-        hint_decay_optimizer_steps = 300
+        hint_decay_optimizer_steps = 100
 
         # Initialize curriculum scheduler.
         rollout_full_prompt_and_completion_parallelized_curriculum.curriculum = CurriculumScheduler(
-            initial_max_turn=CURRICULUM_INITIAL_MAX_TURN,
+            initial_max_turn=trainer.args.initial_max_turn,
             final_max_turn=CURRICULUM_FINAL_MAX_TURN,
-            rollouts_per_stage=CURRICULUM_ROLLOUTS_PER_STAGE,
+            rollouts_per_stage=trainer.args.rollouts_per_stage,
             initial_hint_prob=0.5,
             final_hint_prob=0.0,
             hint_decay_optimizer_steps=hint_decay_optimizer_steps,
-            warmup_rollouts=CURRICULUM_WARMUP_ROLLOUTS,
+            warmup_rollouts=rollout_warmup_rollouts,
             mcts_warmup_optimizer_steps=mcts_warmup_optimizer_steps,
             initial_mcts_sims=CURRICULUM_INITIAL_MCTS_SIMS,
             final_mcts_sims=CURRICULUM_FINAL_MCTS_SIMS,
-        )
-
-        print(
-            f"[CURRICULUM] Initialized with initial_max_turn={CURRICULUM_INITIAL_MAX_TURN}, final_max_turn={CURRICULUM_FINAL_MAX_TURN}, "
-            f"rollouts_per_stage={CURRICULUM_ROLLOUTS_PER_STAGE}, "
-            f"rollout_warmup_rollouts={CURRICULUM_WARMUP_ROLLOUTS}, "
-            f"hint_decay_optimizer_steps={hint_decay_optimizer_steps}, "
-            f"mcts_warmup_optimizer_steps={mcts_warmup_optimizer_steps}, "
-            f"mcts_sims={CURRICULUM_INITIAL_MCTS_SIMS}->{CURRICULUM_FINAL_MCTS_SIMS} (progressive)"
         )
 
     # Retrieve static variables

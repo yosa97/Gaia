@@ -33,28 +33,13 @@ MCTS_CONFIG = {
     "mcts_num_rollouts": 1,
 }
 
-# Curriculum: Liars Dice typical game length is 5-10 moves, max ~12
-CURRICULUM_INITIAL_TURN        = 2     # start simple: one claim/challenge exchange
-CURRICULUM_FINAL_TURN          = 12    # games rarely exceed 10 turns; was 20
-CURRICULUM_ROLLOUTS_PER_STAGE  = 256   # advances 1 turn every ~18 optimizer steps; was 1280
-CURRICULUM_WARMUP_ROLLOUTS     = 64    # was 128
-
-# Curriculum MCTS difficulty: progressive 10→225 sims alongside turn curriculum
-CURRICULUM_INITIAL_MCTS_SIMS   = 10    # easy opponent during early curriculum
-CURRICULUM_FINAL_MCTS_SIMS     = 225   # matches MCTS_CONFIG target
-
-# Reward settings — tuned for MCTS(225,1), 4.5× stronger than previous (50,1).
-# Reduced shaping magnitudes so terminal outcome dominates (avoids reward hacking).
+# Reward settings
 INVALID_ACTION_PENALTY = 0.10
-PASS_MISSED_CHALLENGE_PENALTY = 0.04   # was 0.06 — strong opponent makes legitimate bids
-BID_PLAUSIBILITY_BONUS = 0.09          # was 0.03 — 3× scale so plausible bids outweigh penalty
+PASS_MISSED_CHALLENGE_PENALTY = 0.06
+BID_PLAUSIBILITY_BONUS = 0.04
 BID_PLAUSIBILITY_PENALTY = 0.04
-SHAPING_REWARD_CLIP = 0.35             # was 0.50 — tighter clip, terminal dominates more
+SHAPING_REWARD_CLIP = 0.50
 TERMINAL_REWARD_CLIP = 1.00
-
-# Curriculum hint probability: 50% of early episodes include strategy guide, fades to 0%
-CURRICULUM_INITIAL_HINT_PROB = 0.5
-CURRICULUM_FINAL_HINT_PROB   = 0.0
 
 STRATEGY_TIPS_CLASSIC = """
 # Strategy Guide (Classic Liar's Dice — 2 players, N dice each)
@@ -231,11 +216,11 @@ class CurriculumScheduler:
     def __init__(
         self,
         initial_max_turn: int = 2,
-        final_max_turn: int = 12,
-        rollouts_per_stage: int = 256,
+        final_max_turn: int = 20,
+        rollouts_per_stage: int = 1280,
         initial_hint_prob: float = 0.0,
         final_hint_prob: float = 0.0,
-        warmup_rollouts: int = 64,
+        warmup_rollouts: int = 128,
         initial_mcts_sims: int = 10,
         final_mcts_sims: int = 225,
     ):
@@ -661,7 +646,7 @@ def _score_challenge_decision(
                 1.0 + _clamp((0.10 - current_bid_truth_probability) / 0.10, 0.0, 1.0)
             )
         elif current_bid_truth_probability >= 0.55:
-            reward += PASS_MISSED_CHALLENGE_PENALTY  # was 0.01; now symmetric with missed-challenge penalty
+            reward += 0.01
 
     return reward, {
         "current_bid_z": current_bid_z,
@@ -758,10 +743,11 @@ def _initialize_rollout_state(trainer) -> None:
         raise RuntimeError("ENVIRONMENT_SERVER_URLS is empty")
 
     env_pool = _build_env_pool(server_urls)
-    initial_max_turn = CURRICULUM_INITIAL_TURN
-    final_max_turn = int(os.environ.get("LIARS_DICE_FINAL_MAX_TURN", str(CURRICULUM_FINAL_TURN)))
-    initial_hint_prob = float(os.environ.get("LIARS_DICE_INITIAL_HINT_PROB", str(CURRICULUM_INITIAL_HINT_PROB)))
-    final_hint_prob = float(os.environ.get("LIARS_DICE_FINAL_HINT_PROB", str(CURRICULUM_FINAL_HINT_PROB)))
+    rollout_per_stage = int(getattr(trainer.args, "rollouts_per_stage", 1280))
+    initial_max_turn = int(getattr(trainer.args, "initial_max_turn", 2))
+    final_max_turn = int(os.environ.get("LIARS_DICE_FINAL_MAX_TURN", "20"))
+    initial_hint_prob = float(os.environ.get("LIARS_DICE_INITIAL_HINT_PROB", "0.0"))
+    final_hint_prob = float(os.environ.get("LIARS_DICE_FINAL_HINT_PROB", "0.0"))
 
     _ROLLOUT_STATE["rank"] = rank
     _ROLLOUT_STATE["env_pool"] = env_pool
@@ -771,20 +757,12 @@ def _initialize_rollout_state(trainer) -> None:
     _ROLLOUT_STATE["curriculum"] = CurriculumScheduler(
         initial_max_turn=initial_max_turn,
         final_max_turn=final_max_turn,
-        rollouts_per_stage=CURRICULUM_ROLLOUTS_PER_STAGE,
+        rollouts_per_stage=rollout_per_stage,
         initial_hint_prob=initial_hint_prob,
         final_hint_prob=final_hint_prob,
-        warmup_rollouts=CURRICULUM_WARMUP_ROLLOUTS,
-        initial_mcts_sims=CURRICULUM_INITIAL_MCTS_SIMS,
-        final_mcts_sims=CURRICULUM_FINAL_MCTS_SIMS,
+        warmup_rollouts=128,
     )
     _ROLLOUT_STATE["initialized"] = True
-    print(
-        f"[CURRICULUM] Initialized: turns {initial_max_turn}→{final_max_turn}, "
-        f"mcts_sims {CURRICULUM_INITIAL_MCTS_SIMS}→{CURRICULUM_FINAL_MCTS_SIMS}, "
-        f"rollouts_per_stage={CURRICULUM_ROLLOUTS_PER_STAGE}, "
-        f"hints {initial_hint_prob}→{final_hint_prob}"
-    )
 
     trace_enabled = _is_truthy_env(os.environ.get("EPISODE_TRACE_ENABLED", "1"))
     trace_dir = os.environ.get("EPISODE_TRACE_DIR", "").strip()
@@ -798,11 +776,8 @@ def _initialize_rollout_state(trainer) -> None:
         print("[EPISODE_TRACE] Disabled (set EPISODE_TRACE_ENABLED=1 and EPISODE_TRACE_DIR)")
 
 
-def _reset_environment(env_endpoint: str, game_id: int, timeout: int, mcts_sims: int | None = None) -> tuple[str, str]:
-    config = dict(MCTS_CONFIG)
-    if mcts_sims is not None:
-        config["mcts_max_simulations"] = mcts_sims
-    payload = {"task_id": game_id, "seed": random.randint(0, 2**31 - 1), **config}
+def _reset_environment(env_endpoint: str, game_id: int, timeout: int) -> tuple[str, str]:
+    payload = {"task_id": game_id, "seed": random.randint(0, 2**31 - 1), **MCTS_CONFIG}
     reset_res = requests.post(f"{env_endpoint}/reset", json=payload, timeout=timeout)
     reset_res.raise_for_status()
     reset_data = reset_res.json()
@@ -949,10 +924,9 @@ def _rollout_parallelized_curriculum(
     timeout = REQUEST_TIMEOUT_SECONDS
     current_max_turn = curriculum.get_max_turn()
     current_hint_prob = curriculum.get_hint_prob()
-    current_mcts_sims = curriculum.get_mcts_sims()
     print(
         f"[CURRICULUM] Rollout {curriculum.total_rollouts}: "
-        f"max_turn={current_max_turn}, hint_prob={current_hint_prob:.2f}, mcts_sims={current_mcts_sims}"
+        f"max_turn={current_max_turn}, hint_prob={current_hint_prob:.2f}"
     )
 
     def run_single_prompt(index: int, prompt: str):
@@ -986,7 +960,6 @@ def _rollout_parallelized_curriculum(
                 env_endpoint=env_endpoint,
                 game_id=game_id,
                 timeout=timeout,
-                mcts_sims=current_mcts_sims,
             )
         except Exception as e:
             print(f"Failed to reset environment (Game {game_id}): {e}")
