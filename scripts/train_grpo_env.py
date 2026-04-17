@@ -40,45 +40,12 @@ from trl.trainer.utils import use_adapter
 
 from utility import log_info
 from model_utility import is_reasoning_tokenizer
-from alf_world_environment_functions import (
-    alfworld_rollout_first_prompt_and_completion_parallelized, alfworld_rollout_full_prompt_and_completion_parallelized,
-    alfworld_rollout_reward_func
-)
-from goof_spiel_environment_function import (
-    rollout_first_prompt_and_completion as goof_spiel_rollout_first_prompt_and_completion,
-    rollout_last_prompt_and_completion_parallelized_curriculum as goof_spiel_rollout_last_prompt_and_completion_parallelized_curriculum,
-    rollout_full_prompt_and_completion_parallelized_curriculum as goof_spiel_rollout_full_prompt_and_completion_parallelized_curriculum,
-    rollout_reward_func as goof_spiel_rollout_reward_func
-)
-from gin_rummy_environment_function import (
-    rollout_full_prompt_and_completion_parallelized_curriculum as gin_rummy_rollout_full_prompt_and_completion_parallelized_curriculum,
-    rollout_reward_func as gin_rummy_rollout_reward_func,
-    rollout_last_prompt_and_completion_parallelized_curriculum as gin_rummy_rollout_last_prompt_and_completion_parallelized_curriculum
-)
-from liars_dice_environment_function import (
-    rollout_full_prompt_and_completion_parallelized_curriculum as liars_dice_rollout_full_prompt_and_completion_parallelized_curriculum,
-    rollout_reward_func as liars_dice_rollout_reward_func,
-)
-
-from leduc_poker_environment_function import (
-    rollout_full_prompt_and_completion_parallelized_curriculum as leduc_poker_rollout_full_prompt_and_completion_parallelized_curriculum,
-    rollout_reward_func as leduc_poker_rollout_reward_func,
-)
+from envs import GAMES_TO_TASK_ID_RANGE
+from envs.env_configs import EnvTrainingConfig, get_env_config
 
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
 STANDARD_GRPO_EXTRA_COLUMN = "extra_data"
 STANDARD_GRPO_PROMPT_COLUMN = "prompt"
-
-GAMES_TO_TASK_ID_RANGE = {
-    "goofspiel": (0, 99999999),
-    "liars_dice": (100000000, 199999999),
-    "leduc_poker": (200000000, 299999999),
-    "gin_rummy": (300000000, 399999999),
-    "othello": (400000000, 499999999),
-    "backgammon": (500000000, 599999999),
-    "hex": (600000000, 699999999),
-    "clobber": (700000000, 799999999),
-}
 
 
 @dataclass
@@ -89,8 +56,6 @@ class TrainingArguments(GRPOConfig):
     disable_action_mask: Optional[bool] = field(default=False)
     initial_max_turn: Optional[int] = field(default=2)
     rollouts_per_stage: Optional[int] = field(default=1280)
-    rollout_warmup_rollouts: Optional[int] = field(default=None)
-    mcts_warmup_optimizer_steps: Optional[int] = field(default=None)
     environment_name: Optional[str] = field(default=None)
 
 def print_trainable_parameters(model):
@@ -827,190 +792,70 @@ def main():
             
         print("train_ds.column_names: ", train_ds.column_names)
 
-        if training_args.environment_name == "liars_dice":
-            max_steps = 1800
-        elif training_args.environment_name == "gin_rummy":
-            max_steps = 600
-        elif training_args.environment_name == "leduc_poker":
-            max_steps = 600
-        else:
-            max_steps = train_request.get("max_steps", -1)
+        max_steps = train_request.get("max_steps", -1)
         log_info(f"max_steps: {max_steps}")
-        if max_steps is not None and max_steps != -1:
-            training_args.max_steps = int(max_steps)
-            log_info(f"Applied training_args.max_steps: {training_args.max_steps}")
 
-        if (
-            training_args.environment_name == "gin_rummy"
-            and training_args.use_vllm
-            and training_args.vllm_importance_sampling_correction
-            and training_args.vllm_importance_sampling_mode in ("sequence_mask", "sequence_truncate")
-        ):
-            prev_mode = training_args.vllm_importance_sampling_mode
-            training_args.vllm_importance_sampling_mode = "token_truncate"
-            log_info(
-                f"Switched vLLM IS mode for gin_rummy: {prev_mode} -> "
-                f"{training_args.vllm_importance_sampling_mode}"
-            )
+        cfg = get_env_config(training_args.environment_name)
 
-        # # First time rollout use default GRPO trainer
+        # Callback construction is identical across all three training modes.
+        _callback = GRPOCustomEvalSaveCallback(
+            WhenToEvalHandler(
+                train_request["end_time"],
+                train_request["save_before_remaining_time"],
+                periodic_save_steps=periodic_save_steps,
+                steps_per_epoch=total_steps_per_epoch,
+                max_steps=max_steps,
+            ),
+            train_request["submission_dir"],
+            training_args.output_dir,
+            train_request["model_name"],
+            max_steps,
+        )
+
+        # Select training mode: resolve rollout func, trainer class, mode defaults.
         if is_reasoning_tokenizer(tokenizer):
-            print("Training reasoning tokenizer model")
-            if training_args.environment_name == "goof_spiel":
-                rollout_func = goof_spiel_rollout_last_prompt_and_completion_parallelized_curriculum
-                reward_func = goof_spiel_rollout_reward_func
-                training_args.initial_max_turn = 1
-                trainer_class = GRPOTrainer
-            elif training_args.environment_name == "gin_rummy":
-                rollout_func = gin_rummy_rollout_full_prompt_and_completion_parallelized_curriculum
-                reward_func = gin_rummy_rollout_reward_func
-                training_args.initial_max_turn = 50
-                trainer_class = ActionMaskedGRPOTrainer
-            elif training_args.environment_name == "liars_dice":
-                rollout_func = liars_dice_rollout_full_prompt_and_completion_parallelized_curriculum
-                reward_func = liars_dice_rollout_reward_func
-                training_args.initial_max_turn = 225
-                trainer_class = ActionMaskedGRPOTrainer
-            elif training_args.environment_name == "leduc_poker":
-                rollout_func = leduc_poker_rollout_full_prompt_and_completion_parallelized_curriculum
-                reward_func = leduc_poker_rollout_reward_func
-                training_args.initial_max_turn = 50
-                trainer_class = ActionMaskedGRPOTrainer
-            else:
-                raise ValueError(f"Unsupported environment_name: {training_args.environment_name}")
-            
-            print(f"Training reasoning model with {trainer_class.__name__}")
-            training_args.max_completion_length = 2048
+            mode_cfg = cfg.reasoning
+            rollout_func = cfg.rollout_last
+            default_trainer_class = GRPOTrainer
+            default_completion_length = 2048
             training_args.vllm_max_model_length += 2048
-            trainer = trainer_class(
-                model=model,
-                rollout_func=rollout_func,
-                reward_funcs=[reward_func],
-                args=training_args,
-                train_dataset=train_ds,
-                eval_dataset=dev_ds,
-                processing_class=tokenizer,
-                peft_config=peft_config,
-                callbacks=[
-                    GRPOCustomEvalSaveCallback(
-                        WhenToEvalHandler(train_request["end_time"], train_request["save_before_remaining_time"], periodic_save_steps=periodic_save_steps, steps_per_epoch=total_steps_per_epoch, max_steps=max_steps),
-                        train_request["submission_dir"],
-                        training_args.output_dir,
-                        train_request["model_name"],
-                        max_steps
-                    )
-                ],
-            )
+            use_eval_dataset = True
         elif training_args.disable_action_mask:
-            if training_args.environment_name == "goof_spiel":
-                rollout_func = goof_spiel_rollout_last_prompt_and_completion_parallelized_curriculum
-                reward_func = goof_spiel_rollout_reward_func
-                training_args.initial_max_turn = 1
-                trainer_class = GRPOTrainer
-            elif training_args.environment_name == "gin_rummy":
-                rollout_func = gin_rummy_rollout_full_prompt_and_completion_parallelized_curriculum
-                reward_func = gin_rummy_rollout_reward_func
-                training_args.initial_max_turn = 50
-                trainer_class = GRPOTrainer
-            elif training_args.environment_name == "liars_dice":
-                rollout_func = liars_dice_rollout_full_prompt_and_completion_parallelized_curriculum
-                reward_func = liars_dice_rollout_reward_func
-                training_args.initial_max_turn = 225
-                trainer_class = GRPOTrainer
-            elif training_args.environment_name == "leduc_poker":
-                rollout_func = leduc_poker_rollout_full_prompt_and_completion_parallelized_curriculum
-                reward_func = leduc_poker_rollout_reward_func
-                training_args.initial_max_turn = 50
-                trainer_class = GRPOTrainer
-            else:
-                raise ValueError(f"Unsupported environment_name: {training_args.environment_name}")
-            
-            print("Training reasoning model with GRPOTrainer")
-            training_args.max_completion_length = 16
-            trainer = trainer_class(
-                model=model,
-                rollout_func=rollout_func,
-                reward_funcs=[reward_func],
-                args=training_args,
-                train_dataset=train_ds,
-                eval_dataset=dev_ds,
-                processing_class=tokenizer,
-                peft_config=peft_config,
-                callbacks=[
-                    GRPOCustomEvalSaveCallback(
-                        WhenToEvalHandler(train_request["end_time"], train_request["save_before_remaining_time"], periodic_save_steps=periodic_save_steps, steps_per_epoch=total_steps_per_epoch, max_steps=max_steps),
-                        train_request["submission_dir"],
-                        training_args.output_dir,
-                        train_request["model_name"],
-                        max_steps
-                    )
-                ],
-            )
+            mode_cfg = cfg.no_mask
+            rollout_func = cfg.rollout_last
+            default_trainer_class = GRPOTrainer
+            default_completion_length = 16
+            use_eval_dataset = True
         else:
-            if training_args.environment_name == "goof_spiel":
-                rollout_func = goof_spiel_rollout_full_prompt_and_completion_parallelized_curriculum
-                reward_func = goof_spiel_rollout_reward_func
-                trainer_class = ActionMaskedGRPOTrainer
-            elif training_args.environment_name == "gin_rummy":
-                rollout_func = gin_rummy_rollout_full_prompt_and_completion_parallelized_curriculum
-                reward_func = gin_rummy_rollout_reward_func
-                training_args.initial_max_turn = 50
-                trainer_class = ActionMaskedGRPOTrainer
-            elif training_args.environment_name == "liars_dice":
-                rollout_func = liars_dice_rollout_full_prompt_and_completion_parallelized_curriculum
-                reward_func = liars_dice_rollout_reward_func
-                training_args.initial_max_turn = 225
-                trainer_class = ActionMaskedGRPOTrainer
-            elif training_args.environment_name == "leduc_poker":
-                rollout_func = leduc_poker_rollout_full_prompt_and_completion_parallelized_curriculum
-                reward_func = leduc_poker_rollout_reward_func
-                training_args.initial_max_turn = 50
-                trainer_class = ActionMaskedGRPOTrainer
-            else:
-                raise ValueError(f"Unsupported environment_name: {training_args.environment_name}")
-                
-            # Full prompt and completion rollout use ActionMaskedGRPOTrainer
-            training_args.max_completion_length = 16
-            print("Training non-reasoning model with ActionMaskedGRPOTrainer")
-            trainer = ActionMaskedGRPOTrainer(
-                model=model,
-                rollout_func=rollout_func,
-                reward_funcs=[reward_func],
-                args=training_args,
-                train_dataset=train_ds,
-                processing_class=tokenizer,
-                peft_config=peft_config,
-                callbacks=[
-                    GRPOCustomEvalSaveCallback(
-                        WhenToEvalHandler(train_request["end_time"], train_request["save_before_remaining_time"], periodic_save_steps=periodic_save_steps, steps_per_epoch=total_steps_per_epoch, max_steps=max_steps),
-                        train_request["submission_dir"],
-                        training_args.output_dir,
-                        train_request["model_name"],
-                        max_steps
-                    )
-                ],
-            )
+            mode_cfg = cfg.full_prompt
+            rollout_func = cfg.rollout_full
+            default_trainer_class = ActionMaskedGRPOTrainer
+            default_completion_length = 16
+            use_eval_dataset = False
 
-        # ── Pre-initialize wandb so we control timeout + offline fallback ──────
-        # HF WandbCallback calls wandb.init() inside on_train_begin(). If a run
-        # is already active it reuses it (no-op). We pre-init here with a longer
-        # timeout; if it still fails we switch to offline so training never crashes.
-        if training_args.report_to and "wandb" in training_args.report_to:
-            try:
-                import wandb as _wandb
-                if _wandb.run is None:
-                    _wandb.init(
-                        project=os.environ.get("WANDB_PROJECT", "tournament-environments"),
-                        name=os.environ.get("WANDB_NAME"),
-                        id=os.environ.get("WANDB_RUN_ID"),
-                        resume="allow",
-                        settings=_wandb.Settings(init_timeout=300),
-                    )
-                    print(f"[WANDB] Pre-initialized: {_wandb.run.url if _wandb.run else 'offline'}")
-            except Exception as _e:
-                print(f"[WANDB] Init failed ({_e}), switching to OFFLINE mode")
-                os.environ["WANDB_MODE"] = "offline"
-        # ────────────────────────────────────────────────────────────────────────
+        # Apply per-env/per-mode overrides from ModeConfig.
+        if mode_cfg.initial_max_turn is not None:
+            training_args.initial_max_turn = mode_cfg.initial_max_turn
+        if mode_cfg.rollouts_per_stage is not None:
+            training_args.rollouts_per_stage = mode_cfg.rollouts_per_stage
+        training_args.max_completion_length = mode_cfg.max_completion_length or default_completion_length
+        trainer_class = mode_cfg.trainer_class or default_trainer_class
+        print(f"Training with {trainer_class.__name__} (env={training_args.environment_name})")
+
+        common_trainer_kwargs = dict(
+            model=model,
+            rollout_func=rollout_func,
+            reward_funcs=[cfg.reward_func],
+            args=training_args,
+            train_dataset=train_ds,
+            processing_class=tokenizer,
+            peft_config=peft_config,
+            callbacks=[_callback],
+        )
+        if use_eval_dataset:
+            trainer = trainer_class(**common_trainer_kwargs, eval_dataset=dev_ds)
+        else:
+            trainer = trainer_class(**common_trainer_kwargs)
 
         trainer.train()
     except Exception as e:

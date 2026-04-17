@@ -231,3 +231,8 @@ eval_results/
 outputs/
 secure_checkpoints/
 examples
+.gitmodules
+.claude
+open_spiel
+G.O.D
+AGENTS.md
