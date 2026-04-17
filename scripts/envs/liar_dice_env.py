@@ -230,6 +230,13 @@ def _curriculum_factory(args) -> CurriculumScheduler:
         warmup_rollouts=args.rollouts_per_stage,
     )
 
+def _current_mcts_sims(curriculum: CurriculumScheduler) -> int:
+    """Progressive MCTS sim ramp derived from the scheduler's turn progression."""
+    turn_range = max(curriculum.final_max_turn - curriculum.initial_max_turn, 1)
+    progress = (curriculum.get_max_turn() - curriculum.initial_max_turn) / turn_range
+    progress = max(0.0, min(progress, 1.0))
+    return int(10 + progress * (225 - 10))
+
 
 def _ensure_initialized(trainer) -> None:
     """Set up server pool and curriculum once per process (no-op afterwards)."""
@@ -297,6 +304,7 @@ def _run_episode(
     generation_semaphore: Semaphore,
     current_max_turn: int,
     current_hint_prob: float,
+    current_mcts_sims: int,
 ) -> tuple[int, "dict | None"]:
     """
     Run one episode.
@@ -346,7 +354,7 @@ def _run_episode(
         "task_id": game_id,
         "seed": game_id,
         "opponent": "mcts",
-        "mcts_max_simulations": 225,
+        "mcts_max_simulations": current_mcts_sims,
         "mcts_num_rollouts": 1,
     }
     try:
@@ -588,10 +596,15 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
     """Common dispatch + aggregation logic for both rollout variants."""
     _ensure_initialized(trainer)
 
-    curriculum        = _state["curriculum"]
+    curriculum: CurriculumScheduler = _state["curriculum"]
     current_max_turn  = curriculum.get_max_turn()
     current_hint_prob = curriculum.get_hint_prob()
-    print(f"[CURRICULUM] Rollout {curriculum.total_rollouts}: max_turn={current_max_turn}, hint_prob={current_hint_prob:.2f}")
+    current_mcts_sims = _current_mcts_sims(curriculum)
+    print(
+        f"[CURRICULUM] Rollout {curriculum.total_rollouts}: "
+        f"max_turn={current_max_turn}, hint_prob={current_hint_prob:.2f}, "
+        f"mcts_sims={current_mcts_sims}"
+    )
 
     run = functools.partial(
         _run_episode,
@@ -604,6 +617,7 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
         generation_semaphore=_state["generation_semaphore"],
         current_max_turn=current_max_turn,
         current_hint_prob=current_hint_prob,
+        current_mcts_sims=current_mcts_sims,
     )
 
     _fallback = (
@@ -621,9 +635,11 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
     curriculum.step(len(prompts))
 
     list_results = [r for r in results if r is not None]
+    n = len(list_results)
     finished  = sum(1 for r in list_results if r["final_score"] != 0)
-    avg_return = sum(r["reward"] for r in list_results) / len(list_results) if list_results else 0
-    print(f"[BATCH] Finished: {finished}/{len(list_results)}, AvgReturn: {avg_return:.2f}")
+    wins      = sum(1 for r in list_results if r.get("final_score", 0) > 0)
+    avg_return = sum(r["reward"] for r in list_results) / n if n else 0
+    print(f"[BATCH] Finished: {finished}/{n}, AvgReturn: {avg_return:.2f}")
 
     out = {
         "prompt_ids":     [r["prompt_ids"]     for r in list_results],
