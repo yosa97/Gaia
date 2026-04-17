@@ -728,6 +728,14 @@ def _curriculum_factory(args) -> CurriculumScheduler:
     )
 
 
+def _current_mcts_sims(curriculum: CurriculumScheduler) -> int:
+    """Progressive MCTS sim ramp derived from the scheduler's turn progression."""
+    turn_range = max(curriculum.final_max_turn - curriculum.initial_max_turn, 1)
+    progress = (curriculum.get_max_turn() - curriculum.initial_max_turn) / turn_range
+    progress = max(0.0, min(progress, 1.0))
+    return int(10 + progress * (50 - 10))
+
+
 def _ensure_initialized(trainer) -> None:
     if _state.get("initialized"):
         return
@@ -736,7 +744,7 @@ def _ensure_initialized(trainer) -> None:
         "task_id": GAMES_TO_TASK_ID_RANGE[_SELECTED_GAME][0],
         "seed": 42,
         "opponent": "mcts",
-        "mcts_max_simulations": _MCTS_SIMS,
+        "mcts_max_simulations": 50,
         "mcts_num_rollouts": 1,
     }
     rank, env_pool, num_servers, thread_pool, generation_semaphore = init_env_pool(reset_payload)
@@ -845,6 +853,7 @@ def _run_episode(
     generation_semaphore: Semaphore,
     current_max_turn: int,
     current_hint_prob: float,
+    current_mcts_sims: int,
 ) -> tuple[int, "dict | None"]:
     game_id      = int(prompt)
     server_idx   = (index + rank) % num_servers
@@ -887,7 +896,7 @@ def _run_episode(
         "task_id": game_id,
         "seed":    random.randint(0, 2 ** 31 - 1),
         "opponent": "mcts",
-        "mcts_max_simulations": _MCTS_SIMS,
+        "mcts_max_simulations": current_mcts_sims,
         "mcts_num_rollouts": 1,
     }
     try:
@@ -1102,10 +1111,15 @@ def _run_episode(
 def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
     _ensure_initialized(trainer)
 
-    curriculum        = _state["curriculum"]
+    curriculum: CurriculumScheduler = _state["curriculum"]
     current_max_turn  = curriculum.get_max_turn()
     current_hint_prob = curriculum.get_hint_prob()
-    print(f"[CURRICULUM] Rollout {curriculum.total_rollouts}: max_turn={current_max_turn}, hint_prob={current_hint_prob:.2f}")
+    current_mcts_sims = _current_mcts_sims(curriculum)
+    print(
+        f"[CURRICULUM] Rollout {curriculum.total_rollouts}: "
+        f"max_turn={current_max_turn}, hint_prob={current_hint_prob:.2f}, "
+        f"mcts_sims={current_mcts_sims}"
+    )
 
     run = functools.partial(
         _run_episode,
@@ -1118,6 +1132,7 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
         generation_semaphore=_state["generation_semaphore"],
         current_max_turn=current_max_turn,
         current_hint_prob=current_hint_prob,
+        current_mcts_sims=current_mcts_sims,
     )
 
     _fallback = (
