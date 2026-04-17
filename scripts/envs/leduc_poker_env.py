@@ -49,16 +49,28 @@ _BASE_SYSTEM_PROMPT = (
 )
 
 _HINT_PROMPT = (
-    "\n\n# Strategy Tips\n"
-    "Round 1:\n"
-    "- Hold K or Q → call a raise; raise first if unchallenged.\n"
-    "- Hold J → fold against a raise; check if unchallenged.\n\n"
-    "Round 2 (public card revealed):\n"
-    "- You have a PAIR → raise; never fold.\n"
-    "- You have K (no pair) → raise first; call if opponent raises.\n"
-    "- You have Q (no pair), public card is K → raise first; call if opponent raises.\n"
-    "- You have Q (no pair), public card is J → check; fold if opponent raises.\n"
-    "- You have J (no pair) → check; fold if opponent raises.\n"
+    "\n\n# Strategy Guide\n"
+    "ROUND 1:\n"
+    "- K in hand \u2192 Raise (strongest non-pair; builds pot for potential R2 pair)\n"
+    "- Q in hand \u2192 Call (middle hand; wait to see public card)\n"
+    "- J in hand \u2192 Call; fold if opponent raises twice (weakest hand, bad pot odds)\n\n"
+    "ROUND 2 (public card now visible):\n"
+    "- Public card SAME RANK as your card \u2192 PAIR \u2192 always Raise (dominant hand)\n"
+    "- No pair + K \u2192 Call opponent raises (K beats Q and J without pair)\n"
+    "- No pair + Q \u2192 Call if opponent only called; Fold to raises\n"
+    "- No pair + J \u2192 Fold to any Raise (weakest non-pair)\n\n"
+    "READING OPPONENT:\n"
+    "- Opponent raised R1 then checked R2 \u2192 likely missed pair (caught bluffing)\n"
+    "- Opponent raised both rounds \u2192 likely has a pair; be cautious without one\n"
+    "- Opponent folded to your raise \u2192 bet was credible; note their threshold\n\n"
+    "EXPLOITING THE MCTS OPPONENT (1 random rollout per node):\n"
+    "- Leduc Poker has only 936 total information states; at this sim budget MCTS covers only a fraction per decision\n"
+    "- MCTS uses random rollouts (not Nash equilibrium) \u2192 it underestimates bluffing value\n"
+    "- Random rollouts from any position win ~1/3 of the time \u2192 MCTS sees all positions as similar\n"
+    "- Play Nash equilibrium (the strategy guide above) \u2014 it ALWAYS outperforms MCTS pure strategy\n"
+    "- Key exploit: MCTS is overly passive with J \u2014 raise with K/Q more than MCTS expects\n"
+    "- Key exploit: MCTS folds too rarely vs aggressive raises \u2014 raise more with pairs in R2\n"
+    "- MCTS cannot adapt its strategy based on your betting history \u2014 consistent patterns are safe\n"
 )
 
 

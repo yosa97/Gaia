@@ -39,7 +39,7 @@ Use this skill when the task touches environment GRPO training, environment-serv
 - Preserve the default tournament opponent as MCTS unless the task explicitly says otherwise.
 - MCTS sim counts are set per-game inside each env's `_ensure_initialized()` (or at module scope for the opponent-modeling variant). The shared `CurriculumScheduler` has **no** `get_mcts_sims()` method; progressive warmup is not part of the current refactored path.
 - Current MCTS defaults (fixed, no warmup ramp):
-  - Gin Rummy (`gin_rummy_env.py`): `MCTS(25, 1)`.
+  - Gin Rummy (`gin_rummy_env.py`): `MCTS(50, 1)`.
   - Gin Rummy opponent-modeling (`gin_rummy_opponent_modeling.py`): `MCTS(25, 1)` via module-level `_MCTS_SIMS = 25`.
   - Liars Dice (`liar_dice_env.py`): `MCTS(225, 1)`.
   - Leduc Poker (`leduc_poker_env.py`): `MCTS(50, 1)`.

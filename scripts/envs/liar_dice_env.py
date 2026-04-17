@@ -40,6 +40,67 @@ NORMALIZE_REWARDS     = False  # set True to separate intermediate/terminal rewa
 
 
 # ---------------------------------------------------------------------------
+# System prompt + strategy hint (ported from legacy2)
+# ---------------------------------------------------------------------------
+
+_SYSTEM_PROMPT = (
+    "You are playing liars_dice.\n\n"
+    "# Game Rules\n"
+    "LIAR'S DICE RULES:\n\n"
+    "Setup: Each player has N dice (1-5 depending on variant). All players roll their dice secretly.\n\n"
+    "Goal: Make bids about total dice across ALL players, or call \"Liar\" on opponent's bid.\n\n"
+    "Actions:\n"
+    "- Bid (quantity, face): Claim there are at least 'quantity' dice showing 'face' among all dice.\n"
+    "- Call Liar: Challenge the previous bid.\n\n"
+    "Bidding rules: Each bid must be higher than the previous bid. \"Higher\" means:\n"
+    "  - Same face value but higher quantity (e.g., \"2 fours\" beats \"1 four\")\n"
+    "  - Same quantity but higher face value (e.g., \"2 fives\" beats \"2 fours\")\n\n"
+    "Wild dice: 6s are WILD and count as ANY face value.\n"
+    "- When counting dice for a bid, include 6s in the count\n"
+    "- Example: Bid \"3 fours\" means at least 3 dice showing EITHER 4 OR 6\n\n"
+    "Winning: If you call Liar and previous bid was false, opponent loses. If bid was true or exact, you lose.\n\n"
+    "# Output Format\n"
+    "You must respond with ONLY the action ID (a single number).\n"
+    "Do NOT include descriptions or explanations.\n"
+    "Examples:\n"
+    "- For action \"59 -> 10-6\": respond \"59\"\n"
+    "- For action \"60 -> Liar\": respond \"60\""
+)
+
+_HINT_PROMPT = (
+    "\n\n# Strategy Guide (Classic Liar's Dice \u2014 2 players, N dice each)\n\n"
+    "BID ANCHORING \u2014 use your own dice to set safe bids:\n"
+    "- Count your matching dice: your_match = count(face) + count(6)  [6 is WILD for every face]\n"
+    "- Conservative bid: claim your_match total (you provably support this)\n"
+    "- Normal bid: claim your_match + 1 (expect ~1 matching from opponent per 5 dice)\n"
+    "- Aggressive bid: claim your_match + 2 (opponent needs 2 matching \u2014 ~54% probable)\n\n"
+    "CHALLENGE THRESHOLDS \u2014 call Liar based on how many opponent needs to have:\n"
+    "- needed_from_opponent = bid_quantity - your_match\n"
+    "- needed \u2264 1 from 5 dice: ~87% chance true \u2192 do NOT challenge\n"
+    "- needed = 2: ~54% chance \u2192 neutral; consider prior bid history\n"
+    "- needed = 3: ~21% chance \u2192 CHALLENGE (unlikely bid)\n"
+    "- needed \u2265 4: < 5% chance \u2192 ALWAYS challenge (implausible)\n\n"
+    "RAISING THE BID:\n"
+    "- Raise face value by 1 (NOT quantity) when uncertain \u2014 keeps quantity manageable\n"
+    "- Raise quantity only when your dice strongly support the higher count\n"
+    "- Never jump both quantity AND face value simultaneously (too big a claim)\n"
+    "- Bluff on faces where you have \u2265 1 matching die \u2014 harder to catch than a completely fabricated face\n\n"
+    "READING OPPONENT:\n"
+    "- Opponent raises quantity repeatedly \u2192 they likely have many of that face; stay cautious\n"
+    "- Opponent switches face values \u2192 they've hit the limit for prior face; new face might be weak\n"
+    "- Opponent makes a large jump (e.g., \"3 twos\" \u2192 \"6 twos\") \u2192 bluff OR very strong hand; call if you have 0 matching\n"
+    "- 6 is wild: bid \"3 fours\" means \u2265 3 dice showing EITHER 4 OR 6; always count your 6s as matching\n\n"
+    "EXPLOITING THE MCTS OPPONENT (1 random rollout per node):\n"
+    "- MCTS evaluates each position with a SINGLE random dice rollout \u2014 this causes very high evaluation variance\n"
+    "- The \"exploit zone\" is needed=2 (54% probability): MCTS random rollouts cannot reliably distinguish bluff vs truth here\n"
+    "- Bid aggressively into this zone: claim your_match + 2 more often \u2014 MCTS will frequently mis-evaluate it\n"
+    "- Challenge firmly at needed=3+: MCTS sometimes incorrectly evaluates a 21% bid as safe due to lucky rollouts\n"
+    "- Do NOT deviate from the math thresholds above \u2014 MCTS plays probabilistically and the thresholds beat it long-run\n"
+    "- MCTS cannot track your historical bluff rate \u2014 a pattern of \"always bid +2\" will NOT be detected and countered\n"
+)
+
+
+# ---------------------------------------------------------------------------
 # Data structures and probability helpers
 # ---------------------------------------------------------------------------
 
@@ -373,31 +434,7 @@ def _run_episode(
         return index, None
 
     # --- Build system prompt ---
-    system_prompt = (
-        '"You are playing liars_dice.\n\n# Game Rules\nLIAR\'S DICE RULES:\n\n'
-        'Setup: Each player has N dice (1-5 depending on variant). All players roll their dice secretly.\n\n'
-        'Goal: Make bids about total dice across ALL players, or call "Liar" on opponent\'s bid.\n\n'
-        'Actions:\n- Bid (quantity, face): Claim there are at least \'quantity\' dice showing \'face\' among all dice.\n'
-        '- Call Liar: Challenge the previous bid.\n\n'
-        'Bidding rules: Each bid must be higher than the previous bid. "Higher" means:\n'
-        '  - Same face value but higher quantity (e.g., "2 fours" beats "1 four")\n'
-        '  - Same quantity but higher face value (e.g., "2 fives" beats "2 fours")\n\n'
-        'Wild dice: 6s are WILD and count as ANY face value.\n'
-        '- When counting dice for a bid, include 6s in the count\n'
-        '- Example: Bid "3 fours" means at least 3 dice showing EITHER 4 OR 6\n\n'
-        'Winning: If you call Liar and previous bid was false, opponent loses. If bid was true or exact, you lose.\n\n\n\n'
-        '# Output Format\nYou must respond with ONLY the action ID (a single number).\n'
-        'Do NOT include descriptions or explanations.\n\n'
-        'Examples:\n- For action "0 -> roll": respond "0"\n- For action "89 -> a3": respond "89"'
-        '"'
-    )
-    if use_hints:
-        system_prompt += (
-            '\n# Strategy Tips\n'
-            '- Count your dice that match the bid (including 6s as wild)\n'
-            '- Call "Liar" when the bid is more likely false than any available bid is true.\n'
-            '- Make conservative bids early, aggressive when opponent seems weak\n'
-        )
+    system_prompt = _SYSTEM_PROMPT + (_HINT_PROMPT if use_hints else "")
 
     messages = [
         {"role": "system", "content": system_prompt},
