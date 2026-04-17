@@ -597,6 +597,7 @@ def _run_episode(
             "logprobs":       episode_logprobs,
             "reward":         train_reward,
             "final_score":    final_reward,
+            "invalid_count":  invalid_count,
         }
     else:
         return index, {
@@ -605,6 +606,7 @@ def _run_episode(
             "logprobs":       logprobs,
             "reward":         train_reward,
             "final_score":    final_reward,
+            "invalid_count":  invalid_count,
         }
 
 
@@ -640,9 +642,9 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
     )
 
     _fallback = (
-        {"prompt_ids": [1], "completion_ids": [1], "action_mask": [0], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0}
+        {"prompt_ids": [1], "completion_ids": [1], "action_mask": [0], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0, "invalid_count": 0}
         if use_full_prompt else
-        {"prompt_ids": [1], "completion_ids": [1], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0}
+        {"prompt_ids": [1], "completion_ids": [1], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0, "invalid_count": 0}
     )
 
     results = [None] * len(prompts)
@@ -665,6 +667,9 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
         "completion_ids": [r["completion_ids"] for r in list_results],
         "logprobs":       [r["logprobs"]       for r in list_results],
         "env_rewards":    [r["reward"]         for r in list_results],
+        "terminal_raw":   [float(r["final_score"])                 for r in list_results],
+        "shaping_sum":    [float(r["reward"] - r["final_score"])   for r in list_results],
+        "invalid_count":  [int(r.get("invalid_count", 0))          for r in list_results],
     }
     if use_full_prompt:
         out["action_mask"] = [r["action_mask"] for r in list_results]

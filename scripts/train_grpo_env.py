@@ -842,10 +842,13 @@ def main():
         trainer_class = mode_cfg.trainer_class or default_trainer_class
         print(f"Training with {trainer_class.__name__} (env={training_args.environment_name})")
 
+        reward_funcs = [cfg.reward_func] + list(mode_cfg.diagnostic_funcs)
+        training_args.reward_weights = [1.0] + list(mode_cfg.diagnostic_weights)
+
         common_trainer_kwargs = dict(
             model=model,
             rollout_func=rollout_func,
-            reward_funcs=[cfg.reward_func],
+            reward_funcs=reward_funcs,
             args=training_args,
             train_dataset=train_ds,
             processing_class=tokenizer,
