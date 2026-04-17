@@ -233,7 +233,7 @@ secure_checkpoints/
 examples
 # .gitmodules
 # .claude
-open_spiel
-G.O.D
+# open_spiel
+# G.O.D
 AGENTS.md
 .claude/worktrees
