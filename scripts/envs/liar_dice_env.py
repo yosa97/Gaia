@@ -40,85 +40,6 @@ NORMALIZE_REWARDS     = False  # set True to separate intermediate/terminal rewa
 
 
 # ---------------------------------------------------------------------------
-# System prompt + strategy hint (ported from legacy2)
-# ---------------------------------------------------------------------------
-
-_SYSTEM_PROMPT = (
-    "You are playing liars_dice.\n\n"
-    "# Game Rules\n"
-    "LIAR'S DICE RULES:\n\n"
-    "Setup: Each player has N dice (1-5 depending on variant). All players roll their dice secretly.\n\n"
-    "Goal: Make bids about total dice across ALL players, or call \"Liar\" on opponent's bid.\n\n"
-    "Actions:\n"
-    "- Bid (quantity, face): Claim there are at least 'quantity' dice showing 'face' among all dice.\n"
-    "- Call Liar: Challenge the previous bid.\n\n"
-    "Bidding rules: Each bid must be higher than the previous bid. \"Higher\" means:\n"
-    "  - Same face value but higher quantity (e.g., \"2 fours\" beats \"1 four\")\n"
-    "  - Same quantity but higher face value (e.g., \"2 fives\" beats \"2 fours\")\n\n"
-    "Wild dice: 6s are WILD and count as ANY face value.\n"
-    "- When counting dice for a bid, include 6s in the count\n"
-    "- Example: Bid \"3 fours\" means at least 3 dice showing EITHER 4 OR 6\n\n"
-    "Winning: If you call Liar and previous bid was false, opponent loses. If bid was true or exact, you lose.\n\n"
-    "# Output Format\n"
-    "You must respond with ONLY the action ID (a single number).\n"
-    "Do NOT include descriptions or explanations.\n"
-    "Examples:\n"
-    "- For action \"59 -> 10-6\": respond \"59\"\n"
-    "- For action \"60 -> Liar\": respond \"60\""
-)
-
-_EOS_SUFFIXES = ("</s>", "<|im_end|>", "<|endoftext|>", "<|eot_id|>", "<|end_of_text|>")
-
-
-def extract_action_id(completion_text: str) -> str:
-    """Robust action extractor: strips common EOS markers and answer prefixes,
-    then pulls the first non-negative integer. Returns "" on parse failure."""
-    cleaned = completion_text.strip()
-    for suffix in _EOS_SUFFIXES:
-        if cleaned.endswith(suffix):
-            cleaned = cleaned[: -len(suffix)].rstrip()
-    for marker in ("Action:", "action:", "ACTION:", "Answer:", "answer:"):
-        if marker in cleaned:
-            cleaned = cleaned.split(marker)[-1].strip()
-            break
-    match = re.search(r"\b\d+\b", cleaned)
-    return match.group(0) if match else ""
-
-
-_HINT_PROMPT = (
-    "\n\n# Strategy Guide (Classic Liar's Dice \u2014 2 players, N dice each)\n\n"
-    "BID ANCHORING \u2014 use your own dice to set safe bids:\n"
-    "- Count your matching dice: your_match = count(face) + count(6)  [6 is WILD for every face]\n"
-    "- Conservative bid: claim your_match total (you provably support this)\n"
-    "- Normal bid: claim your_match + 1 (expect ~1 matching from opponent per 5 dice)\n"
-    "- Aggressive bid: claim your_match + 2 (opponent needs 2 matching \u2014 ~54% probable)\n\n"
-    "CHALLENGE THRESHOLDS \u2014 call Liar based on how many opponent needs to have:\n"
-    "- needed_from_opponent = bid_quantity - your_match\n"
-    "- needed \u2264 1 from 5 dice: ~87% chance true \u2192 do NOT challenge\n"
-    "- needed = 2: ~54% chance \u2192 neutral; consider prior bid history\n"
-    "- needed = 3: ~21% chance \u2192 CHALLENGE (unlikely bid)\n"
-    "- needed \u2265 4: < 5% chance \u2192 ALWAYS challenge (implausible)\n\n"
-    "RAISING THE BID:\n"
-    "- Raise face value by 1 (NOT quantity) when uncertain \u2014 keeps quantity manageable\n"
-    "- Raise quantity only when your dice strongly support the higher count\n"
-    "- Never jump both quantity AND face value simultaneously (too big a claim)\n"
-    "- Bluff on faces where you have \u2265 1 matching die \u2014 harder to catch than a completely fabricated face\n\n"
-    "READING OPPONENT:\n"
-    "- Opponent raises quantity repeatedly \u2192 they likely have many of that face; stay cautious\n"
-    "- Opponent switches face values \u2192 they've hit the limit for prior face; new face might be weak\n"
-    "- Opponent makes a large jump (e.g., \"3 twos\" \u2192 \"6 twos\") \u2192 bluff OR very strong hand; call if you have 0 matching\n"
-    "- 6 is wild: bid \"3 fours\" means \u2265 3 dice showing EITHER 4 OR 6; always count your 6s as matching\n\n"
-    "EXPLOITING THE MCTS OPPONENT (1 random rollout per node):\n"
-    "- MCTS evaluates each position with a SINGLE random dice rollout \u2014 this causes very high evaluation variance\n"
-    "- The \"exploit zone\" is needed=2 (54% probability): MCTS random rollouts cannot reliably distinguish bluff vs truth here\n"
-    "- Bid aggressively into this zone: claim your_match + 2 more often \u2014 MCTS will frequently mis-evaluate it\n"
-    "- Challenge firmly at needed=3+: MCTS sometimes incorrectly evaluates a 21% bid as safe due to lucky rollouts\n"
-    "- Do NOT deviate from the math thresholds above \u2014 MCTS plays probabilistically and the thresholds beat it long-run\n"
-    "- MCTS cannot track your historical bluff rate \u2014 a pattern of \"always bid +2\" will NOT be detected and countered\n"
-)
-
-
-# ---------------------------------------------------------------------------
 # Data structures and probability helpers
 # ---------------------------------------------------------------------------
 
@@ -309,13 +230,6 @@ def _curriculum_factory(args) -> CurriculumScheduler:
         warmup_rollouts=args.rollouts_per_stage,
     )
 
-def _current_mcts_sims(curriculum: CurriculumScheduler) -> int:
-    """Progressive MCTS sim ramp derived from the scheduler's turn progression."""
-    turn_range = max(curriculum.final_max_turn - curriculum.initial_max_turn, 1)
-    progress = (curriculum.get_max_turn() - curriculum.initial_max_turn) / turn_range
-    progress = max(0.0, min(progress, 1.0))
-    return int(10 + progress * (225 - 10))
-
 
 def _ensure_initialized(trainer) -> None:
     """Set up server pool and curriculum once per process (no-op afterwards)."""
@@ -353,21 +267,12 @@ def _ensure_initialized(trainer) -> None:
 # ---------------------------------------------------------------------------
 
 def _reformat_observation(obs: str, gs: GameState, use_hints: bool) -> str:
-    """Annotate each legal bid with its truth probability, optionally shuffle, and add hint."""
-    actions = gs.actions[:]
+    """Randomly shuffle the displayed action order and optionally append a per-turn hint."""
     if random.random() < SHUFFLE_PROB:
+        actions = gs.actions[:]
         random.shuffle(actions)
-    # Annotate every action with the binomial truth probability so the LLM doesn't
-    # have to recompute from scratch each turn — this is information the env already
-    # derives from public state (your dice + bid history).
-    action_lines = []
-    for a in actions:
-        if a.is_liar:
-            action_lines.append(f"{a.action_id} -> {a.label} (p_lie={a.prob:.2f})")
-        else:
-            action_lines.append(f"{a.action_id} -> {a.label} (p_true={a.prob:.2f})")
-    action_block = "Legal Actions:\n" + "\n".join(action_lines)
-    obs = re.sub(r"Legal Actions:\n(?:[ \t]*\d+[ \t]*->[ \t]*\S.*(?:\n|$))+", action_block + "\n", obs)
+        action_block = "Legal Actions:\n" + "\n".join(f"{a.action_id} -> {a.label}" for a in actions)
+        obs = re.sub(r"Legal Actions:\n(?:[ \t]*\d+[ \t]*->[ \t]*\S.*(?:\n|$))+", action_block + "\n", obs)
     if use_hints:
         scores = [a.score for a in gs.actions]
         best = random.choices(gs.actions, weights=scores, k=1)[0]
@@ -392,7 +297,6 @@ def _run_episode(
     generation_semaphore: Semaphore,
     current_max_turn: int,
     current_hint_prob: float,
-    current_mcts_sims: int,
 ) -> tuple[int, "dict | None"]:
     """
     Run one episode.
@@ -401,6 +305,7 @@ def _run_episode(
     action masking (mask=1 for LLM completions, mask=0 for environment turns).
     When ``use_full_prompt=False``, only the final turn's token IDs are kept.
     """
+    current_max_turn = 5
     game_id = int(prompt)
 
     server_idx   = (index + rank) % num_servers
@@ -432,10 +337,6 @@ def _run_episode(
     bluff_count      = 0
     risky_liar_count = 0
     last_action_prob = 0.0
-    components: dict[str, float] = {
-        "score_sum": 0.0, "terminal": 0.0,
-        "bluff_bonus": 0.0, "risky_liar_bonus": 0.0, "invalid_total": 0.0,
-    }
 
     # Per-episode hint flag
     use_hints = random.random() < current_hint_prob
@@ -445,7 +346,7 @@ def _run_episode(
         "task_id": game_id,
         "seed": game_id,
         "opponent": "mcts",
-        "mcts_max_simulations": current_mcts_sims,
+        "mcts_max_simulations": 225,
         "mcts_num_rollouts": 1,
     }
     try:
@@ -464,7 +365,31 @@ def _run_episode(
         return index, None
 
     # --- Build system prompt ---
-    system_prompt = _SYSTEM_PROMPT + (_HINT_PROMPT if use_hints else "")
+    system_prompt = (
+        '"You are playing liars_dice.\n\n# Game Rules\nLIAR\'S DICE RULES:\n\n'
+        'Setup: Each player has N dice (1-5 depending on variant). All players roll their dice secretly.\n\n'
+        'Goal: Make bids about total dice across ALL players, or call "Liar" on opponent\'s bid.\n\n'
+        'Actions:\n- Bid (quantity, face): Claim there are at least \'quantity\' dice showing \'face\' among all dice.\n'
+        '- Call Liar: Challenge the previous bid.\n\n'
+        'Bidding rules: Each bid must be higher than the previous bid. "Higher" means:\n'
+        '  - Same face value but higher quantity (e.g., "2 fours" beats "1 four")\n'
+        '  - Same quantity but higher face value (e.g., "2 fives" beats "2 fours")\n\n'
+        'Wild dice: 6s are WILD and count as ANY face value.\n'
+        '- When counting dice for a bid, include 6s in the count\n'
+        '- Example: Bid "3 fours" means at least 3 dice showing EITHER 4 OR 6\n\n'
+        'Winning: If you call Liar and previous bid was false, opponent loses. If bid was true or exact, you lose.\n\n\n\n'
+        '# Output Format\nYou must respond with ONLY the action ID (a single number).\n'
+        'Do NOT include descriptions or explanations.\n\n'
+        'Examples:\n- For action "0 -> roll": respond "0"\n- For action "89 -> a3": respond "89"'
+        '"'
+    )
+    if use_hints:
+        system_prompt += (
+            '\n# Strategy Tips\n'
+            '- Count your dice that match the bid (including 6s as wild)\n'
+            '- Call "Liar" when the bid is more likely false than any available bid is true.\n'
+            '- Make conservative bids early, aggressive when opponent seems weak\n'
+        )
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -523,8 +448,12 @@ def _run_episode(
 
         messages.append({"role": "assistant", "content": completion_text})
 
-        # --- Parse action (robust: handles multiple EOS markers + answer prefixes) ---
-        action_to_send = extract_action_id(completion_text)
+        # --- Parse action (game-specific: strip EOS / "Action:" prefix) ---
+        action_to_send = completion_text
+        if action_to_send.endswith("</s>"):
+            action_to_send = action_to_send[:-4]
+        if "Action:" in action_to_send:
+            action_to_send = action_to_send.split("Action:")[-1].strip()
 
         # --- Step environment ---
         is_invalid = False
@@ -593,27 +522,20 @@ def _run_episode(
                     game_state_history.append(game_state)
                     immediate_reward = calculator.calculate_step_reward(taken_action, 0.0)
                     step_scores.append(taken_action.score if taken_action else 0.0)
-                    components["score_sum"] += taken_action.score if taken_action else 0.0
                 else:
                     won = step_reward > 0.5
-                    action_score = taken_action.score if taken_action else 0.0
-                    terminal_part = (step_reward - 0.5) * 2.0
-                    immediate_reward = action_score + terminal_part
-                    step_scores.append(action_score)
-                    terminal_reward = terminal_part
-                    components["score_sum"] += action_score
-                    components["terminal"]  += terminal_part
+                    immediate_reward = (taken_action.score if taken_action else 0.0)
+                    immediate_reward += (step_reward - 0.5) * 2.0
+                    step_scores.append(taken_action.score if taken_action else 0.0)
+                    terminal_reward = (step_reward - 0.5) * 2.0
                     if won:
-                        bluff_bonus_part = BLUFF_WIN_BONUS * min(bluff_count, RISKY_BONUS_MAX_COUNT)
-                        risky_bonus_part = RISKY_LIAR_WIN_BONUS * min(risky_liar_count, RISKY_BONUS_MAX_COUNT)
-                        immediate_reward += bluff_bonus_part + risky_bonus_part
-                        terminal_reward  += bluff_bonus_part + risky_bonus_part
-                        components["bluff_bonus"]      += bluff_bonus_part
-                        components["risky_liar_bonus"] += risky_bonus_part
+                        immediate_reward += BLUFF_WIN_BONUS * min(bluff_count, RISKY_BONUS_MAX_COUNT)
+                        immediate_reward += RISKY_LIAR_WIN_BONUS * min(risky_liar_count, RISKY_BONUS_MAX_COUNT)
+                        terminal_reward  += BLUFF_WIN_BONUS * min(bluff_count, RISKY_BONUS_MAX_COUNT)
+                        terminal_reward  += RISKY_LIAR_WIN_BONUS * min(risky_liar_count, RISKY_BONUS_MAX_COUNT)
         else:
             immediate_reward = -1.0
             step_scores.append(-1.0)
-            components["invalid_total"] += -1.0
 
         rewards.append(immediate_reward)
         turn_number += 1
@@ -634,9 +556,6 @@ def _run_episode(
         )
     )
 
-    components["bluff_count"]      = float(bluff_count)
-    components["risky_liar_count"] = float(risky_liar_count)
-
     # --- Build result ---
     if use_full_prompt:
         if len(episode_completion_ids) > _MAX_EPISODE_TOKENS:
@@ -650,8 +569,6 @@ def _run_episode(
             "logprobs":       episode_logprobs,
             "reward":         train_reward,
             "final_score":    final_reward,
-            "invalid_count":  invalid_count,
-            "components":     components,
         }
     else:
         return index, {
@@ -660,8 +577,6 @@ def _run_episode(
             "logprobs":       logprobs,
             "reward":         train_reward,
             "final_score":    final_reward,
-            "invalid_count":  invalid_count,
-            "components":     components,
         }
 
 
@@ -673,15 +588,10 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
     """Common dispatch + aggregation logic for both rollout variants."""
     _ensure_initialized(trainer)
 
-    curriculum: CurriculumScheduler = _state["curriculum"]
+    curriculum        = _state["curriculum"]
     current_max_turn  = curriculum.get_max_turn()
     current_hint_prob = curriculum.get_hint_prob()
-    current_mcts_sims = _current_mcts_sims(curriculum)
-    print(
-        f"[CURRICULUM] Rollout {curriculum.total_rollouts}: "
-        f"max_turn={current_max_turn}, hint_prob={current_hint_prob:.2f}, "
-        f"mcts_sims={current_mcts_sims}"
-    )
+    print(f"[CURRICULUM] Rollout {curriculum.total_rollouts}: max_turn={current_max_turn}, hint_prob={current_hint_prob:.2f}")
 
     run = functools.partial(
         _run_episode,
@@ -694,13 +604,12 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
         generation_semaphore=_state["generation_semaphore"],
         current_max_turn=current_max_turn,
         current_hint_prob=current_hint_prob,
-        current_mcts_sims=current_mcts_sims,
     )
 
     _fallback = (
-        {"prompt_ids": [1], "completion_ids": [1], "action_mask": [0], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0, "invalid_count": 0, "components": {}}
+        {"prompt_ids": [1], "completion_ids": [1], "action_mask": [0], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0}
         if use_full_prompt else
-        {"prompt_ids": [1], "completion_ids": [1], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0, "invalid_count": 0, "components": {}}
+        {"prompt_ids": [1], "completion_ids": [1], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0}
     )
 
     results = [None] * len(prompts)
@@ -712,36 +621,15 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
     curriculum.step(len(prompts))
 
     list_results = [r for r in results if r is not None]
-    n = len(list_results)
     finished  = sum(1 for r in list_results if r["final_score"] != 0)
-    wins      = sum(1 for r in list_results if r.get("final_score", 0) > 0)
-    losses    = sum(1 for r in list_results if r.get("final_score", 0) < 0)
-    avg_return = sum(r["reward"] for r in list_results) / n if n else 0
-    win_rate   = (wins / finished) if finished else 0.0
-    avg_invalid = sum(r.get("invalid_count", 0) for r in list_results) / n if n else 0
-    print(
-        f"[BATCH] Finished:{finished}/{n} W:{wins} L:{losses} "
-        f"WinRate:{win_rate:.2%} AvgReturn:{avg_return:.2f} AvgInv:{avg_invalid:.2f}"
-    )
-
-    component_keys = ["score_sum", "terminal", "bluff_bonus", "risky_liar_bonus",
-                      "invalid_total", "bluff_count", "risky_liar_count"]
-    if n:
-        avgs = {
-            k: sum(r.get("components", {}).get(k, 0.0) for r in list_results) / n
-            for k in component_keys
-        }
-        comp_str = " ".join(f"{k}:{v:+.2f}" for k, v in avgs.items())
-        print(f"[SHAPING] {comp_str}")
+    avg_return = sum(r["reward"] for r in list_results) / len(list_results) if list_results else 0
+    print(f"[BATCH] Finished: {finished}/{len(list_results)}, AvgReturn: {avg_return:.2f}")
 
     out = {
         "prompt_ids":     [r["prompt_ids"]     for r in list_results],
         "completion_ids": [r["completion_ids"] for r in list_results],
         "logprobs":       [r["logprobs"]       for r in list_results],
         "env_rewards":    [r["reward"]         for r in list_results],
-        "terminal_raw":   [float(r["final_score"])                 for r in list_results],
-        "shaping_sum":    [float(r["reward"] - r["final_score"])   for r in list_results],
-        "invalid_count":  [int(r.get("invalid_count", 0))          for r in list_results],
     }
     if use_full_prompt:
         out["action_mask"] = [r["action_mask"] for r in list_results]

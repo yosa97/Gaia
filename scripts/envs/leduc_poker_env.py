@@ -49,28 +49,16 @@ _BASE_SYSTEM_PROMPT = (
 )
 
 _HINT_PROMPT = (
-    "\n\n# Strategy Guide\n"
-    "ROUND 1:\n"
-    "- K in hand \u2192 Raise (strongest non-pair; builds pot for potential R2 pair)\n"
-    "- Q in hand \u2192 Call (middle hand; wait to see public card)\n"
-    "- J in hand \u2192 Call; fold if opponent raises twice (weakest hand, bad pot odds)\n\n"
-    "ROUND 2 (public card now visible):\n"
-    "- Public card SAME RANK as your card \u2192 PAIR \u2192 always Raise (dominant hand)\n"
-    "- No pair + K \u2192 Call opponent raises (K beats Q and J without pair)\n"
-    "- No pair + Q \u2192 Call if opponent only called; Fold to raises\n"
-    "- No pair + J \u2192 Fold to any Raise (weakest non-pair)\n\n"
-    "READING OPPONENT:\n"
-    "- Opponent raised R1 then checked R2 \u2192 likely missed pair (caught bluffing)\n"
-    "- Opponent raised both rounds \u2192 likely has a pair; be cautious without one\n"
-    "- Opponent folded to your raise \u2192 bet was credible; note their threshold\n\n"
-    "EXPLOITING THE MCTS OPPONENT (1 random rollout per node):\n"
-    "- Leduc Poker has only 936 total information states; at this sim budget MCTS covers only a fraction per decision\n"
-    "- MCTS uses random rollouts (not Nash equilibrium) \u2192 it underestimates bluffing value\n"
-    "- Random rollouts from any position win ~1/3 of the time \u2192 MCTS sees all positions as similar\n"
-    "- Play Nash equilibrium (the strategy guide above) \u2014 it ALWAYS outperforms MCTS pure strategy\n"
-    "- Key exploit: MCTS is overly passive with J \u2014 raise with K/Q more than MCTS expects\n"
-    "- Key exploit: MCTS folds too rarely vs aggressive raises \u2014 raise more with pairs in R2\n"
-    "- MCTS cannot adapt its strategy based on your betting history \u2014 consistent patterns are safe\n"
+    "\n\n# Strategy Tips\n"
+    "Round 1:\n"
+    "- Hold K or Q → call a raise; raise first if unchallenged.\n"
+    "- Hold J → fold against a raise; check if unchallenged.\n\n"
+    "Round 2 (public card revealed):\n"
+    "- You have a PAIR → raise; never fold.\n"
+    "- You have K (no pair) → raise first; call if opponent raises.\n"
+    "- You have Q (no pair), public card is K → raise first; call if opponent raises.\n"
+    "- You have Q (no pair), public card is J → check; fold if opponent raises.\n"
+    "- You have J (no pair) → check; fold if opponent raises.\n"
 )
 
 
@@ -283,54 +271,42 @@ class RewardCalculator:
         self.terminal_weight = terminal_weight
         self.gamma = gamma
 
-    def calculate_step_reward(
-        self,
-        gs: "GameState | None",
-        action_str: str,
-        env_reward: float,
-        components: "dict | None" = None,
-    ) -> float:
+    def calculate_step_reward(self, gs: "GameState | None", action_str: str, env_reward: float) -> float:
         reward = 0.0
-        signal_key: "str | None" = None
 
         if gs is not None:
             pub = gs.public_card_rank or 0
 
             if action_str == "Fold":
                 if gs.has_pair:
-                    signal_key = "fold_pair"
+                    reward += self.SIGNALS["fold_pair"]
                 elif gs.private_card_rank == 3:
-                    signal_key = "fold_k"
+                    reward += self.SIGNALS["fold_k"]
                 elif gs.round == 1 and gs.opp_last_action == "Raise":
-                    signal_key = "fold_kq_r1_raise" if gs.private_card_rank >= 2 else "fold_j_r1_raise"
+                    if gs.private_card_rank >= 2:
+                        reward += self.SIGNALS["fold_kq_r1_raise"]
+                    else:
+                        reward += self.SIGNALS["fold_j_r1_raise"]
                 elif gs.round == 2 and gs.opp_last_action == "Raise":
                     if gs.private_card_rank == 1:
-                        signal_key = "fold_j_r2_raise"
+                        reward += self.SIGNALS["fold_j_r2_raise"]
                     elif gs.private_card_rank == 2 and pub == 1:
-                        signal_key = "fold_q_pubj_raise"
+                        reward += self.SIGNALS["fold_q_pubj_raise"]
                     elif gs.private_card_rank == 2 and pub == 3:
-                        signal_key = "fold_q_pubk_raise"
+                        reward += self.SIGNALS["fold_q_pubk_raise"]
 
             elif action_str == "Raise":
                 if gs.round == 2 and gs.has_pair:
-                    signal_key = "raise_pair_r2"
+                    reward += self.SIGNALS["raise_pair_r2"]
                 elif gs.round == 2 and gs.private_card_rank == 3 and not gs.has_pair:
-                    signal_key = "raise_k_r2"
+                    reward += self.SIGNALS["raise_k_r2"]
 
             elif action_str in ("Call", "Check"):
                 if gs.round == 1 and gs.opp_last_action == "Raise" and gs.private_card_rank >= 2:
-                    signal_key = "call_kq_r1_raise"
+                    reward += self.SIGNALS["call_kq_r1_raise"]
 
-        if signal_key is not None:
-            reward += self.SIGNALS[signal_key]
-
-        terminal_part = env_reward * self.terminal_weight if env_reward != 0.0 else 0.0
-        reward += terminal_part
-
-        if components is not None:
-            if signal_key is not None:
-                components[signal_key] = components.get(signal_key, 0.0) + self.SIGNALS[signal_key]
-            components["terminal"] = components.get("terminal", 0.0) + terminal_part
+        if env_reward != 0.0:
+            reward += env_reward * self.terminal_weight
 
         return reward
 
@@ -358,18 +334,6 @@ def _curriculum_factory(args) -> CurriculumScheduler:
         final_hint_prob=0.0,
         warmup_rollouts=args.rollouts_per_stage,
     )
-
-
-def _current_mcts_sims(curriculum: CurriculumScheduler) -> int:
-    """
-    Progressive MCTS sim ramp, derived from the shared scheduler's existing
-    turn progression — no subclassing needed.  Easy→target as the agent
-    advances through turn stages.
-    """
-    turn_range = max(curriculum.final_max_turn - curriculum.initial_max_turn, 1)
-    progress = (curriculum.get_max_turn() - curriculum.initial_max_turn) / turn_range
-    progress = max(0.0, min(progress, 1.0))
-    return int(10 + progress * (50 - 10))
 
 
 def _ensure_initialized(trainer) -> None:
@@ -455,42 +419,14 @@ def _format_observation(raw: str) -> str:
     return "\n\n".join(parts)
 
 
-def _pot_odds_line(gs: "GameState | None") -> str:
-    """One-line pot-odds cue derived from the parsed game state.
-
-    Pot odds = chips_to_call / (pot + chips_to_call): the minimum win rate at which
-    calling is +EV. Returns empty when there's nothing to call.
-    """
-    if gs is None:
-        return ""
-    chips_to_call = max(gs.opp_contributed - gs.our_contributed, 0)
-    if chips_to_call == 0:
-        return f"[Pot odds] Pot:{gs.pot}  To call:0  No bet to face."
-    pot_after_call = gs.pot + chips_to_call
-    threshold = chips_to_call / pot_after_call if pot_after_call > 0 else 0.0
-    return (
-        f"[Pot odds] Pot:{gs.pot}  To call:{chips_to_call}  "
-        f"Win-rate to break-even: {threshold:.0%} "
-        f"(call profitable if your est. win rate \u2265 {threshold:.0%})"
-    )
-
-
-_EOS_SUFFIXES = ("</s>", "<|im_end|>", "<|endoftext|>", "<|eot_id|>", "<|end_of_text|>")
-
-
 def _parse_action(completion_text: str) -> str:
-    """Robust action extractor: strips common EOS markers + answer prefixes,
-    then pulls the first non-negative integer. Returns "" on parse failure."""
-    cleaned = completion_text.strip()
-    for suffix in _EOS_SUFFIXES:
-        if cleaned.endswith(suffix):
-            cleaned = cleaned[: -len(suffix)].rstrip()
-    for marker in ("Action:", "action:", "ACTION:", "Answer:", "answer:"):
-        if marker in cleaned:
-            cleaned = cleaned.split(marker)[-1].strip()
-            break
-    match = re.search(r"\b\d+\b", cleaned)
-    return match.group(0) if match else ""
+    """Extract action ID from model output."""
+    action = completion_text.strip()
+    if action.endswith("</s>"):
+        action = action[:-4].strip()
+    if "Action:" in action:
+        action = action.split("Action:")[-1].strip()
+    return action
 
 
 def _run_episode(
@@ -505,7 +441,6 @@ def _run_episode(
     tokenizer,
     generation_semaphore: Semaphore,
     current_hint_prob: float,
-    current_mcts_sims: int,
 ) -> tuple[int, "dict | None"]:
     """
     Run one Leduc Poker episode.
@@ -542,15 +477,13 @@ def _run_episode(
     game_state_history: list[GameState] = []
     calculator    = RewardCalculator()
     rewards:        list[float] = []
-    components: dict[str, float] = {}
-    invalid_penalty_sum: float   = 0.0
 
     # Reset environment
     reset_payload = {
         "task_id": game_id,
         "seed": game_id,
         "opponent": "mcts",
-        "mcts_max_simulations": current_mcts_sims,
+        "mcts_max_simulations": 50,
         "mcts_num_rollouts": 1,
     }
     try:
@@ -562,9 +495,6 @@ def _run_episode(
         gs = parse_game_state(observation)
         if gs is not None:
             game_state_history.append(gs)
-            pot_line = _pot_odds_line(gs)
-            if pot_line:
-                observation = f"{observation}\n\n{pot_line}"
     except Exception as exc:
         import traceback; traceback.print_exc()
         print(f"Failed to reset environment (Game {game_id}): {exc}")
@@ -646,9 +576,6 @@ def _run_episode(
                 gs = parse_game_state(observation)
                 if gs is not None:
                     game_state_history.append(gs)
-                    pot_line = _pot_odds_line(gs)
-                    if pot_line:
-                        observation = f"{observation}\n\n{pot_line}"
         except Exception as exc:
             print(f"Step failed (Game {game_id}, turn {turn_number}): {exc}")
             observation = ""
@@ -656,12 +583,10 @@ def _run_episode(
             done        = False
             invalid_count += 1
             episode_reward += _INVALID_PENALTY
-            invalid_penalty_sum += _INVALID_PENALTY
 
         if "Nothing happens" in observation or "Invalid" in observation:
             invalid_count += 1
             episode_reward += _INVALID_PENALTY
-            invalid_penalty_sum += _INVALID_PENALTY
 
         if done:
             final_reward = step_reward
@@ -670,9 +595,7 @@ def _run_episode(
             action_str = prev_gs.legal_actions.get(int(action_to_send.strip()), "") if prev_gs else ""
         except (ValueError, AttributeError):
             action_str = ""
-        step_shaped = calculator.calculate_step_reward(
-            prev_gs, action_str, step_reward if done else 0.0, components=components,
-        )
+        step_shaped = calculator.calculate_step_reward(prev_gs, action_str, step_reward if done else 0.0)
         rewards.append(step_shaped)
 
         messages.append({"role": "user", "content": observation})
@@ -684,8 +607,6 @@ def _run_episode(
             str(game_id)[:6], int(done), turn_number, int(use_hints), final_reward, train_reward, invalid_count,
         )
     )
-
-    components["invalid_penalty"] = invalid_penalty_sum
 
     # --- Build result ---
     if use_full_prompt:
@@ -700,8 +621,6 @@ def _run_episode(
             "logprobs":       episode_logprobs,
             "reward":         train_reward,
             "final_score":    final_reward,
-            "invalid_count":  invalid_count,
-            "components":     components,
         }
     else:
         return index, {
@@ -710,8 +629,6 @@ def _run_episode(
             "logprobs":       logprobs,
             "reward":         train_reward,
             "final_score":    final_reward,
-            "invalid_count":  invalid_count,
-            "components":     components,
         }
 
 
@@ -723,15 +640,9 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
     """Common dispatch + aggregation logic for both rollout variants."""
     _ensure_initialized(trainer)
 
-    curriculum: CurriculumScheduler = _state["curriculum"]
-    current_max_turn  = curriculum.get_max_turn()
+    curriculum        = _state["curriculum"]
     current_hint_prob = curriculum.get_hint_prob()
-    current_mcts_sims = _current_mcts_sims(curriculum)
-    print(
-        f"[CURRICULUM] Rollout {curriculum.total_rollouts}: "
-        f"max_turn={current_max_turn}, hint_prob={current_hint_prob:.2f}, "
-        f"mcts_sims={current_mcts_sims}"
-    )
+    print(f"[CURRICULUM] Rollout {curriculum.total_rollouts}: hint_prob={current_hint_prob:.2f}")
 
     run = functools.partial(
         _run_episode,
@@ -743,13 +654,12 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
         tokenizer=trainer.processing_class,
         generation_semaphore=_state["generation_semaphore"],
         current_hint_prob=current_hint_prob,
-        current_mcts_sims=current_mcts_sims,
     )
 
     _fallback = (
-        {"prompt_ids": [1], "completion_ids": [1], "action_mask": [0], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0, "invalid_count": 0, "components": {}}
+        {"prompt_ids": [1], "completion_ids": [1], "action_mask": [0], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0}
         if use_full_prompt else
-        {"prompt_ids": [1], "completion_ids": [1], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0, "invalid_count": 0, "components": {}}
+        {"prompt_ids": [1], "completion_ids": [1], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0}
     )
 
     results = [None] * len(prompts)
@@ -761,35 +671,15 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
     curriculum.step(len(prompts))
 
     list_results = [r for r in results if r is not None]
-    n = len(list_results)
     finished   = sum(1 for r in list_results if r["final_score"] != 0)
-    wins       = sum(1 for r in list_results if r.get("final_score", 0) > 0)
-    losses     = sum(1 for r in list_results if r.get("final_score", 0) < 0)
-    avg_return = sum(r["reward"] for r in list_results) / n if n else 0
-    win_rate   = (wins / finished) if finished else 0.0
-    avg_invalid = sum(r.get("invalid_count", 0) for r in list_results) / n if n else 0
-    print(
-        f"[BATCH] Finished:{finished}/{n} W:{wins} L:{losses} "
-        f"WinRate:{win_rate:.2%} AvgReturn:{avg_return:.2f} AvgInv:{avg_invalid:.2f}"
-    )
-
-    component_keys = list(RewardCalculator.SIGNALS.keys()) + ["terminal", "invalid_penalty"]
-    if n:
-        avgs = {
-            k: sum(r.get("components", {}).get(k, 0.0) for r in list_results) / n
-            for k in component_keys
-        }
-        comp_str = " ".join(f"{k}:{v:+.3f}" for k, v in avgs.items() if abs(v) > 1e-6)
-        print(f"[SHAPING] {comp_str}" if comp_str else "[SHAPING] (no signal)")
+    avg_return = sum(r["reward"] for r in list_results) / len(list_results) if list_results else 0
+    print(f"[BATCH] Finished: {finished}/{len(list_results)}, AvgReturn: {avg_return:.2f}")
 
     out = {
         "prompt_ids":     [r["prompt_ids"]     for r in list_results],
         "completion_ids": [r["completion_ids"] for r in list_results],
         "logprobs":       [r["logprobs"]       for r in list_results],
         "env_rewards":    [r["reward"]         for r in list_results],
-        "terminal_raw":   [float(r["final_score"])                 for r in list_results],
-        "shaping_sum":    [float(r["reward"] - r["final_score"])   for r in list_results],
-        "invalid_count":  [int(r.get("invalid_count", 0))          for r in list_results],
     }
     if use_full_prompt:
         out["action_mask"] = [r["action_mask"] for r in list_results]

@@ -48,13 +48,6 @@ DEADWOOD_WEIGHT      = 0.5
 INVALID_PENALTY      = -0.1
 INVALID_TOTAL_CLIP   = -0.3
 TERMINAL_REWARD_CLIP = 1.0
-
-# Knock-timing shaping: only fires when the agent attempts to knock and the
-# Bayesian model has a confident estimate of opp deadwood.
-KNOCK_TIMING_BONUS             = 0.20
-KNOCK_TIMING_UNDERCUT_PENALTY  = -0.30
-KNOCK_TIMING_WIN_MARGIN        = 1.0   # our_dw + margin <= est_opp_dw → likely net win
-KNOCK_TIMING_UNDERCUT_MARGIN   = 5.0   # est_opp_dw < our_dw + margin → likely undercut
 SAFE_DISCARD_BONUS        = 0.02
 DANGEROUS_DISCARD_PENALTY = 0.02
 DRAW_UPCARD_BONUS   = 0.03
@@ -499,20 +492,14 @@ class BayesianOpponentHandModel:
             key=lambda x: -x[1],
         )[:top_n]
 
-    def expected_opp_deadwood(self) -> Optional[float]:
-        """Numeric expected opponent deadwood. None when the model has no signal yet."""
+    def knock_risk(self) -> str:
         top_hand = self.estimated_opponent_hand(10)
         if not top_hand:
-            return None
-        estimated_dw = sum(get_value(c) * p for c, p in top_hand)
-        confirmed_in = list(self._confirmed_in_hand)
-        confirmed_dw = sum(get_value(c) for c in confirmed_in if len(c) == 2)
-        return estimated_dw + confirmed_dw
-
-    def knock_risk(self) -> str:
-        total_est = self.expected_opp_deadwood()
-        if total_est is None:
             return "Unknown"
+        estimated_dw  = sum(get_value(c) * p for c, p in top_hand)
+        confirmed_in  = list(self._confirmed_in_hand)
+        confirmed_dw  = sum(get_value(c) for c in confirmed_in if len(c) == 2)
+        total_est     = estimated_dw + confirmed_dw
         if total_est <= 10:
             return f"HIGH (est. opp deadwood ~{total_est:.0f} — may knock soon)"
         elif total_est <= 25:
@@ -623,23 +610,14 @@ def remove_reasoning_tags(text: str) -> str:
     return cleaned.strip()
 
 
-_EOS_SUFFIXES = ("</s>", "<|im_end|>", "<|endoftext|>", "<|eot_id|>", "<|end_of_text|>")
-
-
 def extract_action_id(completion_text: str) -> str:
-    """Robust action extractor: strips reasoning tags + common EOS markers, then pulls
-    the first non-negative integer from the cleaned tail. Returns "" when nothing parses
-    (so the caller surfaces an invalid action rather than sending malformed text)."""
     cleaned = remove_reasoning_tags(completion_text)
-    for suffix in _EOS_SUFFIXES:
-        if cleaned.endswith(suffix):
-            cleaned = cleaned[: -len(suffix)].rstrip()
-    for marker in ("Action:", "action:", "ACTION:", "Answer:", "answer:"):
-        if marker in cleaned:
-            cleaned = cleaned.split(marker)[-1].strip()
-            break
-    match = re.search(r"\b\d+\b", cleaned)
-    return match.group(0) if match else ""
+    if cleaned.endswith("</s>"):
+        cleaned = cleaned[:-5].strip()
+    if "Action:" in cleaned:
+        cleaned = cleaned.split("Action:")[-1].strip()
+    match = re.search(r"-?\d+", cleaned)
+    return match.group(0) if match else cleaned.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -695,8 +673,6 @@ class RewardCalculator:
         initial_state: "GameState | None",
         final_state:   "GameState | None",
         all_states:    "list[GameState] | None" = None,
-        components:    Optional[dict] = None,
-        knock_timing:  float = 0.0,
     ) -> float:
         # 1. Deadwood improvement via DP optimal deadwood
         if initial_state and final_state and initial_state.hand and final_state.hand:
@@ -714,17 +690,13 @@ class RewardCalculator:
 
         # 2. Terminal bonus
         terminal = 0.0
-        gin_bonus_part = 0.0
-        knock_bonus_part = 0.0
         if done:
             if env_reward > 0.5:
                 terminal = TERMINAL_WIN_REWARD
                 if final_state and final_state.deadwood == 0:
-                    gin_bonus_part = GIN_BONUS
-                    terminal += gin_bonus_part
+                    terminal += GIN_BONUS
                 else:
-                    knock_bonus_part = KNOCK_BONUS
-                    terminal += knock_bonus_part
+                    terminal += KNOCK_BONUS
             else:
                 terminal = TERMINAL_LOSS_REWARD
         elif final_state:
@@ -733,19 +705,8 @@ class RewardCalculator:
         # 3. Invalid action penalties (accumulated, clipped)
         invalid_total = max(sum(r for r in step_rewards if r < 0), INVALID_TOTAL_CLIP)
 
-        raw = deadwood_component + terminal + invalid_total + knock_timing
-        clipped = max(min(raw, TERMINAL_REWARD_CLIP), -TERMINAL_REWARD_CLIP)
-
-        if components is not None:
-            components["dw"]            = components.get("dw", 0.0)            + deadwood_component
-            components["terminal"]      = components.get("terminal", 0.0)      + terminal
-            components["gin_bonus"]     = components.get("gin_bonus", 0.0)     + gin_bonus_part
-            components["knock_bonus"]   = components.get("knock_bonus", 0.0)   + knock_bonus_part
-            components["invalid_total"] = components.get("invalid_total", 0.0) + invalid_total
-            components["knock_timing"]  = components.get("knock_timing", 0.0)  + knock_timing
-            components["clip_delta"]    = components.get("clip_delta", 0.0)    + (clipped - raw)
-
-        return clipped
+        raw = deadwood_component + terminal + invalid_total
+        return max(min(raw, TERMINAL_REWARD_CLIP), -TERMINAL_REWARD_CLIP)
 
 
 # ---------------------------------------------------------------------------
@@ -767,14 +728,6 @@ def _curriculum_factory(args) -> CurriculumScheduler:
     )
 
 
-def _current_mcts_sims(curriculum: CurriculumScheduler) -> int:
-    """Progressive MCTS sim ramp derived from the scheduler's turn progression."""
-    turn_range = max(curriculum.final_max_turn - curriculum.initial_max_turn, 1)
-    progress = (curriculum.get_max_turn() - curriculum.initial_max_turn) / turn_range
-    progress = max(0.0, min(progress, 1.0))
-    return int(10 + progress * (50 - 10))
-
-
 def _ensure_initialized(trainer) -> None:
     if _state.get("initialized"):
         return
@@ -783,7 +736,7 @@ def _ensure_initialized(trainer) -> None:
         "task_id": GAMES_TO_TASK_ID_RANGE[_SELECTED_GAME][0],
         "seed": 42,
         "opponent": "mcts",
-        "mcts_max_simulations": 50,
+        "mcts_max_simulations": _MCTS_SIMS,
         "mcts_num_rollouts": 1,
     }
     rank, env_pool, num_servers, thread_pool, generation_semaphore = init_env_pool(reset_payload)
@@ -816,62 +769,37 @@ _SYSTEM_PROMPT = (
     "MELDS (Valid Combinations):\n"
     "1. SET: 3+ cards of SAME RANK (e.g., 7\u2660 7\u2665 7\u2663)\n"
     "2. RUN: 3+ CONSECUTIVE cards of SAME SUIT (e.g., 5\u2666 6\u2666 7\u2666)\n"
-    "Examples:\n- Valid runs: A\u2660-2\u2660-3\u2660, 9\u2665-10\u2665-J\u2665-Q\u2665\n"
-    "- Invalid: K\u2660-A\u2660-2\u2660 (Ace is LOW only)\n\n"
+    "Examples:\n- Valid runs: A\u2660-2\u2660-3\u2660, 9\u2665-10\u2665-J\u2665-Q\u2665, 10\u2663-J\u2663-Q\u2663-K\u2663\n"
+    "- Invalid: K\u2660-A\u2660-2\u2660 (Ace is LOW only, not wraparound)\n\n"
     "CARD NOTATION:\n- Ranks: A(Ace), 2-9, T(10), J(Jack), Q(Queen), K(King)\n"
-    "- Suits: s(\u2660), h(\u2665), d(\u2666), c(\u2663)\n\n"
+    "- Suits: s(\u2660), h(\u2665), d(\u2666), c(\u2663)\n"
+    "- Example: 7c = 7 of clubs, Th = 10 of hearts, As = Ace of spades\n\n"
     "GAME PHASES:\n"
     "1. FirstUpcard: 52=Draw upcard, 54=Pass\n"
     "2. Draw: 52=Draw upcard, 53=Draw stock\n"
     "3. Discard: action ID = card index (shown in Legal Actions)\n"
     "4. Layoff: card indices or 54=Pass\n"
     "5. Knock: declare end when deadwood \u2264 knock_card\n\n"
+    "EACH TURN:\n1. DRAW: stock (53) or upcard (52)\n"
+    "2. DISCARD: choose a card by action ID\n\n"
     "KNOCKING:\n- Gin: 0 deadwood = 25-point bonus\n\n"
     "SCORING: Winner scores difference in deadwood.\n"
     "Card Values: A=1, 2-10=face value, J=11, Q=12, K=13\n\n"
-    "IMPORTANT: Always respond with the action ID number ONLY.\n\n"
+    "IMPORTANT: Always respond with the action ID number ONLY, never card names.\n\n"
     "# Output Format\nYou must respond with ONLY the action ID (a single number).\n"
     "Do NOT include descriptions or explanations.\n\n"
     'Examples:\n- For action "0 -> roll": respond "0"\n- For action "89 -> a3": respond "89"'
 )
 
 _HINT_PROMPT = (
-    "\n\n# Strategy Guide\n"
-    "FIRSTUPCARD PHASE (52=Draw upcard, 54=Pass):\n"
-    "- Take upcard (52) ONLY if it completes or extends a run/set in your hand (reduces deadwood)\n"
-    "- Pass (54) if the upcard doesn't connect to your hand \u2014 let the opponent decide\n\n"
-    "DRAW PHASE (52=Draw upcard, 53=Draw stock):\n"
-    "- Draw upcard (52) ONLY when it directly reduces your optimal deadwood (fits a meld)\n"
-    "- Taking the upcard reveals your hand structure to the opponent \u2014 avoid it for marginal benefit\n"
-    "- Draw stock (53) when the upcard doesn't clearly help \u2014 hidden information costs nothing\n\n"
-    "DISCARD PHASE (card index from Legal Actions):\n"
-    "- Discard highest-value isolated cards first: K/Q/J cost 10 deadwood pts each\n"
-    "- Prefer discarding cards with NO neighbors in your hand (no run extensions, no rank matches)\n"
-    "- NEVER discard a card that is part of a completed meld or a 2-card partial meld\n"
-    "- 'Safe discard': choose cards whose partners already appear in the discard pile (they are dead)\n"
-    "- DANGER: avoid discarding a card in the same suit/rank as what the opponent just drew\n\n"
-    "KNOCK TIMING:\n"
-    "- Knock IMMEDIATELY when deadwood \u2264 knock_card if opponent shows no sign of being close to Gin\n"
-    "- If stock pile is low (< 8 cards), always knock rather than chase Gin \u2014 forced draw ends badly\n"
-    "- Pursue Gin (0 deadwood) only when already \u2264 5 deadwood AND 1-2 cards away from completion\n"
-    "- Gin bonus (+25 pts equivalent) is worth chasing only when stock is healthy (\u2265 15 cards)\n\n"
-    "LAYOFF PHASE (after opponent knocks \u2014 add cards to their melds or 54=Pass):\n"
-    "- Always layoff your highest-value cards first: K(13), Q(12), J(11) = 10 pts each\n"
-    "- Extend opponent's runs at either end if your card fits\n"
-    "- Pass (54) only when you have no valid layoff cards\n\n"
-    "OPPONENT READING:\n"
-    "- Opponent drew your discard \u2192 that card fits their meld; don't discard same rank/suit again\n"
-    "- Opponent passed the upcard \u2192 they don't need that rank/suit right now (safer to discard nearby)\n"
-    "- Opponent discarding high cards (K/Q/J) late game \u2192 they're building runs, not sets\n"
-    "- 'Dead cards' shown in observation = cards in discard pile, safe to build around\n\n"
-    "EXPLOITING THE MCTS OPPONENT (IS-MCTS with 1 random rollout per node):\n"
-    "- MCTS uses IS-MCTS: each simulation RESAMPLES the opponent's unknown hand from remaining cards\n"
-    "- With a limited sim budget, MCTS cannot accurately evaluate all possible opponent hand configurations\n"
-    "- 'Dead cards' are eliminated from ALL MCTS samples \u2014 always treat dead-card analysis as reliable\n"
-    "- Knock EARLIER than feels right: MCTS with 1 rollout UNDERESTIMATES the value of waiting for Gin\n"
-    "- MCTS struggles most when stock pile is 10-20 cards (many unseen cards \u2192 high sample variance)\n"
-    "- Upcard decisions: MCTS evaluates these accurately (upcard is known) \u2192 only take if it truly helps\n"
-    "- Safe discard strategy beats MCTS: 'dead' card discards force MCTS into samples it can't exploit\n"
+    "\n\n# Strategy Tips\n"
+    "- Early game: Draw from deck to see more cards\n"
+    "- Build runs and sets to reduce deadwood\n"
+    "- Track opponent's discards to guess their hand\n"
+    "- Knock when you have \u226410 deadwood points and think you're ahead\n"
+    "- Go for Gin (0 deadwood) when close for bonus points\n"
+    "- In Layoff phase: use 'Dead cards' hint to find extension opportunities\n"
+    "- IMPORTANT: YOU MUST PICK THE ACTION ID FROM THE LEGAL ACTIONS."
 )
 
 
@@ -892,7 +820,6 @@ def _run_episode(
     generation_semaphore: Semaphore,
     current_max_turn: int,
     current_hint_prob: float,
-    current_mcts_sims: int,
 ) -> tuple[int, "dict | None"]:
     game_id      = int(prompt)
     server_idx   = (index + rank) % num_servers
@@ -920,15 +847,13 @@ def _run_episode(
     calculator          = RewardCalculator()
     dead_card_tracker   = DeadCardTracker()
     prev_discard_pile:  list[str]       = []
-    components: dict[str, float]        = {}
-    ucb_sum:    float                   = 0.0
-    knock_timing_sum: float             = 0.0
 
-    # Opponent modelling — Bayesian inference signals fed into the prompt for all modes.
-    # Why: the MCTS opponent has no cross-episode memory; surfacing inferred opp hand and
-    # meld direction lets the LLM exploit asymmetric information regardless of training mode.
-    bayesian_model: "BayesianOpponentModel | None"     = BayesianOpponentModel()
-    bayes_hand:     "BayesianOpponentHandModel | None" = BayesianOpponentHandModel()
+    # Opponent modelling — full Bayesian models only for last-prompt mode
+    bayesian_model: "BayesianOpponentModel | None"     = None
+    bayes_hand:     "BayesianOpponentHandModel | None" = None
+    if not use_full_prompt:
+        bayesian_model = BayesianOpponentModel()
+        bayes_hand     = BayesianOpponentHandModel()
 
     use_hints = random.random() < current_hint_prob
 
@@ -937,7 +862,7 @@ def _run_episode(
         "task_id": game_id,
         "seed":    random.randint(0, 2 ** 31 - 1),
         "opponent": "mcts",
-        "mcts_max_simulations": current_mcts_sims,
+        "mcts_max_simulations": _MCTS_SIMS,
         "mcts_num_rollouts": 1,
     }
     try:
@@ -951,7 +876,7 @@ def _run_episode(
         game_state_history.append(initial_game_state)
         dead_card_tracker.update_from_discard_pile(initial_game_state.discard_pile)
         prev_discard_pile = list(initial_game_state.discard_pile)
-        if bayes_hand is not None:
+        if not use_full_prompt and bayes_hand is not None:
             actual_hand_size = len(initial_game_state.hand)
             bayes_hand._opp_hand_size = actual_hand_size if actual_hand_size > 0 else 7
             bayes_hand.initialize(
@@ -978,20 +903,6 @@ def _run_episode(
         logprobs       = rollout_outputs.get("logprobs", [])
         completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
         action_to_send  = extract_action_id(completion_text)
-
-        # --- Knock-timing shaping (fires once per knock attempt) ---
-        # Action 55 is "knock" in OpenSpiel gin_rummy. We only score the timing
-        # when the prev state allowed a knock and the Bayesian model has signal.
-        if action_to_send == "55" and game_state_history:
-            prev_gs = game_state_history[-1]
-            if prev_gs.can_knock() and bayes_hand is not None:
-                est_opp_dw = bayes_hand.expected_opp_deadwood()
-                if est_opp_dw is not None:
-                    our_dw = prev_gs.deadwood
-                    if our_dw + KNOCK_TIMING_WIN_MARGIN <= est_opp_dw:
-                        knock_timing_sum += KNOCK_TIMING_BONUS
-                    elif est_opp_dw < our_dw + KNOCK_TIMING_UNDERCUT_MARGIN:
-                        knock_timing_sum += KNOCK_TIMING_UNDERCUT_PENALTY
 
         # --- Full-prompt token accumulation ---
         if use_full_prompt:
@@ -1067,7 +978,7 @@ def _run_episode(
 
             dead_summary = dead_card_tracker.summary(current_hand)
 
-            if bayesian_model is not None and bayes_hand is not None:
+            if not use_full_prompt and bayesian_model is not None and bayes_hand is not None:
                 bayes_summary      = bayesian_model.summary(current_hand)
                 bayes_hand_summary = bayes_hand.summary(current_hand)
                 context_parts      = [p for p in [dead_summary, bayes_summary, bayes_hand_summary] if p]
@@ -1093,7 +1004,7 @@ def _run_episode(
                     game_state_history.append(game_state)
                     dead_card_tracker.update_from_discard_pile(game_state.discard_pile)
 
-                    if bayesian_model is not None and bayes_hand is not None:
+                    if not use_full_prompt and bayesian_model is not None and bayes_hand is not None:
                         bayesian_model.update_from_discard_pile_delta(prev_discard_pile, game_state.discard_pile)
                         if len(game_state.discard_pile) < len(prev_discard_pile):
                             drawn_card = prev_discard_pile[-1] if prev_discard_pile else None
@@ -1117,7 +1028,6 @@ def _run_episode(
 
         if not use_full_prompt and not is_invalid:
             immediate_reward += ucb_draw_reward
-            ucb_sum += ucb_draw_reward
 
         rewards.append(immediate_reward)
         turn_number += 1
@@ -1126,11 +1036,8 @@ def _run_episode(
     initial_state = game_state_history[0] if game_state_history else None
     final_state   = game_state_history[-1] if game_state_history else None
     train_reward  = calculator.calculate_episode_reward(
-        rewards, final_reward, done, initial_state, final_state,
-        all_states=game_state_history, components=components,
-        knock_timing=knock_timing_sum,
+        rewards, final_reward, done, initial_state, final_state, all_states=game_state_history
     )
-    components["ucb_draw"] = ucb_sum
 
     initial_dw = game_state_history[0].deadwood if game_state_history else 0
     final_dw   = game_state_history[-1].deadwood if game_state_history else 0
@@ -1152,8 +1059,6 @@ def _run_episode(
             "logprobs":       episode_logprobs,
             "reward":         train_reward,
             "final_score":    final_reward,
-            "invalid_count":  invalid_count,
-            "components":     components,
         }
     else:
         return index, {
@@ -1162,8 +1067,6 @@ def _run_episode(
             "logprobs":       logprobs,
             "reward":         train_reward,
             "final_score":    final_reward,
-            "invalid_count":  invalid_count,
-            "components":     components,
         }
 
 
@@ -1174,15 +1077,10 @@ def _run_episode(
 def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
     _ensure_initialized(trainer)
 
-    curriculum: CurriculumScheduler = _state["curriculum"]
+    curriculum        = _state["curriculum"]
     current_max_turn  = curriculum.get_max_turn()
     current_hint_prob = curriculum.get_hint_prob()
-    current_mcts_sims = _current_mcts_sims(curriculum)
-    print(
-        f"[CURRICULUM] Rollout {curriculum.total_rollouts}: "
-        f"max_turn={current_max_turn}, hint_prob={current_hint_prob:.2f}, "
-        f"mcts_sims={current_mcts_sims}"
-    )
+    print(f"[CURRICULUM] Rollout {curriculum.total_rollouts}: max_turn={current_max_turn}, hint_prob={current_hint_prob:.2f}")
 
     run = functools.partial(
         _run_episode,
@@ -1195,13 +1093,12 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
         generation_semaphore=_state["generation_semaphore"],
         current_max_turn=current_max_turn,
         current_hint_prob=current_hint_prob,
-        current_mcts_sims=current_mcts_sims,
     )
 
     _fallback = (
-        {"prompt_ids": [1], "completion_ids": [1], "action_mask": [0], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0, "invalid_count": 0, "components": {}}
+        {"prompt_ids": [1], "completion_ids": [1], "action_mask": [0], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0}
         if use_full_prompt else
-        {"prompt_ids": [1], "completion_ids": [1], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0, "invalid_count": 0, "components": {}}
+        {"prompt_ids": [1], "completion_ids": [1], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0}
     )
 
     results = [None] * len(prompts)
@@ -1213,36 +1110,16 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
     curriculum.step(len(prompts))
 
     list_results = [r for r in results if r is not None]
-    n = len(list_results)
     finished = sum(1 for r in list_results if r["final_score"] != 0)
     wins     = sum(1 for r in list_results if r["final_score"] > 0.5)
-    losses   = sum(1 for r in list_results if r["final_score"] < -0.5)
-    avg_return = sum(r["reward"] for r in list_results) / n if n else 0
-    win_rate   = (wins / finished) if finished else 0.0
-    avg_invalid = sum(r.get("invalid_count", 0) for r in list_results) / n if n else 0
-    print(
-        f"[BATCH] Finished:{finished}/{n} W:{wins} L:{losses} "
-        f"WinRate:{win_rate:.2%} AvgReturn:{avg_return:.3f} AvgInv:{avg_invalid:.2f}"
-    )
-
-    component_keys = ["dw", "terminal", "gin_bonus", "knock_bonus",
-                      "invalid_total", "knock_timing", "clip_delta", "ucb_draw"]
-    if n:
-        avgs = {
-            k: sum(r.get("components", {}).get(k, 0.0) for r in list_results) / n
-            for k in component_keys
-        }
-        comp_str = " ".join(f"{k}:{v:+.3f}" for k, v in avgs.items())
-        print(f"[SHAPING] {comp_str}")
+    avg_return = sum(r["reward"] for r in list_results) / len(list_results) if list_results else 0
+    print(f"[BATCH] Finished:{finished}/{len(list_results)} Wins:{wins} AvgReturn:{avg_return:.3f}")
 
     out = {
         "prompt_ids":     [r["prompt_ids"]     for r in list_results],
         "completion_ids": [r["completion_ids"] for r in list_results],
         "logprobs":       [r["logprobs"]       for r in list_results],
         "env_rewards":    [r["reward"]         for r in list_results],
-        "terminal_raw":   [float(r["final_score"])                 for r in list_results],
-        "shaping_sum":    [float(r["reward"] - r["final_score"])   for r in list_results],
-        "invalid_count":  [int(r.get("invalid_count", 0))          for r in list_results],
     }
     if use_full_prompt:
         out["action_mask"] = [r["action_mask"] for r in list_results]

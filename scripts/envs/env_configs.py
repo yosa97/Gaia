@@ -78,26 +78,6 @@ from envs.liar_dice_env import (
     rollout_reward_func                                        as _liar_reward,
     _curriculum_factory                                        as _liar_curriculum,
 )
-from envs.reward_monitoring import (
-    shaping_dominance_probe,
-    length_probe,
-    invalid_count_probe,
-    terminal_raw_probe,
-    format_guard_reasoning,
-)
-
-# Passive probes (weight 0) applied in all training modes.
-_PASSIVE_PROBES = [
-    shaping_dominance_probe,
-    length_probe,
-    invalid_count_probe,
-    terminal_raw_probe,
-]
-_PASSIVE_WEIGHTS = [0.0, 0.0, 0.0, 0.0]
-
-# Reasoning-mode bundle adds the active format guard.
-_REASONING_DIAGNOSTICS = _PASSIVE_PROBES + [format_guard_reasoning]
-_REASONING_WEIGHTS     = _PASSIVE_WEIGHTS + [1.0]
 
 
 # ---------------------------------------------------------------------------
@@ -123,11 +103,6 @@ class ModeConfig:
     trainer_class:       "type | None" = None
     # None → mode default (2048 for reasoning, 16 for no_mask/full_prompt)
     max_completion_length: int | None = None
-    # Extra reward functions appended to the main reward_func for this mode.
-    # Functions with weight 0.0 act as passive probes (logged, no loss
-    # contribution). Functions with weight > 0 contribute to the GRPO loss.
-    diagnostic_funcs:    list    = field(default_factory=list)
-    diagnostic_weights:  list    = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -179,63 +154,27 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         rollout_last=_gin_rollout_last,
         reward_func=_gin_reward,
         curriculum_factory=_gin_curriculum,
-        reasoning=ModeConfig(
-            initial_max_turn=8,
-            diagnostic_funcs=list(_REASONING_DIAGNOSTICS),
-            diagnostic_weights=list(_REASONING_WEIGHTS),
-        ),
-        no_mask=ModeConfig(
-            initial_max_turn=4, rollouts_per_stage=512,
-            diagnostic_funcs=list(_PASSIVE_PROBES),
-            diagnostic_weights=list(_PASSIVE_WEIGHTS),
-        ),
-        full_prompt=ModeConfig(
-            initial_max_turn=8,
-            diagnostic_funcs=list(_PASSIVE_PROBES),
-            diagnostic_weights=list(_PASSIVE_WEIGHTS),
-        ),
+        reasoning=ModeConfig(initial_max_turn=8),
+        no_mask=ModeConfig(initial_max_turn=4, rollouts_per_stage=512),
+        full_prompt=ModeConfig(initial_max_turn=8),
     ),
     "gin_rummy_opponent_modeling": EnvTrainingConfig(
         rollout_full=_gin_opp_rollout_full,
         rollout_last=_gin_opp_rollout_last,
         reward_func=_gin_opp_reward,
         curriculum_factory=_gin_opp_curriculum,
-        reasoning=ModeConfig(
-            initial_max_turn=8,
-            diagnostic_funcs=list(_REASONING_DIAGNOSTICS),
-            diagnostic_weights=list(_REASONING_WEIGHTS),
-        ),
-        no_mask=ModeConfig(
-            initial_max_turn=4, rollouts_per_stage=512,
-            diagnostic_funcs=list(_PASSIVE_PROBES),
-            diagnostic_weights=list(_PASSIVE_WEIGHTS),
-        ),
-        full_prompt=ModeConfig(
-            initial_max_turn=8,
-            diagnostic_funcs=list(_PASSIVE_PROBES),
-            diagnostic_weights=list(_PASSIVE_WEIGHTS),
-        ),
+        reasoning=ModeConfig(initial_max_turn=8),
+        no_mask=ModeConfig(initial_max_turn=4, rollouts_per_stage=512),
+        full_prompt=ModeConfig(initial_max_turn=8),
     ),
     "liars_dice": EnvTrainingConfig(
         rollout_full=_liar_rollout_full,
         rollout_last=_liar_rollout_last,
         reward_func=_liar_reward,
         curriculum_factory=_liar_curriculum,
-        reasoning=ModeConfig(
-            rollouts_per_stage=2048, initial_max_turn=1,
-            diagnostic_funcs=list(_REASONING_DIAGNOSTICS),
-            diagnostic_weights=list(_REASONING_WEIGHTS),
-        ),
-        no_mask=ModeConfig(
-            rollouts_per_stage=2048, initial_max_turn=1,
-            diagnostic_funcs=list(_PASSIVE_PROBES),
-            diagnostic_weights=list(_PASSIVE_WEIGHTS),
-        ),
-        full_prompt=ModeConfig(
-            rollouts_per_stage=2048, initial_max_turn=1,
-            diagnostic_funcs=list(_PASSIVE_PROBES),
-            diagnostic_weights=list(_PASSIVE_WEIGHTS),
-        ),
+        reasoning=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
+        no_mask=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
+        full_prompt=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
         num_generations=8,
         temperature=2.0,
         top_k=5,
@@ -245,63 +184,28 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         rollout_last=_liar_opp_rollout_last,
         reward_func=_liar_opp_reward,
         curriculum_factory=_liar_opp_curriculum,
-        reasoning=ModeConfig(
-            rollouts_per_stage=2048, initial_max_turn=1,
-            diagnostic_funcs=list(_REASONING_DIAGNOSTICS),
-            diagnostic_weights=list(_REASONING_WEIGHTS),
-        ),
-        no_mask=ModeConfig(
-            rollouts_per_stage=2048, initial_max_turn=1,
-            diagnostic_funcs=list(_PASSIVE_PROBES),
-            diagnostic_weights=list(_PASSIVE_WEIGHTS),
-        ),
-        full_prompt=ModeConfig(
-            rollouts_per_stage=2048, initial_max_turn=1,
-            diagnostic_funcs=list(_PASSIVE_PROBES),
-            diagnostic_weights=list(_PASSIVE_WEIGHTS),
-        ),
+        reasoning=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
+        no_mask=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1,
+        full_prompt=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
         num_generations=8,
         temperature=2.0,
         top_k=5,
+        )
     ),
     "leduc_poker": EnvTrainingConfig(
         rollout_full=_leduc_rollout_full,
         rollout_last=_leduc_rollout_last,
         reward_func=_leduc_reward,
         curriculum_factory=_leduc_curriculum,
-        reasoning=ModeConfig(
-            diagnostic_funcs=list(_REASONING_DIAGNOSTICS),
-            diagnostic_weights=list(_REASONING_WEIGHTS),
-        ),
-        no_mask=ModeConfig(
-            diagnostic_funcs=list(_PASSIVE_PROBES),
-            diagnostic_weights=list(_PASSIVE_WEIGHTS),
-        ),
-        full_prompt=ModeConfig(
-            diagnostic_funcs=list(_PASSIVE_PROBES),
-            diagnostic_weights=list(_PASSIVE_WEIGHTS),
-        ),
         num_generations=8,
         temperature=2.0,
         top_k=5,
     ),
-    "leduc_poker_opponent_modeling": EnvTrainingConfig(
+        "leduc_poker_opponent_modeling": EnvTrainingConfig(
         rollout_full=_leduc_opp_rollout_full,
         rollout_last=_leduc_opp_rollout_last,
         reward_func=_leduc_opp_reward,
         curriculum_factory=_leduc_opp_curriculum,
-        reasoning=ModeConfig(
-            diagnostic_funcs=list(_REASONING_DIAGNOSTICS),
-            diagnostic_weights=list(_REASONING_WEIGHTS),
-        ),
-        no_mask=ModeConfig(
-            diagnostic_funcs=list(_PASSIVE_PROBES),
-            diagnostic_weights=list(_PASSIVE_WEIGHTS),
-        ),
-        full_prompt=ModeConfig(
-            diagnostic_funcs=list(_PASSIVE_PROBES),
-            diagnostic_weights=list(_PASSIVE_WEIGHTS),
-        ),
         num_generations=8,
         temperature=2.0,
         top_k=5,
