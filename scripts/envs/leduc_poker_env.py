@@ -455,6 +455,26 @@ def _format_observation(raw: str) -> str:
     return "\n\n".join(parts)
 
 
+def _pot_odds_line(gs: "GameState | None") -> str:
+    """One-line pot-odds cue derived from the parsed game state.
+
+    Pot odds = chips_to_call / (pot + chips_to_call): the minimum win rate at which
+    calling is +EV. Returns empty when there's nothing to call.
+    """
+    if gs is None:
+        return ""
+    chips_to_call = max(gs.opp_contributed - gs.our_contributed, 0)
+    if chips_to_call == 0:
+        return f"[Pot odds] Pot:{gs.pot}  To call:0  No bet to face."
+    pot_after_call = gs.pot + chips_to_call
+    threshold = chips_to_call / pot_after_call if pot_after_call > 0 else 0.0
+    return (
+        f"[Pot odds] Pot:{gs.pot}  To call:{chips_to_call}  "
+        f"Win-rate to break-even: {threshold:.0%} "
+        f"(call profitable if your est. win rate \u2265 {threshold:.0%})"
+    )
+
+
 _EOS_SUFFIXES = ("</s>", "<|im_end|>", "<|endoftext|>", "<|eot_id|>", "<|end_of_text|>")
 
 
@@ -542,6 +562,9 @@ def _run_episode(
         gs = parse_game_state(observation)
         if gs is not None:
             game_state_history.append(gs)
+            pot_line = _pot_odds_line(gs)
+            if pot_line:
+                observation = f"{observation}\n\n{pot_line}"
     except Exception as exc:
         import traceback; traceback.print_exc()
         print(f"Failed to reset environment (Game {game_id}): {exc}")
@@ -623,6 +646,9 @@ def _run_episode(
                 gs = parse_game_state(observation)
                 if gs is not None:
                     game_state_history.append(gs)
+                    pot_line = _pot_odds_line(gs)
+                    if pot_line:
+                        observation = f"{observation}\n\n{pot_line}"
         except Exception as exc:
             print(f"Step failed (Game {game_id}, turn {turn_number}): {exc}")
             observation = ""

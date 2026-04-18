@@ -353,12 +353,21 @@ def _ensure_initialized(trainer) -> None:
 # ---------------------------------------------------------------------------
 
 def _reformat_observation(obs: str, gs: GameState, use_hints: bool) -> str:
-    """Randomly shuffle the displayed action order and optionally append a per-turn hint."""
+    """Annotate each legal bid with its truth probability, optionally shuffle, and add hint."""
+    actions = gs.actions[:]
     if random.random() < SHUFFLE_PROB:
-        actions = gs.actions[:]
         random.shuffle(actions)
-        action_block = "Legal Actions:\n" + "\n".join(f"{a.action_id} -> {a.label}" for a in actions)
-        obs = re.sub(r"Legal Actions:\n(?:[ \t]*\d+[ \t]*->[ \t]*\S.*(?:\n|$))+", action_block + "\n", obs)
+    # Annotate every action with the binomial truth probability so the LLM doesn't
+    # have to recompute from scratch each turn — this is information the env already
+    # derives from public state (your dice + bid history).
+    action_lines = []
+    for a in actions:
+        if a.is_liar:
+            action_lines.append(f"{a.action_id} -> {a.label} (p_lie={a.prob:.2f})")
+        else:
+            action_lines.append(f"{a.action_id} -> {a.label} (p_true={a.prob:.2f})")
+    action_block = "Legal Actions:\n" + "\n".join(action_lines)
+    obs = re.sub(r"Legal Actions:\n(?:[ \t]*\d+[ \t]*->[ \t]*\S.*(?:\n|$))+", action_block + "\n", obs)
     if use_hints:
         scores = [a.score for a in gs.actions]
         best = random.choices(gs.actions, weights=scores, k=1)[0]
@@ -392,7 +401,6 @@ def _run_episode(
     action masking (mask=1 for LLM completions, mask=0 for environment turns).
     When ``use_full_prompt=False``, only the final turn's token IDs are kept.
     """
-    current_max_turn = 5
     game_id = int(prompt)
 
     server_idx   = (index + rank) % num_servers
