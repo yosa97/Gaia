@@ -48,6 +48,18 @@ from envs.gin_rummy_opponent_modeling import (
     rollout_reward_func                                        as _gin_opp_reward,
     _curriculum_factory                                        as _gin_opp_curriculum,
 )
+from envs.liar_dice_opponent_modeling import (
+    rollout_full_prompt_and_completion_parallelized_curriculum as _liar_opp_rollout_full,
+    rollout_last_prompt_and_completion_parallelized_curriculum as _liar_opp_rollout_last,
+    rollout_reward_func                                        as _liar_opp_reward,
+    _curriculum_factory                                        as _liar_opp_curriculum,
+)
+from envs.leduc_poker_opponent_modeling import (
+    rollout_full_prompt_and_completion_parallelized_curriculum as _leduc_opp_rollout_full,
+    rollout_last_prompt_and_completion_parallelized_curriculum as _leduc_opp_rollout_last,
+    rollout_reward_func                                        as _leduc_opp_reward,
+    _curriculum_factory                                        as _leduc_opp_curriculum,
+)
 from envs.goof_spiel_env import (
     rollout_full_prompt_and_completion_parallelized_curriculum as _goof_rollout_full,
     rollout_last_prompt_and_completion_parallelized_curriculum as _goof_rollout_last,
@@ -228,11 +240,56 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         temperature=2.0,
         top_k=5,
     ),
+    "liars_dice_opponent_modeling": EnvTrainingConfig(
+        rollout_full=_liar_opp_rollout_full,
+        rollout_last=_liar_opp_rollout_last,
+        reward_func=_liar_opp_reward,
+        curriculum_factory=_liar_opp_curriculum,
+        reasoning=ModeConfig(
+            rollouts_per_stage=2048, initial_max_turn=1,
+            diagnostic_funcs=list(_REASONING_DIAGNOSTICS),
+            diagnostic_weights=list(_REASONING_WEIGHTS),
+        ),
+        no_mask=ModeConfig(
+            rollouts_per_stage=2048, initial_max_turn=1,
+            diagnostic_funcs=list(_PASSIVE_PROBES),
+            diagnostic_weights=list(_PASSIVE_WEIGHTS),
+        ),
+        full_prompt=ModeConfig(
+            rollouts_per_stage=2048, initial_max_turn=1,
+            diagnostic_funcs=list(_PASSIVE_PROBES),
+            diagnostic_weights=list(_PASSIVE_WEIGHTS),
+        ),
+        num_generations=8,
+        temperature=2.0,
+        top_k=5,
+    ),
     "leduc_poker": EnvTrainingConfig(
         rollout_full=_leduc_rollout_full,
         rollout_last=_leduc_rollout_last,
         reward_func=_leduc_reward,
         curriculum_factory=_leduc_curriculum,
+        reasoning=ModeConfig(
+            diagnostic_funcs=list(_REASONING_DIAGNOSTICS),
+            diagnostic_weights=list(_REASONING_WEIGHTS),
+        ),
+        no_mask=ModeConfig(
+            diagnostic_funcs=list(_PASSIVE_PROBES),
+            diagnostic_weights=list(_PASSIVE_WEIGHTS),
+        ),
+        full_prompt=ModeConfig(
+            diagnostic_funcs=list(_PASSIVE_PROBES),
+            diagnostic_weights=list(_PASSIVE_WEIGHTS),
+        ),
+        num_generations=8,
+        temperature=2.0,
+        top_k=5,
+    ),
+    "leduc_poker_opponent_modeling": EnvTrainingConfig(
+        rollout_full=_leduc_opp_rollout_full,
+        rollout_last=_leduc_opp_rollout_last,
+        reward_func=_leduc_opp_reward,
+        curriculum_factory=_leduc_opp_curriculum,
         reasoning=ModeConfig(
             diagnostic_funcs=list(_REASONING_DIAGNOSTICS),
             diagnostic_weights=list(_REASONING_WEIGHTS),
@@ -263,7 +320,9 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
 
 # Change this to select a non-default variant for a base environment name.
 _VARIANT_OVERRIDES: dict[str, str] = {
-    # "gin_rummy": "gin_rummy_opponent_modeling",
+    # "gin_rummy":   "gin_rummy_opponent_modeling",
+    # "liars_dice":  "liars_dice_opponent_modeling",
+    # "leduc_poker": "leduc_poker_opponent_modeling",
 }
 
 
