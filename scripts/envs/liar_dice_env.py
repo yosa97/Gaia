@@ -67,6 +67,24 @@ _SYSTEM_PROMPT = (
     "- For action \"60 -> Liar\": respond \"60\""
 )
 
+_EOS_SUFFIXES = ("</s>", "<|im_end|>", "<|endoftext|>", "<|eot_id|>", "<|end_of_text|>")
+
+
+def extract_action_id(completion_text: str) -> str:
+    """Robust action extractor: strips common EOS markers and answer prefixes,
+    then pulls the first non-negative integer. Returns "" on parse failure."""
+    cleaned = completion_text.strip()
+    for suffix in _EOS_SUFFIXES:
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)].rstrip()
+    for marker in ("Action:", "action:", "ACTION:", "Answer:", "answer:"):
+        if marker in cleaned:
+            cleaned = cleaned.split(marker)[-1].strip()
+            break
+    match = re.search(r"\b\d+\b", cleaned)
+    return match.group(0) if match else ""
+
+
 _HINT_PROMPT = (
     "\n\n# Strategy Guide (Classic Liar's Dice \u2014 2 players, N dice each)\n\n"
     "BID ANCHORING \u2014 use your own dice to set safe bids:\n"
@@ -406,6 +424,10 @@ def _run_episode(
     bluff_count      = 0
     risky_liar_count = 0
     last_action_prob = 0.0
+    components: dict[str, float] = {
+        "score_sum": 0.0, "terminal": 0.0,
+        "bluff_bonus": 0.0, "risky_liar_bonus": 0.0, "invalid_total": 0.0,
+    }
 
     # Per-episode hint flag
     use_hints = random.random() < current_hint_prob
@@ -493,12 +515,8 @@ def _run_episode(
 
         messages.append({"role": "assistant", "content": completion_text})
 
-        # --- Parse action (game-specific: strip EOS / "Action:" prefix) ---
-        action_to_send = completion_text
-        if action_to_send.endswith("</s>"):
-            action_to_send = action_to_send[:-4]
-        if "Action:" in action_to_send:
-            action_to_send = action_to_send.split("Action:")[-1].strip()
+        # --- Parse action (robust: handles multiple EOS markers + answer prefixes) ---
+        action_to_send = extract_action_id(completion_text)
 
         # --- Step environment ---
         is_invalid = False
@@ -567,20 +585,27 @@ def _run_episode(
                     game_state_history.append(game_state)
                     immediate_reward = calculator.calculate_step_reward(taken_action, 0.0)
                     step_scores.append(taken_action.score if taken_action else 0.0)
+                    components["score_sum"] += taken_action.score if taken_action else 0.0
                 else:
                     won = step_reward > 0.5
-                    immediate_reward = (taken_action.score if taken_action else 0.0)
-                    immediate_reward += (step_reward - 0.5) * 2.0
-                    step_scores.append(taken_action.score if taken_action else 0.0)
-                    terminal_reward = (step_reward - 0.5) * 2.0
+                    action_score = taken_action.score if taken_action else 0.0
+                    terminal_part = (step_reward - 0.5) * 2.0
+                    immediate_reward = action_score + terminal_part
+                    step_scores.append(action_score)
+                    terminal_reward = terminal_part
+                    components["score_sum"] += action_score
+                    components["terminal"]  += terminal_part
                     if won:
-                        immediate_reward += BLUFF_WIN_BONUS * min(bluff_count, RISKY_BONUS_MAX_COUNT)
-                        immediate_reward += RISKY_LIAR_WIN_BONUS * min(risky_liar_count, RISKY_BONUS_MAX_COUNT)
-                        terminal_reward  += BLUFF_WIN_BONUS * min(bluff_count, RISKY_BONUS_MAX_COUNT)
-                        terminal_reward  += RISKY_LIAR_WIN_BONUS * min(risky_liar_count, RISKY_BONUS_MAX_COUNT)
+                        bluff_bonus_part = BLUFF_WIN_BONUS * min(bluff_count, RISKY_BONUS_MAX_COUNT)
+                        risky_bonus_part = RISKY_LIAR_WIN_BONUS * min(risky_liar_count, RISKY_BONUS_MAX_COUNT)
+                        immediate_reward += bluff_bonus_part + risky_bonus_part
+                        terminal_reward  += bluff_bonus_part + risky_bonus_part
+                        components["bluff_bonus"]      += bluff_bonus_part
+                        components["risky_liar_bonus"] += risky_bonus_part
         else:
             immediate_reward = -1.0
             step_scores.append(-1.0)
+            components["invalid_total"] += -1.0
 
         rewards.append(immediate_reward)
         turn_number += 1
@@ -601,6 +626,9 @@ def _run_episode(
         )
     )
 
+    components["bluff_count"]      = float(bluff_count)
+    components["risky_liar_count"] = float(risky_liar_count)
+
     # --- Build result ---
     if use_full_prompt:
         if len(episode_completion_ids) > _MAX_EPISODE_TOKENS:
@@ -615,6 +643,7 @@ def _run_episode(
             "reward":         train_reward,
             "final_score":    final_reward,
             "invalid_count":  invalid_count,
+            "components":     components,
         }
     else:
         return index, {
@@ -624,6 +653,7 @@ def _run_episode(
             "reward":         train_reward,
             "final_score":    final_reward,
             "invalid_count":  invalid_count,
+            "components":     components,
         }
 
 
@@ -660,9 +690,9 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
     )
 
     _fallback = (
-        {"prompt_ids": [1], "completion_ids": [1], "action_mask": [0], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0, "invalid_count": 0}
+        {"prompt_ids": [1], "completion_ids": [1], "action_mask": [0], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0, "invalid_count": 0, "components": {}}
         if use_full_prompt else
-        {"prompt_ids": [1], "completion_ids": [1], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0, "invalid_count": 0}
+        {"prompt_ids": [1], "completion_ids": [1], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0, "invalid_count": 0, "components": {}}
     )
 
     results = [None] * len(prompts)
@@ -677,8 +707,24 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
     n = len(list_results)
     finished  = sum(1 for r in list_results if r["final_score"] != 0)
     wins      = sum(1 for r in list_results if r.get("final_score", 0) > 0)
+    losses    = sum(1 for r in list_results if r.get("final_score", 0) < 0)
     avg_return = sum(r["reward"] for r in list_results) / n if n else 0
-    print(f"[BATCH] Finished: {finished}/{n}, AvgReturn: {avg_return:.2f}")
+    win_rate   = (wins / finished) if finished else 0.0
+    avg_invalid = sum(r.get("invalid_count", 0) for r in list_results) / n if n else 0
+    print(
+        f"[BATCH] Finished:{finished}/{n} W:{wins} L:{losses} "
+        f"WinRate:{win_rate:.2%} AvgReturn:{avg_return:.2f} AvgInv:{avg_invalid:.2f}"
+    )
+
+    component_keys = ["score_sum", "terminal", "bluff_bonus", "risky_liar_bonus",
+                      "invalid_total", "bluff_count", "risky_liar_count"]
+    if n:
+        avgs = {
+            k: sum(r.get("components", {}).get(k, 0.0) for r in list_results) / n
+            for k in component_keys
+        }
+        comp_str = " ".join(f"{k}:{v:+.2f}" for k, v in avgs.items())
+        print(f"[SHAPING] {comp_str}")
 
     out = {
         "prompt_ids":     [r["prompt_ids"]     for r in list_results],

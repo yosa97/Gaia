@@ -283,42 +283,54 @@ class RewardCalculator:
         self.terminal_weight = terminal_weight
         self.gamma = gamma
 
-    def calculate_step_reward(self, gs: "GameState | None", action_str: str, env_reward: float) -> float:
+    def calculate_step_reward(
+        self,
+        gs: "GameState | None",
+        action_str: str,
+        env_reward: float,
+        components: "dict | None" = None,
+    ) -> float:
         reward = 0.0
+        signal_key: "str | None" = None
 
         if gs is not None:
             pub = gs.public_card_rank or 0
 
             if action_str == "Fold":
                 if gs.has_pair:
-                    reward += self.SIGNALS["fold_pair"]
+                    signal_key = "fold_pair"
                 elif gs.private_card_rank == 3:
-                    reward += self.SIGNALS["fold_k"]
+                    signal_key = "fold_k"
                 elif gs.round == 1 and gs.opp_last_action == "Raise":
-                    if gs.private_card_rank >= 2:
-                        reward += self.SIGNALS["fold_kq_r1_raise"]
-                    else:
-                        reward += self.SIGNALS["fold_j_r1_raise"]
+                    signal_key = "fold_kq_r1_raise" if gs.private_card_rank >= 2 else "fold_j_r1_raise"
                 elif gs.round == 2 and gs.opp_last_action == "Raise":
                     if gs.private_card_rank == 1:
-                        reward += self.SIGNALS["fold_j_r2_raise"]
+                        signal_key = "fold_j_r2_raise"
                     elif gs.private_card_rank == 2 and pub == 1:
-                        reward += self.SIGNALS["fold_q_pubj_raise"]
+                        signal_key = "fold_q_pubj_raise"
                     elif gs.private_card_rank == 2 and pub == 3:
-                        reward += self.SIGNALS["fold_q_pubk_raise"]
+                        signal_key = "fold_q_pubk_raise"
 
             elif action_str == "Raise":
                 if gs.round == 2 and gs.has_pair:
-                    reward += self.SIGNALS["raise_pair_r2"]
+                    signal_key = "raise_pair_r2"
                 elif gs.round == 2 and gs.private_card_rank == 3 and not gs.has_pair:
-                    reward += self.SIGNALS["raise_k_r2"]
+                    signal_key = "raise_k_r2"
 
             elif action_str in ("Call", "Check"):
                 if gs.round == 1 and gs.opp_last_action == "Raise" and gs.private_card_rank >= 2:
-                    reward += self.SIGNALS["call_kq_r1_raise"]
+                    signal_key = "call_kq_r1_raise"
 
-        if env_reward != 0.0:
-            reward += env_reward * self.terminal_weight
+        if signal_key is not None:
+            reward += self.SIGNALS[signal_key]
+
+        terminal_part = env_reward * self.terminal_weight if env_reward != 0.0 else 0.0
+        reward += terminal_part
+
+        if components is not None:
+            if signal_key is not None:
+                components[signal_key] = components.get(signal_key, 0.0) + self.SIGNALS[signal_key]
+            components["terminal"] = components.get("terminal", 0.0) + terminal_part
 
         return reward
 
@@ -443,14 +455,22 @@ def _format_observation(raw: str) -> str:
     return "\n\n".join(parts)
 
 
+_EOS_SUFFIXES = ("</s>", "<|im_end|>", "<|endoftext|>", "<|eot_id|>", "<|end_of_text|>")
+
+
 def _parse_action(completion_text: str) -> str:
-    """Extract action ID from model output."""
-    action = completion_text.strip()
-    if action.endswith("</s>"):
-        action = action[:-4].strip()
-    if "Action:" in action:
-        action = action.split("Action:")[-1].strip()
-    return action
+    """Robust action extractor: strips common EOS markers + answer prefixes,
+    then pulls the first non-negative integer. Returns "" on parse failure."""
+    cleaned = completion_text.strip()
+    for suffix in _EOS_SUFFIXES:
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)].rstrip()
+    for marker in ("Action:", "action:", "ACTION:", "Answer:", "answer:"):
+        if marker in cleaned:
+            cleaned = cleaned.split(marker)[-1].strip()
+            break
+    match = re.search(r"\b\d+\b", cleaned)
+    return match.group(0) if match else ""
 
 
 def _run_episode(
@@ -502,6 +522,8 @@ def _run_episode(
     game_state_history: list[GameState] = []
     calculator    = RewardCalculator()
     rewards:        list[float] = []
+    components: dict[str, float] = {}
+    invalid_penalty_sum: float   = 0.0
 
     # Reset environment
     reset_payload = {
@@ -608,10 +630,12 @@ def _run_episode(
             done        = False
             invalid_count += 1
             episode_reward += _INVALID_PENALTY
+            invalid_penalty_sum += _INVALID_PENALTY
 
         if "Nothing happens" in observation or "Invalid" in observation:
             invalid_count += 1
             episode_reward += _INVALID_PENALTY
+            invalid_penalty_sum += _INVALID_PENALTY
 
         if done:
             final_reward = step_reward
@@ -620,7 +644,9 @@ def _run_episode(
             action_str = prev_gs.legal_actions.get(int(action_to_send.strip()), "") if prev_gs else ""
         except (ValueError, AttributeError):
             action_str = ""
-        step_shaped = calculator.calculate_step_reward(prev_gs, action_str, step_reward if done else 0.0)
+        step_shaped = calculator.calculate_step_reward(
+            prev_gs, action_str, step_reward if done else 0.0, components=components,
+        )
         rewards.append(step_shaped)
 
         messages.append({"role": "user", "content": observation})
@@ -632,6 +658,8 @@ def _run_episode(
             str(game_id)[:6], int(done), turn_number, int(use_hints), final_reward, train_reward, invalid_count,
         )
     )
+
+    components["invalid_penalty"] = invalid_penalty_sum
 
     # --- Build result ---
     if use_full_prompt:
@@ -647,6 +675,7 @@ def _run_episode(
             "reward":         train_reward,
             "final_score":    final_reward,
             "invalid_count":  invalid_count,
+            "components":     components,
         }
     else:
         return index, {
@@ -656,6 +685,7 @@ def _run_episode(
             "reward":         train_reward,
             "final_score":    final_reward,
             "invalid_count":  invalid_count,
+            "components":     components,
         }
 
 
@@ -691,9 +721,9 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
     )
 
     _fallback = (
-        {"prompt_ids": [1], "completion_ids": [1], "action_mask": [0], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0, "invalid_count": 0}
+        {"prompt_ids": [1], "completion_ids": [1], "action_mask": [0], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0, "invalid_count": 0, "components": {}}
         if use_full_prompt else
-        {"prompt_ids": [1], "completion_ids": [1], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0, "invalid_count": 0}
+        {"prompt_ids": [1], "completion_ids": [1], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0, "invalid_count": 0, "components": {}}
     )
 
     results = [None] * len(prompts)
@@ -708,8 +738,23 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
     n = len(list_results)
     finished   = sum(1 for r in list_results if r["final_score"] != 0)
     wins       = sum(1 for r in list_results if r.get("final_score", 0) > 0)
+    losses     = sum(1 for r in list_results if r.get("final_score", 0) < 0)
     avg_return = sum(r["reward"] for r in list_results) / n if n else 0
-    print(f"[BATCH] Finished: {finished}/{n}, AvgReturn: {avg_return:.2f}")
+    win_rate   = (wins / finished) if finished else 0.0
+    avg_invalid = sum(r.get("invalid_count", 0) for r in list_results) / n if n else 0
+    print(
+        f"[BATCH] Finished:{finished}/{n} W:{wins} L:{losses} "
+        f"WinRate:{win_rate:.2%} AvgReturn:{avg_return:.2f} AvgInv:{avg_invalid:.2f}"
+    )
+
+    component_keys = list(RewardCalculator.SIGNALS.keys()) + ["terminal", "invalid_penalty"]
+    if n:
+        avgs = {
+            k: sum(r.get("components", {}).get(k, 0.0) for r in list_results) / n
+            for k in component_keys
+        }
+        comp_str = " ".join(f"{k}:{v:+.3f}" for k, v in avgs.items() if abs(v) > 1e-6)
+        print(f"[SHAPING] {comp_str}" if comp_str else "[SHAPING] (no signal)")
 
     out = {
         "prompt_ids":     [r["prompt_ids"]     for r in list_results],
