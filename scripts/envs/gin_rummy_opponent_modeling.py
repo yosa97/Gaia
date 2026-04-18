@@ -48,6 +48,13 @@ DEADWOOD_WEIGHT      = 0.5
 INVALID_PENALTY      = -0.1
 INVALID_TOTAL_CLIP   = -0.3
 TERMINAL_REWARD_CLIP = 1.0
+
+# Knock-timing shaping: only fires when the agent attempts to knock and the
+# Bayesian model has a confident estimate of opp deadwood.
+KNOCK_TIMING_BONUS             = 0.20
+KNOCK_TIMING_UNDERCUT_PENALTY  = -0.30
+KNOCK_TIMING_WIN_MARGIN        = 1.0   # our_dw + margin <= est_opp_dw → likely net win
+KNOCK_TIMING_UNDERCUT_MARGIN   = 5.0   # est_opp_dw < our_dw + margin → likely undercut
 SAFE_DISCARD_BONUS        = 0.02
 DANGEROUS_DISCARD_PENALTY = 0.02
 DRAW_UPCARD_BONUS   = 0.03
@@ -492,14 +499,20 @@ class BayesianOpponentHandModel:
             key=lambda x: -x[1],
         )[:top_n]
 
-    def knock_risk(self) -> str:
+    def expected_opp_deadwood(self) -> Optional[float]:
+        """Numeric expected opponent deadwood. None when the model has no signal yet."""
         top_hand = self.estimated_opponent_hand(10)
         if not top_hand:
+            return None
+        estimated_dw = sum(get_value(c) * p for c, p in top_hand)
+        confirmed_in = list(self._confirmed_in_hand)
+        confirmed_dw = sum(get_value(c) for c in confirmed_in if len(c) == 2)
+        return estimated_dw + confirmed_dw
+
+    def knock_risk(self) -> str:
+        total_est = self.expected_opp_deadwood()
+        if total_est is None:
             return "Unknown"
-        estimated_dw  = sum(get_value(c) * p for c, p in top_hand)
-        confirmed_in  = list(self._confirmed_in_hand)
-        confirmed_dw  = sum(get_value(c) for c in confirmed_in if len(c) == 2)
-        total_est     = estimated_dw + confirmed_dw
         if total_est <= 10:
             return f"HIGH (est. opp deadwood ~{total_est:.0f} — may knock soon)"
         elif total_est <= 25:
@@ -610,14 +623,23 @@ def remove_reasoning_tags(text: str) -> str:
     return cleaned.strip()
 
 
+_EOS_SUFFIXES = ("</s>", "<|im_end|>", "<|endoftext|>", "<|eot_id|>", "<|end_of_text|>")
+
+
 def extract_action_id(completion_text: str) -> str:
+    """Robust action extractor: strips reasoning tags + common EOS markers, then pulls
+    the first non-negative integer from the cleaned tail. Returns "" when nothing parses
+    (so the caller surfaces an invalid action rather than sending malformed text)."""
     cleaned = remove_reasoning_tags(completion_text)
-    if cleaned.endswith("</s>"):
-        cleaned = cleaned[:-5].strip()
-    if "Action:" in cleaned:
-        cleaned = cleaned.split("Action:")[-1].strip()
-    match = re.search(r"-?\d+", cleaned)
-    return match.group(0) if match else cleaned.strip()
+    for suffix in _EOS_SUFFIXES:
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)].rstrip()
+    for marker in ("Action:", "action:", "ACTION:", "Answer:", "answer:"):
+        if marker in cleaned:
+            cleaned = cleaned.split(marker)[-1].strip()
+            break
+    match = re.search(r"\b\d+\b", cleaned)
+    return match.group(0) if match else ""
 
 
 # ---------------------------------------------------------------------------
@@ -673,6 +695,8 @@ class RewardCalculator:
         initial_state: "GameState | None",
         final_state:   "GameState | None",
         all_states:    "list[GameState] | None" = None,
+        components:    Optional[dict] = None,
+        knock_timing:  float = 0.0,
     ) -> float:
         # 1. Deadwood improvement via DP optimal deadwood
         if initial_state and final_state and initial_state.hand and final_state.hand:
@@ -690,13 +714,17 @@ class RewardCalculator:
 
         # 2. Terminal bonus
         terminal = 0.0
+        gin_bonus_part = 0.0
+        knock_bonus_part = 0.0
         if done:
             if env_reward > 0.5:
                 terminal = TERMINAL_WIN_REWARD
                 if final_state and final_state.deadwood == 0:
-                    terminal += GIN_BONUS
+                    gin_bonus_part = GIN_BONUS
+                    terminal += gin_bonus_part
                 else:
-                    terminal += KNOCK_BONUS
+                    knock_bonus_part = KNOCK_BONUS
+                    terminal += knock_bonus_part
             else:
                 terminal = TERMINAL_LOSS_REWARD
         elif final_state:
@@ -705,8 +733,19 @@ class RewardCalculator:
         # 3. Invalid action penalties (accumulated, clipped)
         invalid_total = max(sum(r for r in step_rewards if r < 0), INVALID_TOTAL_CLIP)
 
-        raw = deadwood_component + terminal + invalid_total
-        return max(min(raw, TERMINAL_REWARD_CLIP), -TERMINAL_REWARD_CLIP)
+        raw = deadwood_component + terminal + invalid_total + knock_timing
+        clipped = max(min(raw, TERMINAL_REWARD_CLIP), -TERMINAL_REWARD_CLIP)
+
+        if components is not None:
+            components["dw"]            = components.get("dw", 0.0)            + deadwood_component
+            components["terminal"]      = components.get("terminal", 0.0)      + terminal
+            components["gin_bonus"]     = components.get("gin_bonus", 0.0)     + gin_bonus_part
+            components["knock_bonus"]   = components.get("knock_bonus", 0.0)   + knock_bonus_part
+            components["invalid_total"] = components.get("invalid_total", 0.0) + invalid_total
+            components["knock_timing"]  = components.get("knock_timing", 0.0)  + knock_timing
+            components["clip_delta"]    = components.get("clip_delta", 0.0)    + (clipped - raw)
+
+        return clipped
 
 
 # ---------------------------------------------------------------------------
@@ -881,13 +920,15 @@ def _run_episode(
     calculator          = RewardCalculator()
     dead_card_tracker   = DeadCardTracker()
     prev_discard_pile:  list[str]       = []
+    components: dict[str, float]        = {}
+    ucb_sum:    float                   = 0.0
+    knock_timing_sum: float             = 0.0
 
-    # Opponent modelling — full Bayesian models only for last-prompt mode
-    bayesian_model: "BayesianOpponentModel | None"     = None
-    bayes_hand:     "BayesianOpponentHandModel | None" = None
-    if not use_full_prompt:
-        bayesian_model = BayesianOpponentModel()
-        bayes_hand     = BayesianOpponentHandModel()
+    # Opponent modelling — Bayesian inference signals fed into the prompt for all modes.
+    # Why: the MCTS opponent has no cross-episode memory; surfacing inferred opp hand and
+    # meld direction lets the LLM exploit asymmetric information regardless of training mode.
+    bayesian_model: "BayesianOpponentModel | None"     = BayesianOpponentModel()
+    bayes_hand:     "BayesianOpponentHandModel | None" = BayesianOpponentHandModel()
 
     use_hints = random.random() < current_hint_prob
 
@@ -910,7 +951,7 @@ def _run_episode(
         game_state_history.append(initial_game_state)
         dead_card_tracker.update_from_discard_pile(initial_game_state.discard_pile)
         prev_discard_pile = list(initial_game_state.discard_pile)
-        if not use_full_prompt and bayes_hand is not None:
+        if bayes_hand is not None:
             actual_hand_size = len(initial_game_state.hand)
             bayes_hand._opp_hand_size = actual_hand_size if actual_hand_size > 0 else 7
             bayes_hand.initialize(
@@ -937,6 +978,20 @@ def _run_episode(
         logprobs       = rollout_outputs.get("logprobs", [])
         completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
         action_to_send  = extract_action_id(completion_text)
+
+        # --- Knock-timing shaping (fires once per knock attempt) ---
+        # Action 55 is "knock" in OpenSpiel gin_rummy. We only score the timing
+        # when the prev state allowed a knock and the Bayesian model has signal.
+        if action_to_send == "55" and game_state_history:
+            prev_gs = game_state_history[-1]
+            if prev_gs.can_knock() and bayes_hand is not None:
+                est_opp_dw = bayes_hand.expected_opp_deadwood()
+                if est_opp_dw is not None:
+                    our_dw = prev_gs.deadwood
+                    if our_dw + KNOCK_TIMING_WIN_MARGIN <= est_opp_dw:
+                        knock_timing_sum += KNOCK_TIMING_BONUS
+                    elif est_opp_dw < our_dw + KNOCK_TIMING_UNDERCUT_MARGIN:
+                        knock_timing_sum += KNOCK_TIMING_UNDERCUT_PENALTY
 
         # --- Full-prompt token accumulation ---
         if use_full_prompt:
@@ -1012,7 +1067,7 @@ def _run_episode(
 
             dead_summary = dead_card_tracker.summary(current_hand)
 
-            if not use_full_prompt and bayesian_model is not None and bayes_hand is not None:
+            if bayesian_model is not None and bayes_hand is not None:
                 bayes_summary      = bayesian_model.summary(current_hand)
                 bayes_hand_summary = bayes_hand.summary(current_hand)
                 context_parts      = [p for p in [dead_summary, bayes_summary, bayes_hand_summary] if p]
@@ -1038,7 +1093,7 @@ def _run_episode(
                     game_state_history.append(game_state)
                     dead_card_tracker.update_from_discard_pile(game_state.discard_pile)
 
-                    if not use_full_prompt and bayesian_model is not None and bayes_hand is not None:
+                    if bayesian_model is not None and bayes_hand is not None:
                         bayesian_model.update_from_discard_pile_delta(prev_discard_pile, game_state.discard_pile)
                         if len(game_state.discard_pile) < len(prev_discard_pile):
                             drawn_card = prev_discard_pile[-1] if prev_discard_pile else None
@@ -1062,6 +1117,7 @@ def _run_episode(
 
         if not use_full_prompt and not is_invalid:
             immediate_reward += ucb_draw_reward
+            ucb_sum += ucb_draw_reward
 
         rewards.append(immediate_reward)
         turn_number += 1
@@ -1070,8 +1126,11 @@ def _run_episode(
     initial_state = game_state_history[0] if game_state_history else None
     final_state   = game_state_history[-1] if game_state_history else None
     train_reward  = calculator.calculate_episode_reward(
-        rewards, final_reward, done, initial_state, final_state, all_states=game_state_history
+        rewards, final_reward, done, initial_state, final_state,
+        all_states=game_state_history, components=components,
+        knock_timing=knock_timing_sum,
     )
+    components["ucb_draw"] = ucb_sum
 
     initial_dw = game_state_history[0].deadwood if game_state_history else 0
     final_dw   = game_state_history[-1].deadwood if game_state_history else 0
@@ -1094,6 +1153,7 @@ def _run_episode(
             "reward":         train_reward,
             "final_score":    final_reward,
             "invalid_count":  invalid_count,
+            "components":     components,
         }
     else:
         return index, {
@@ -1103,6 +1163,7 @@ def _run_episode(
             "reward":         train_reward,
             "final_score":    final_reward,
             "invalid_count":  invalid_count,
+            "components":     components,
         }
 
 
@@ -1138,9 +1199,9 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
     )
 
     _fallback = (
-        {"prompt_ids": [1], "completion_ids": [1], "action_mask": [0], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0, "invalid_count": 0}
+        {"prompt_ids": [1], "completion_ids": [1], "action_mask": [0], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0, "invalid_count": 0, "components": {}}
         if use_full_prompt else
-        {"prompt_ids": [1], "completion_ids": [1], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0, "invalid_count": 0}
+        {"prompt_ids": [1], "completion_ids": [1], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0, "invalid_count": 0, "components": {}}
     )
 
     results = [None] * len(prompts)
@@ -1152,10 +1213,27 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
     curriculum.step(len(prompts))
 
     list_results = [r for r in results if r is not None]
+    n = len(list_results)
     finished = sum(1 for r in list_results if r["final_score"] != 0)
     wins     = sum(1 for r in list_results if r["final_score"] > 0.5)
-    avg_return = sum(r["reward"] for r in list_results) / len(list_results) if list_results else 0
-    print(f"[BATCH] Finished:{finished}/{len(list_results)} Wins:{wins} AvgReturn:{avg_return:.3f}")
+    losses   = sum(1 for r in list_results if r["final_score"] < -0.5)
+    avg_return = sum(r["reward"] for r in list_results) / n if n else 0
+    win_rate   = (wins / finished) if finished else 0.0
+    avg_invalid = sum(r.get("invalid_count", 0) for r in list_results) / n if n else 0
+    print(
+        f"[BATCH] Finished:{finished}/{n} W:{wins} L:{losses} "
+        f"WinRate:{win_rate:.2%} AvgReturn:{avg_return:.3f} AvgInv:{avg_invalid:.2f}"
+    )
+
+    component_keys = ["dw", "terminal", "gin_bonus", "knock_bonus",
+                      "invalid_total", "knock_timing", "clip_delta", "ucb_draw"]
+    if n:
+        avgs = {
+            k: sum(r.get("components", {}).get(k, 0.0) for r in list_results) / n
+            for k in component_keys
+        }
+        comp_str = " ".join(f"{k}:{v:+.3f}" for k, v in avgs.items())
+        print(f"[SHAPING] {comp_str}")
 
     out = {
         "prompt_ids":     [r["prompt_ids"]     for r in list_results],

@@ -178,8 +178,7 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
             diagnostic_weights=list(_PASSIVE_WEIGHTS),
         ),
         full_prompt=ModeConfig(
-            initial_max_turn=15,
-            rollouts_per_stage=200,
+            initial_max_turn=8,
             diagnostic_funcs=list(_PASSIVE_PROBES),
             diagnostic_weights=list(_PASSIVE_WEIGHTS),
         ),
@@ -200,8 +199,7 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
             diagnostic_weights=list(_PASSIVE_WEIGHTS),
         ),
         full_prompt=ModeConfig(
-            initial_max_turn=15,
-            rollouts_per_stage=170,
+            initial_max_turn=8,
             diagnostic_funcs=list(_PASSIVE_PROBES),
             diagnostic_weights=list(_PASSIVE_WEIGHTS),
         ),
@@ -222,7 +220,7 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
             diagnostic_weights=list(_PASSIVE_WEIGHTS),
         ),
         full_prompt=ModeConfig(
-            rollouts_per_stage=450, initial_max_turn=5,
+            rollouts_per_stage=2048, initial_max_turn=1,
             diagnostic_funcs=list(_PASSIVE_PROBES),
             diagnostic_weights=list(_PASSIVE_WEIGHTS),
         ),
@@ -244,8 +242,6 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
             diagnostic_weights=list(_PASSIVE_WEIGHTS),
         ),
         full_prompt=ModeConfig(
-            initial_max_turn=2,
-            rollouts_per_stage=700,
             diagnostic_funcs=list(_PASSIVE_PROBES),
             diagnostic_weights=list(_PASSIVE_WEIGHTS),
         ),

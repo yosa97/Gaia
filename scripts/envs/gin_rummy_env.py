@@ -124,6 +124,26 @@ def remove_reasoning_tags(text: str) -> str:
     return cleaned.strip()
 
 
+# Common EOS / chat-template suffixes that some tokenizers leak into decoded output.
+_EOS_SUFFIXES = ("</s>", "<|im_end|>", "<|endoftext|>", "<|eot_id|>", "<|end_of_text|>")
+
+
+def extract_action_id(completion_text: str) -> str:
+    """Robust action extractor: strips reasoning tags + EOS markers, then pulls the
+    first non-negative integer from the cleaned tail. Returns "" when nothing parses,
+    so the caller surfaces an invalid action rather than sending malformed text."""
+    cleaned = remove_reasoning_tags(completion_text)
+    for suffix in _EOS_SUFFIXES:
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)].rstrip()
+    for marker in ("Action:", "action:", "ACTION:", "Answer:", "answer:"):
+        if marker in cleaned:
+            cleaned = cleaned.split(marker)[-1].strip()
+            break
+    match = re.search(r"\b\d+\b", cleaned)
+    return match.group(0) if match else ""
+
+
 # ---------------------------------------------------------------------------
 # Game state
 # ---------------------------------------------------------------------------
@@ -243,43 +263,87 @@ class RewardCalculator:
         self.missed_opportunity_penalty = -3.0
         self.picked_up_useless_upcard_penalty = -3.0
 
-    def calculate_step_reward(self, states: list[GameState], action: str, env_reward: float) -> float:
+    def calculate_step_reward(
+        self,
+        states: list[GameState],
+        action: str,
+        env_reward: float,
+        components: Optional[dict] = None,
+    ) -> float:
         if len(states) < 2:
             return 0.0
         prev, curr = states[-2], states[-1]
-        reward = 0.0
-        reward += self.deadwood_weight * (prev.deadwood - curr.deadwood)
-        reward += self.high_card_penalty * curr.num_high_cards()
+
+        dw_part = self.deadwood_weight * (prev.deadwood - curr.deadwood)
+        high_card_part = self.high_card_penalty * curr.num_high_cards()
+
         pair_change = curr.count_pairs() - prev.count_pairs()
-        reward += (self.pair_bonus if pair_change > 0 else self.break_pair_penalty) * abs(pair_change) if pair_change != 0 else 0
+        if pair_change > 0:
+            pair_part = self.pair_bonus * pair_change
+        elif pair_change < 0:
+            pair_part = self.break_pair_penalty * abs(pair_change)
+        else:
+            pair_part = 0.0
+
         set_change = curr.count_sets() - prev.count_sets()
-        reward += (self.set_bonus if set_change > 0 else self.break_set_penalty) * abs(set_change) if set_change != 0 else 0
+        if set_change > 0:
+            set_part = self.set_bonus * set_change
+        elif set_change < 0:
+            set_part = self.break_set_penalty * abs(set_change)
+        else:
+            set_part = 0.0
+
         run_change = curr.count_runs() - prev.count_runs()
-        reward += (self.run_bonus if run_change > 0 else self.break_run_penalty) * abs(run_change) if run_change != 0 else 0
+        if run_change > 0:
+            run_part = self.run_bonus * run_change
+        elif run_change < 0:
+            run_part = self.break_run_penalty * abs(run_change)
+        else:
+            run_part = 0.0
+
         potential_run_change = curr.count_potential_runs() - prev.count_potential_runs()
-        if potential_run_change > 0:
-            reward += self.potential_run_bonus * potential_run_change
-        if curr.can_knock() and not prev.can_knock():
-            reward += self.knock_ready_bonus
+        potential_run_part = self.potential_run_bonus * potential_run_change if potential_run_change > 0 else 0.0
+
+        knock_ready_part = self.knock_ready_bonus if (curr.can_knock() and not prev.can_knock()) else 0.0
+
+        discard_part = 0.0
         if prev.phase == 'Discard' and len(curr.discard_pile) > len(prev.discard_pile):
             newly_discarded = [c for c in curr.discard_pile if c not in prev.discard_pile]
             if newly_discarded:
                 dc = newly_discarded[0]
                 if sum(1 for c in prev.hand if get_rank(c) == get_rank(dc)) >= 2:
-                    reward += self.discard_useful_penalty
+                    discard_part += self.discard_useful_penalty
                 if would_improve_run(prev.hand, dc):
-                    reward += self.discard_useful_penalty
+                    discard_part += self.discard_useful_penalty
+
+        upcard_part = 0.0
         if prev.phase == 'Draw' and prev.upcard != 'XX':
             upcard = prev.upcard
             if action == '53':
                 if would_complete_set(prev.hand, upcard) or would_complete_run(prev.hand, upcard):
-                    reward += self.missed_opportunity_penalty
+                    upcard_part += self.missed_opportunity_penalty
             else:
                 if not (would_complete_set(prev.hand, upcard) or would_complete_run(prev.hand, upcard)):
-                    reward += self.picked_up_useless_upcard_penalty
-        if env_reward != 0.0:
-            reward += max(min(env_reward * 100.0, 50.0), -50.0)
-        return reward
+                    upcard_part += self.picked_up_useless_upcard_penalty
+
+        terminal_part = max(min(env_reward * 100.0, 50.0), -50.0) if env_reward != 0.0 else 0.0
+
+        if components is not None:
+            components["dw_delta"]      = components.get("dw_delta", 0.0)      + dw_part
+            components["high_card"]     = components.get("high_card", 0.0)     + high_card_part
+            components["pair"]          = components.get("pair", 0.0)          + pair_part
+            components["set"]           = components.get("set", 0.0)           + set_part
+            components["run"]           = components.get("run", 0.0)           + run_part
+            components["potential_run"] = components.get("potential_run", 0.0) + potential_run_part
+            components["knock_ready"]   = components.get("knock_ready", 0.0)   + knock_ready_part
+            components["discard"]       = components.get("discard", 0.0)       + discard_part
+            components["upcard"]        = components.get("upcard", 0.0)        + upcard_part
+            components["terminal"]      = components.get("terminal", 0.0)      + terminal_part
+
+        return (
+            dw_part + high_card_part + pair_part + set_part + run_part
+            + potential_run_part + knock_ready_part + discard_part + upcard_part + terminal_part
+        )
 
     def calculate_discounted_return(self, rewards: list[float]) -> float:
         if not rewards:
@@ -452,6 +516,8 @@ def _run_episode(
     game_state_history: list[GameState] = []
     rewards: list[float] = []
     calculator = RewardCalculator()
+    components: dict[str, float] = {}
+    invalid_penalty_sum = 0.0
     use_hints = random.random() < current_hint_prob
 
     # --- Reset environment ---
@@ -523,11 +589,7 @@ def _run_episode(
         messages.append({"role": "assistant", "content": completion_text})
 
         # --- Parse action ---
-        action_to_send = remove_reasoning_tags(completion_text)
-        if action_to_send.endswith("</s>"):
-            action_to_send = action_to_send[:-5]
-        if "Action:" in action_to_send:
-            action_to_send = action_to_send.split("Action:")[-1].strip()
+        action_to_send = extract_action_id(completion_text)
 
         # --- Step environment ---
         is_invalid = False
@@ -565,13 +627,18 @@ def _run_episode(
             except Exception as exc:
                 print(f"Failed to parse game state: {exc}")
                 immediate_reward = -10.0
+                invalid_penalty_sum += -10.0
             else:
                 game_state_history.append(game_state)
-                immediate_reward = calculator.calculate_step_reward(game_state_history, action_to_send, 0.0)
+                immediate_reward = calculator.calculate_step_reward(
+                    game_state_history, action_to_send, 0.0, components=components
+                )
         elif is_invalid:
             immediate_reward = -10.0
+            invalid_penalty_sum += -10.0
         else:
             immediate_reward = max(min((step_reward - 0.5) * 100.0, 50.0), -50.0)
+            components["terminal"] = components.get("terminal", 0.0) + immediate_reward
 
         rewards.append(immediate_reward)
         turn_number += 1
@@ -598,6 +665,8 @@ def _run_episode(
             "reward":         train_reward,
             "final_score":    final_reward,
             "invalid_count":  invalid_count,
+            "components":     components,
+            "invalid_penalty_sum": invalid_penalty_sum,
         }
     else:
         return index, {
@@ -607,6 +676,8 @@ def _run_episode(
             "reward":         train_reward,
             "final_score":    final_reward,
             "invalid_count":  invalid_count,
+            "components":     components,
+            "invalid_penalty_sum": invalid_penalty_sum,
         }
 
 
@@ -642,9 +713,9 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
     )
 
     _fallback = (
-        {"prompt_ids": [1], "completion_ids": [1], "action_mask": [0], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0, "invalid_count": 0}
+        {"prompt_ids": [1], "completion_ids": [1], "action_mask": [0], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0, "invalid_count": 0, "components": {}, "invalid_penalty_sum": 0.0}
         if use_full_prompt else
-        {"prompt_ids": [1], "completion_ids": [1], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0, "invalid_count": 0}
+        {"prompt_ids": [1], "completion_ids": [1], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0, "invalid_count": 0, "components": {}, "invalid_penalty_sum": 0.0}
     )
 
     results = [None] * len(prompts)
@@ -659,8 +730,25 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
     n = len(list_results)
     finished   = sum(1 for r in list_results if r["final_score"] != 0)
     wins       = sum(1 for r in list_results if r.get("final_score", 0) > 0)
+    losses     = sum(1 for r in list_results if r.get("final_score", 0) < 0)
     avg_return = sum(r["reward"] for r in list_results) / n if n else 0
-    print(f"[BATCH] Finished: {finished}/{n}, AvgReturn: {avg_return:.2f}")
+    win_rate   = (wins / finished) if finished else 0.0
+    avg_invalid = sum(r.get("invalid_count", 0) for r in list_results) / n if n else 0
+    print(
+        f"[BATCH] Finished:{finished}/{n} W:{wins} L:{losses} "
+        f"WinRate:{win_rate:.2%} AvgReturn:{avg_return:.2f} AvgInv:{avg_invalid:.2f}"
+    )
+
+    component_keys = ["dw_delta", "high_card", "pair", "set", "run", "potential_run",
+                      "knock_ready", "discard", "upcard", "terminal"]
+    if n:
+        avgs = {
+            k: sum(r.get("components", {}).get(k, 0.0) for r in list_results) / n
+            for k in component_keys
+        }
+        avg_inv_pen = sum(r.get("invalid_penalty_sum", 0.0) for r in list_results) / n
+        comp_str = " ".join(f"{k}:{v:+.2f}" for k, v in avgs.items())
+        print(f"[SHAPING] {comp_str} invalid_pen:{avg_inv_pen:+.2f}")
 
     out = {
         "prompt_ids":     [r["prompt_ids"]     for r in list_results],
