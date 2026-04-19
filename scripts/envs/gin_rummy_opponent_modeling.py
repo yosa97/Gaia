@@ -366,8 +366,11 @@ class BayesianOpponentModel:
         self._update_heat(discarded_card, weight=-0.5)
 
     def update_from_discard_pile_delta(
-        self, prev_discard_pile: list[str], curr_discard_pile: list[str]
+        self, prev_discard_pile: list[str], curr_discard_pile: list[str],
+        is_opponent_turn: bool = True,
     ) -> None:
+        if not is_opponent_turn:
+            return  # skip update jika bukan giliran opp — hindari false signal
         prev_set = list(prev_discard_pile)
         curr_set = list(curr_discard_pile)
         if prev_set and (not curr_set or len(curr_set) < len(prev_set)):
@@ -521,6 +524,152 @@ class BayesianOpponentHandModel:
 
 
 # ---------------------------------------------------------------------------
+# Knock urgency model
+# ---------------------------------------------------------------------------
+
+class KnockUrgencyModel:
+    """
+    Estimasi seberapa dekat opp akan knock berdasarkan pola draw/discard mereka.
+
+    Signal:
+    - Opp draw dari upcard → actively building meld → lebih dekat knock
+    - Opp draw dari stock terus → mungkin stuck
+    - Banyak discard bervalue tinggi (J/Q/K) → clearing deadwood → knock imminent
+    - Stock size kecil → semua orang harus bergerak cepat
+    """
+
+    def __init__(self) -> None:
+        self.upcard_draws:      int = 0
+        self.stock_draws:       int = 0
+        self.high_val_discards: int = 0
+        self.total_opp_turns:   int = 0
+
+    def update_upcard_draw(self) -> None:
+        self.upcard_draws    += 1
+        self.total_opp_turns += 1
+
+    def update_stock_draw(self) -> None:
+        self.stock_draws     += 1
+        self.total_opp_turns += 1
+
+    def update_discard(self, card: str) -> None:
+        if len(card) == 2:
+            val = CARD_VALUES.get(card[0].upper(), 0)
+            if val >= 10:          # discard J/Q/K → clearing high deadwood
+                self.high_val_discards += 1
+        self.total_opp_turns += 1
+
+    def urgency_level(self, stock_size: int) -> str:
+        """Return: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'"""
+        score = 0
+        if self.total_opp_turns > 0:
+            upcard_ratio = self.upcard_draws / self.total_opp_turns
+            if upcard_ratio >= 0.5:
+                score += 2
+            elif upcard_ratio >= 0.3:
+                score += 1
+        if self.high_val_discards >= 3:
+            score += 2
+        elif self.high_val_discards >= 1:
+            score += 1
+        if stock_size <= 5:
+            score += 3
+        elif stock_size <= 10:
+            score += 2
+        elif stock_size <= 15:
+            score += 1
+        if score >= 5:
+            return "CRITICAL"
+        elif score >= 3:
+            return "HIGH"
+        elif score >= 2:
+            return "MEDIUM"
+        return "LOW"
+
+    def summary(self, stock_size: int) -> str:
+        level = self.urgency_level(stock_size)
+        lines = [f"[KnockUrgency] Opp knock threat: {level}"]
+        if level in ("HIGH", "CRITICAL"):
+            lines.append(
+                f"[KnockUrgency] Opp drew upcard {self.upcard_draws}x, "
+                f"cleared {self.high_val_discards} high-value cards. "
+                f"Stock={stock_size}. REDUCE DEADWOOD ASAP or KNOCK if eligible."
+            )
+        elif level == "MEDIUM":
+            lines.append("[KnockUrgency] Opp gaining momentum. Monitor closely.")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Strategy advisor
+# ---------------------------------------------------------------------------
+
+class StrategyAdvisor:
+    """
+    Synthesizes semua opponent models menjadi satu rekomendasi strategis konkret
+    yang ditampilkan ke LLM dalam augmented observation.
+    """
+
+    @staticmethod
+    def advise(
+        game_state:    "GameState",
+        dead_tracker:  "DeadCardTracker",
+        bayes_model:   "BayesianOpponentModel",
+        bayes_hand:    "BayesianOpponentHandModel",
+        knock_urgency: "KnockUrgencyModel",
+    ) -> str:
+        lines = ["=== STRATEGIC CONTEXT ==="]
+
+        # 1. Knock decision
+        knock_risk = bayes_hand.knock_risk()
+        urgency    = knock_urgency.urgency_level(game_state.stock_size)
+
+        if game_state.can_knock():
+            if urgency in ("HIGH", "CRITICAL"):
+                lines.append("\u26a1 KNOCK NOW \u2014 you are eligible AND opp is close to knocking!")
+            elif "HIGH" in knock_risk:
+                lines.append("\u26a1 KNOCK NOW \u2014 you are eligible AND opponent near knocking (low est. deadwood)")
+            else:
+                lines.append("\u2705 You CAN knock. Consider it if your deadwood is comfortable.")
+        else:
+            dw_gap = game_state.deadwood - game_state.knock_card
+            if urgency in ("HIGH", "CRITICAL"):
+                lines.append(
+                    f"\U0001f6a8 URGENT: Deadwood={game_state.deadwood}, need \u2264{game_state.knock_card}. "
+                    f"Gap={dw_gap}. Opp threatening to knock soon!"
+                )
+            else:
+                lines.append(
+                    f"\u2139\ufe0f Deadwood={game_state.deadwood}, need \u2264{game_state.knock_card} to knock (gap={dw_gap})."
+                )
+
+        # 2. Discard advice
+        safe_cards   = bayes_model.get_safe_cards(game_state.hand)
+        danger_cards = bayes_model.get_danger_cards(game_state.hand)
+        if safe_cards:
+            lines.append(f"\u2705 SAFE to discard: {' '.join(safe_cards[:4])} (opp has low interest)")
+        if danger_cards:
+            lines.append(f"\U0001f6ab AVOID discarding: {' '.join(danger_cards[:4])} (may complete opp meld)")
+
+        # 3. Draw advice (hanya saat phase Draw/FirstUpcard)
+        if game_state.phase in ("Draw", "FirstUpcard") and game_state.upcard != "XX":
+            potential = meld_potential(game_state.upcard, game_state.hand)
+            if potential > 0:
+                lines.append(
+                    f"\u2b06\ufe0f  Upcard {game_state.upcard} reduces your deadwood by ~{potential}pt \u2014 consider taking it."
+                )
+            elif bayes_model.is_dangerous_discard(game_state.upcard):
+                lines.append(
+                    f"\u26a0\ufe0f  Upcard {game_state.upcard} is HOT for opp \u2014 take it to BLOCK, even if low value for you."
+                )
+            else:
+                lines.append(f"\u27a1\ufe0f  Upcard {game_state.upcard} has low value for you \u2014 draw from stock instead.")
+
+        lines.append("=========================")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Observation helpers
 # ---------------------------------------------------------------------------
 
@@ -665,6 +814,22 @@ class RewardCalculator:
             return 0.0
         return -0.1 * (unsafe_count / len(agent_discards))
 
+    @staticmethod
+    def _compute_stock_urgency(states: list["GameState"]) -> float:
+        """
+        Penalti negatif jika kita belum knock padahal stock sudah kecil.
+        Makin kecil stock, makin besar penalti jika masih belum knock.
+        """
+        if not states:
+            return 0.0
+        final  = states[-1]
+        stock  = final.stock_size
+        dw     = final.deadwood
+        if stock <= 5 and dw > final.knock_card:
+            urgency_scale = (5 - stock) / 5.0   # 0.0 saat stock=5, 1.0 saat stock=0
+            return -0.15 * urgency_scale
+        return 0.0
+
     def calculate_episode_reward(
         self,
         step_rewards: list[float],
@@ -705,7 +870,13 @@ class RewardCalculator:
         # 3. Invalid action penalties (accumulated, clipped)
         invalid_total = max(sum(r for r in step_rewards if r < 0), INVALID_TOTAL_CLIP)
 
-        raw = deadwood_component + terminal + invalid_total
+        # 4. Discard safety signal (was implemented but never used — now active)
+        discard_safety = self.compute_discard_safety(all_states or [])
+
+        # 5. Stock depletion urgency penalty
+        stock_urgency  = self._compute_stock_urgency(all_states or [])
+
+        raw = deadwood_component + terminal + invalid_total + discard_safety + stock_urgency
         return max(min(raw, TERMINAL_REWARD_CLIP), -TERMINAL_REWARD_CLIP)
 
 
@@ -851,9 +1022,11 @@ def _run_episode(
     # Opponent modelling — full Bayesian models only for last-prompt mode
     bayesian_model: "BayesianOpponentModel | None"     = None
     bayes_hand:     "BayesianOpponentHandModel | None" = None
+    knock_urgency:  "KnockUrgencyModel | None"         = None
     if not use_full_prompt:
         bayesian_model = BayesianOpponentModel()
         bayes_hand     = BayesianOpponentHandModel()
+        knock_urgency  = KnockUrgencyModel()
 
     use_hints = random.random() < current_hint_prob
 
@@ -978,10 +1151,18 @@ def _run_episode(
 
             dead_summary = dead_card_tracker.summary(current_hand)
 
-            if not use_full_prompt and bayesian_model is not None and bayes_hand is not None:
+            if not use_full_prompt and bayesian_model is not None and bayes_hand is not None and knock_urgency is not None:
+                curr_gs            = game_state_history[-1] if game_state_history else None
                 bayes_summary      = bayesian_model.summary(current_hand)
                 bayes_hand_summary = bayes_hand.summary(current_hand)
-                context_parts      = [p for p in [dead_summary, bayes_summary, bayes_hand_summary] if p]
+                knock_summary      = knock_urgency.summary(curr_gs.stock_size if curr_gs else 52)
+                if curr_gs is not None:
+                    strategy_advice = StrategyAdvisor.advise(
+                        curr_gs, dead_card_tracker, bayesian_model, bayes_hand, knock_urgency
+                    )
+                    context_parts = [p for p in [strategy_advice, dead_summary, bayes_summary, bayes_hand_summary, knock_summary] if p]
+                else:
+                    context_parts = [p for p in [dead_summary, bayes_summary, bayes_hand_summary] if p]
             else:
                 context_parts = [dead_summary] if dead_summary else []
 
@@ -1005,17 +1186,28 @@ def _run_episode(
                     dead_card_tracker.update_from_discard_pile(game_state.discard_pile)
 
                     if not use_full_prompt and bayesian_model is not None and bayes_hand is not None:
-                        bayesian_model.update_from_discard_pile_delta(prev_discard_pile, game_state.discard_pile)
+                        # Tentukan apakah ini giliran opp: turn genap = giliran kita jika player_id=0
+                        is_opp_turn = (turn_number % 2 == 1) if game_state.player_id == 0 else (turn_number % 2 == 0)
+                        bayesian_model.update_from_discard_pile_delta(
+                            prev_discard_pile, game_state.discard_pile,
+                            is_opponent_turn=is_opp_turn,
+                        )
                         if len(game_state.discard_pile) < len(prev_discard_pile):
                             drawn_card = prev_discard_pile[-1] if prev_discard_pile else None
                             if drawn_card:
                                 bayes_hand.update_opp_drew_upcard(drawn_card)
+                                if knock_urgency is not None and is_opp_turn:
+                                    knock_urgency.update_upcard_draw()
                         elif len(game_state.discard_pile) > len(prev_discard_pile):
                             discarded_card = game_state.discard_pile[-1] if game_state.discard_pile else None
                             if discarded_card:
                                 bayes_hand.update_opp_discarded(discarded_card)
+                                if knock_urgency is not None and is_opp_turn:
+                                    knock_urgency.update_discard(discarded_card)
                         else:
                             bayes_hand.update_opp_drew_stock()
+                            if knock_urgency is not None and is_opp_turn:
+                                knock_urgency.update_stock_draw()
 
                     prev_discard_pile = list(game_state.discard_pile)
                     immediate_reward  = calculator.calculate_step_reward(

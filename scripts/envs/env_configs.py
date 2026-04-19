@@ -185,12 +185,11 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         reward_func=_liar_opp_reward,
         curriculum_factory=_liar_opp_curriculum,
         reasoning=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
-        no_mask=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1,
+        no_mask=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
         full_prompt=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
         num_generations=8,
         temperature=2.0,
         top_k=5,
-        )
     ),
     "leduc_poker": EnvTrainingConfig(
         rollout_full=_leduc_rollout_full,
@@ -201,7 +200,7 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         temperature=2.0,
         top_k=5,
     ),
-        "leduc_poker_opponent_modeling": EnvTrainingConfig(
+    "leduc_poker_opponent_modeling": EnvTrainingConfig(
         rollout_full=_leduc_opp_rollout_full,
         rollout_last=_leduc_opp_rollout_last,
         reward_func=_leduc_opp_reward,
@@ -224,9 +223,9 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
 
 # Change this to select a non-default variant for a base environment name.
 _VARIANT_OVERRIDES: dict[str, str] = {
-    # "gin_rummy":   "gin_rummy_opponent_modeling",
-    # "liars_dice":  "liars_dice_opponent_modeling",
-    # "leduc_poker": "leduc_poker_opponent_modeling",
+    "gin_rummy":   "gin_rummy_opponent_modeling",
+    "liars_dice":  "liars_dice_opponent_modeling",
+    "leduc_poker": "leduc_poker_opponent_modeling",
 }
 
 
