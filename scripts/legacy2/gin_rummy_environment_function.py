@@ -3,14 +3,14 @@ import re
 import random
 import requests
 from typing import Optional
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Semaphore
 
 from trl.experimental.openenv import generate_rollout_completions
 
-
+# ── CONSTANTS ────────────────────────────────────────────────────────────────
 CARD_VALUES = {
     'A': 1, '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9,
     'T': 10, 'J': 10, 'Q': 10, 'K': 10
@@ -18,40 +18,53 @@ CARD_VALUES = {
 
 RANK_ORDER = ['A', '2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K']
 
-MCTS_CONFIG = {
-    "opponent": "mcts",
-    "mcts_max_simulations": 50,
-    "mcts_num_rollouts": 1,
+GAMES_TO_TASK_ID_RANGE = {
+    "goofspiel": (0, 99999999), "goof_spiel": (0, 99999999),
+    "liars_dice": (100000000, 199999999), "leduc_poker": (200000000, 299999999),
+    "gin_rummy": (300000000, 399999999), "othello": (400000000, 499999999),
+    "backgammon": (500000000, 599999999), "hex": (600000000, 699999999),
+    "clobber": (700000000, 799999999),
 }
 
-# Reward constants — aligns with validator "higher is better" scoring
-TERMINAL_WIN_REWARD = 1.0
-TERMINAL_LOSS_REWARD = -1.0
-GIN_BONUS = 0.25           # extra for 0-deadwood win (Gin = all melds)
-KNOCK_BONUS = 0.1          # extra for winning via knock (tournament: reward timely knock)
-DEADWOOD_WEIGHT = 0.5      # fraction of total reward from deadwood improvement
-INVALID_PENALTY = -0.1
-INVALID_TOTAL_CLIP = -0.3
-TERMINAL_REWARD_CLIP = 1.0 # final clip for validator alignment
+_SELECTED_GAME = "gin_rummy"
+_MAX_EPISODE_TOKENS = 16384
+_MAX_PROMPT_LEN = 5500
+_TIMEOUT = 2400
 
-# Bayesian discard quality shaping (from AAAI Gin Rummy / Bayesian inference literature)
-# Reward discarding cards that are "safe" (unlikely to benefit opponent's meld-building)
-SAFE_DISCARD_BONUS = 0.02       # bonus for discarding a card unlikely to complete opp's meld
-DANGEROUS_DISCARD_PENALTY = 0.02  # penalty for discarding a card that directly extends opp's run/set
+# ── REWARD CONSTANTS — normalized [-1, 1] for validator alignment ─────────────
+TERMINAL_WIN_REWARD  = 1.0
+TERMINAL_LOSS_REWARD = -1.0
+GIN_BONUS            = 0.6    # bonus menang dengan deadwood 0 (Gin sempurna)
+KNOCK_BONUS          = 0.15   # bonus menang lewat knock tepat waktu
+DEADWOOD_WEIGHT      = 0.3    # bobot penurunan deadwood per episode
+INVALID_PENALTY      = -0.1   # penalti per aksi invalid
+INVALID_TOTAL_CLIP   = -0.3   # maksimum total penalti invalid per episode
+TERMINAL_REWARD_CLIP = 1.0    # clip akhir reward agar di [-1, 1]
 
 # UCB Draw Decision shaping constants
-DRAW_UPCARD_BONUS = 0.03    # bonus when model draws upcard that reduces optimal deadwood
-DRAW_UPCARD_PENALTY = 0.02  # mild penalty when model draws upcard with no deadwood benefit
+DRAW_UPCARD_BONUS   = 0.03    # bonus when model draws upcard that reduces optimal deadwood
+DRAW_UPCARD_PENALTY = 0.02    # mild penalty when model draws upcard with no deadwood benefit
 
-# Curriculum MCTS difficulty: progressive 10→50 sims alongside turn curriculum
-CURRICULUM_INITIAL_MCTS_SIMS = 10   # easy opponent during early turn curriculum
-CURRICULUM_FINAL_MCTS_SIMS   = 50   # matches MCTS_CONFIG target at full curriculum
+# ── CURRICULUM MCTS — progressive 10 → 50 sims (match validator di akhir) ────
+CURRICULUM_INITIAL_MCTS_SIMS = 10   # lawan lemah di awal curriculum
+CURRICULUM_FINAL_MCTS_SIMS   = 50   # sekuat evaluasi validator di akhir
 
 # Curriculum turn progression
-CURRICULUM_INITIAL_MAX_TURN    = 5    # gin needs 10+ turns to complete; start at 5 for early signal
-CURRICULUM_FINAL_MAX_TURN      = 30   # full gin rummy game length
-CURRICULUM_ROLLOUTS_PER_STAGE  = 64   # advance 1 turn every ~5 optimizer steps at batch-size 14
-CURRICULUM_WARMUP_ROLLOUTS     = 0    # no warmup burn; start advancing from step 0
+CURRICULUM_INITIAL_MAX_TURN   = 5    # mulai dari 5 turn; gin butuh 10+ giliran
+CURRICULUM_FINAL_MAX_TURN     = 30   # full gin rummy game length
+CURRICULUM_ROLLOUTS_PER_STAGE = 64   # naik 1 turn per ~5 optimizer steps (batch 14)
+CURRICULUM_WARMUP_ROLLOUTS    = 0    # tidak ada warmup; langsung mulai naik
+
+# ── MCTS STRATEGY HINT — diajarkan ke AI cara eksploitasi kelemahan MCTS ─────
+_MCTS_HINT = (
+    "\n\n# Strategi vs MCTS Opponent (50 simulasi, IS-MCTS 1 rollout per node):\n"
+    "- MCTS resample tangan lawan setiap simulasi — dengan 50 sampel saja, MCTS tidak akurat\n"
+    "- 'Kartu mati' (di discard pile) dieliminasi dari semua sampel MCTS — analisis kartu mati selalu andal\n"
+    "- Knock LEBIH AWAL dari yang terasa benar: MCTS dengan 1 rollout meremehkan nilai menunggu Gin\n"
+    "- MCTS paling lemah saat stock 10-20 kartu (banyak kartu tersembunyi = varians sampel tinggi)\n"
+    "- Buang kartu mati: paksa MCTS masuk ke sampel yang tidak bisa dieksploitasi\n"
+    "- Jika stock < 8 kartu, selalu knock daripada kejar Gin — draw paksa itu berbahaya\n"
+)
 
 # Comprehensive win strategy hint injected into early episodes (fades to 0 by end)
 _HINT_PROMPT = (
@@ -92,6 +105,11 @@ _HINT_PROMPT = (
     "- Upcard decisions: MCTS evaluates these accurately (upcard is known) → only take if it truly helps\n"
     "- Safe discard strategy beats MCTS: 'dead' card discards force MCTS into samples it can't exploit\n"
 )
+
+REASONING_TAG_PAIRS = [
+    ("think", "think"), ("thinking", "thinking"), ("reasoning", "reasoning"),
+    ("thought", "thought"), ("reflection", "reflection"),
+]
 
 
 def get_rank(card: str) -> str:
@@ -1047,13 +1065,7 @@ class RewardCalculator:
         return max(min(raw, TERMINAL_REWARD_CLIP), -TERMINAL_REWARD_CLIP)
     
     
-REASONING_TAG_PAIRS = [
-    ("think", "think"),
-    ("thinking", "thinking"),
-    ("reasoning", "reasoning"),
-    ("thought", "thought"),
-    ("reflection", "reflection"),
-]
+# (REASONING_TAG_PAIRS defined at module level above)
 
 def remove_reasoning_tags(text: str) -> str:
 
@@ -1214,7 +1226,7 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
             try:
                 print(f"[INIT] Initializing env on server {idx}: {base_url}")
                 # Initialize with a test reset to ensure server is ready
-                payload = {"task_id": games_to_task_id_range[selected_game][0], "seed": 42, **MCTS_CONFIG}
+                payload = {"task_id": games_to_task_id_range[selected_game][0], "seed": 42, "opponent": "mcts", "mcts_max_simulations": CURRICULUM_FINAL_MCTS_SIMS, "mcts_num_rollouts": 1}
                 res = requests.post(f"{base_url}/reset", json=payload, timeout=300)
                 res.raise_for_status()
                 env_pool.append({"base_url": base_url})
@@ -1578,7 +1590,7 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
             try:
                 print(f"[INIT] Initializing env on server {idx}: {base_url}")
                 # Initialize with a test reset to ensure server is ready
-                payload = {"task_id": games_to_task_id_range[selected_game][0], "seed": 42, **MCTS_CONFIG}
+                payload = {"task_id": games_to_task_id_range[selected_game][0], "seed": 42, "opponent": "mcts", "mcts_max_simulations": CURRICULUM_FINAL_MCTS_SIMS, "mcts_num_rollouts": 1}
                 res = requests.post(f"{base_url}/reset", json=payload, timeout=300)
                 res.raise_for_status()
                 env_pool.append({"base_url": base_url})

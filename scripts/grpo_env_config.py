@@ -286,7 +286,7 @@ def get_training_json(train_info: dict) -> dict:
         config = GRPO_CONFIG["6_9_b"]
     print(f"config: {config}")
     run_config = {
-        "epoch_num": 2,
+        "epoch_num": 5,
         "batch_size": config["batch_size"],
         "learning_rate": config["lr"],
         "min_lr_rate": 0.25,

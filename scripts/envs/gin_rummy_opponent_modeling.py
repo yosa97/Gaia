@@ -1,3 +1,51 @@
+"""
+Gin Rummy — Opponent Modeling Environment
+==========================================
+
+Upgraded training environment featuring:
+
+Opponent Modeling Stack:
+  - DeadCardTracker      — impossible meld detection + layoff candidates
+  - BayesianOpponentModel — rank/suit heat map from discard pile deltas
+  - BayesianOpponentHandModel — P(card ∈ opp hand) → knock risk estimate
+
+Rich Reward Shaping (15 signals, post-Training-A calibration):
+  1.  Deadwood improvement (DP optimal, weight=0.8)
+  2.  High card penalty (-0.05 per high card)
+  3.  Pair tracking (bonus=2.0 / break=-1.5)
+  4.  Set tracking (bonus=4.0 / break=-3.0)
+  5.  Run tracking (bonus=4.0 / break=-4.0)
+  6.  Potential run bonus (3.0 per new 2-card run)
+  7.  Knock ready bonus (6.0 × early-knock multiplier 1.5/1.0/0.8)
+  7b. Gin completion bonus (knock_ready_bonus × 1.5)
+  7c. Deadwood margin shaping (proportional 0.3 per point)
+  8.  Discard quality penalty (useful card discarded)
+  9.  Draw decision shaping (meld_potential + completion check)
+  10. Terminal env reward scaling (×100, clip ±50)
+  11. Discard isolation (card_isolation_score — vlmlee/Gin-Rummy)
+  12. Bayesian discard safety (safe +1.0 / dangerous -1.5)
+  13. Gin proximity bonus (3.0 when deadwood ≤ 3 and can knock)
+  14. Stock urgency penalty (-1.0 when stock ≤ 5 and cannot knock)
+  15. Stagnation penalty (-1.5 if deadwood unchanged 3+ turns)
+  16. Meld coverage progress (×5.0 delta, DP optimal)
+
+Curriculum:
+  - Progressive MCTS: 10 sims at start → 50 sims (validator level)
+    ramp over rollouts_per_stage × 2 rollouts
+  - max_turn ramp: initial_max_turn → 30
+  - hint_prob decay: 0.5 → 0.0
+
+Intelligence Context Injection (every turn):
+  - Dead cards / layoff candidates
+  - Bayesian opponent suit/rank heat
+  - Opponent knock risk
+  - Compact # Intel [H:N] block capped at 400 chars
+
+MCTS Exploitation hint in system prompt (always injected).
+Error correction message on invalid actions.
+Discounted return γ=0.95 (encourages early knock).
+"""
+
 import functools
 import random
 import re
