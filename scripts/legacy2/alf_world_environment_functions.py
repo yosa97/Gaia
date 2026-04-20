@@ -233,7 +233,7 @@ def alfworld_rollout_full_prompt_and_completion_parallelized(
     MAX_PROMPT_LEN = 24576      # Max prompt tokens before ending episode early
     
     # --- 1. Static Initialization (Once per Rank) ---
-    if not getattr(alfworld_rollout_first_prompt_and_completion_parallelized, "initialized", False):
+    if not getattr(alfworld_rollout_full_prompt_and_completion_parallelized, "initialized", False):
         rank = int(os.environ.get("LOCAL_RANK", "0"))
         raw_urls = os.environ.get("ENVIRONMENT_SERVER_URLS", "")
         server_urls = [u.strip() for u in raw_urls.split(",") if u.strip()]
@@ -262,17 +262,17 @@ def alfworld_rollout_full_prompt_and_completion_parallelized(
             except Exception as e:
                 raise RuntimeError(f"Failed to init server {base_url}: {e}")
 
-        alfworld_rollout_first_prompt_and_completion_parallelized.rank = rank
-        alfworld_rollout_first_prompt_and_completion_parallelized.env_pool = env_pool
-        alfworld_rollout_first_prompt_and_completion_parallelized.num_servers = len(env_pool)
-        alfworld_rollout_first_prompt_and_completion_parallelized.initialized = True
-        alfworld_rollout_first_prompt_and_completion_parallelized.thread_pool = ThreadPoolExecutor(max_workers=len(env_pool))
-        alfworld_rollout_first_prompt_and_completion_parallelized.generation_semaphore = Semaphore(1)
+        alfworld_rollout_full_prompt_and_completion_parallelized.rank = rank
+        alfworld_rollout_full_prompt_and_completion_parallelized.env_pool = env_pool
+        alfworld_rollout_full_prompt_and_completion_parallelized.num_servers = len(env_pool)
+        alfworld_rollout_full_prompt_and_completion_parallelized.initialized = True
+        alfworld_rollout_full_prompt_and_completion_parallelized.thread_pool = ThreadPoolExecutor(max_workers=len(env_pool))
+        alfworld_rollout_full_prompt_and_completion_parallelized.generation_semaphore = Semaphore(1)
 
     # Retrieve static variables
-    rank = alfworld_rollout_first_prompt_and_completion_parallelized.rank
-    env_pool = alfworld_rollout_first_prompt_and_completion_parallelized.env_pool
-    num_servers = alfworld_rollout_first_prompt_and_completion_parallelized.num_servers
+    rank = alfworld_rollout_full_prompt_and_completion_parallelized.rank
+    env_pool = alfworld_rollout_full_prompt_and_completion_parallelized.env_pool
+    num_servers = alfworld_rollout_full_prompt_and_completion_parallelized.num_servers
 
     tokenizer = trainer.processing_class
     DATA_LEN = 2500
@@ -346,7 +346,7 @@ def alfworld_rollout_full_prompt_and_completion_parallelized(
             while not done and (turn_number < max_turns):
                 # Generate Rollout Completion
                 # Only allow one thread to generate rollout completions at a time
-                with alfworld_rollout_first_prompt_and_completion_parallelized.generation_semaphore:
+                with alfworld_rollout_full_prompt_and_completion_parallelized.generation_semaphore:
                     rollout_outputs = generate_rollout_completions(trainer, prompts=[messages], as_chat=True)[0]
                 prompt_ids = rollout_outputs.get("prompt_ids", [])
                 completion_ids = rollout_outputs.get("completion_ids", [])
@@ -459,7 +459,7 @@ def alfworld_rollout_full_prompt_and_completion_parallelized(
     results = [None] * len(prompts)
     list_results = []
 
-    executor = alfworld_rollout_first_prompt_and_completion_parallelized.thread_pool
+    executor = alfworld_rollout_full_prompt_and_completion_parallelized.thread_pool
 
     futures = [
         executor.submit(run_single_prompt, i, p)

@@ -172,6 +172,10 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         rollout_last=_liar_rollout_last,
         reward_func=_liar_reward,
         curriculum_factory=_liar_curriculum,
+        # Liar's Dice has very long episodes (_MAX_EPISODE_TOKENS=16384).
+        # 8192 gives enough headroom for 7B models on 4 GPUs without OOM.
+        # (reasoning mode adds 2048 on top of this at runtime)
+        vllm_max_model_length=8192,
         reasoning=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
         no_mask=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
         full_prompt=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
@@ -184,6 +188,10 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         rollout_last=_liar_opp_rollout_last,
         reward_func=_liar_opp_reward,
         curriculum_factory=_liar_opp_curriculum,
+        # Liar's Dice has very long episodes (_MAX_EPISODE_TOKENS=16384).
+        # 8192 gives enough headroom for 7B models on 4 GPUs without OOM.
+        # (reasoning mode adds 2048 on top of this at runtime)
+        vllm_max_model_length=8192,
         reasoning=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
         no_mask=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
         full_prompt=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
