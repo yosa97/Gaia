@@ -541,14 +541,55 @@ def _format_observation(raw: str) -> str:
     return "\n\n".join(parts)
 
 
-def _parse_action(completion_text: str) -> str:
-    """Extract action ID from model output."""
+def _parse_action(completion_text: str, legal_map: "dict[int, str] | None" = None) -> str:
+    """
+    Extract action ID from model output.
+
+    If ``legal_map`` is provided and the extracted token does not map to a
+    legal action, returns an empty string so the caller can use the fallback.
+    """
     action = completion_text.strip()
     if action.endswith("</s>"):
         action = action[:-4].strip()
     if "Action:" in action:
         action = action.split("Action:")[-1].strip()
+    # Keep only the first token (model may output "2 Raise" instead of "2")
+    action = action.split()[0] if action.split() else action
+    if legal_map is not None:
+        try:
+            if int(action) not in legal_map:
+                return ""
+        except (ValueError, TypeError):
+            return ""
     return action
+
+
+def _select_fallback_action(gs: "GameState | None") -> str:
+    """
+    Nash-inspired fallback when the model produces an invalid action.
+
+    Decision hierarchy (Leduc solved strategy):
+      - Pair or K  → Raise > Call
+      - J vs raise → Fold > Call
+      - Otherwise  → Call > Fold
+    """
+    if gs is None:
+        return "1"
+    la = gs.legal_actions
+    if not la:
+        return "1"
+
+    def _pick(*preferred: int) -> str:
+        for a in preferred:
+            if a in la:
+                return str(a)
+        return str(next(iter(la)))
+
+    if gs.has_pair or gs.private_card_rank == 3:
+        return _pick(2, 1)  # Raise > Call
+    if gs.private_card_rank == 1 and gs.opp_raised_this_round:
+        return _pick(0, 1)  # Fold > Call
+    return _pick(1, 0)      # Call > Fold
 
 
 # ---------------------------------------------------------------------------
@@ -584,15 +625,16 @@ def _run_episode(
     completion_ids: list[int]   = []
     logprobs:       list[float] = []
 
-    done          = False
-    final_reward  = 0.0
-    episode_reward = 0.0
-    turn_number   = 0
-    invalid_count = 0
-    use_hints     = random.random() < current_hint_prob
+    done                 = False
+    final_reward         = 0.0
+    episode_reward       = 0.0
+    turn_number          = 0
+    invalid_count        = 0
+    consecutive_invalids = 0
+    use_hints            = random.random() < current_hint_prob
     game_state_history: list[GameState] = []
-    calculator    = RewardCalculator()
-    rewards:        list[float] = []
+    calculator           = RewardCalculator()
+    rewards:             list[float] = []
 
     # Opponent models — only active in last-prompt mode
     range_model: "OpponentRangeModel | None"        = None
@@ -680,8 +722,20 @@ def _run_episode(
         messages.append({"role": "assistant", "content": completion_text})
 
         # --- Parse and send action ---
-        action_to_send = _parse_action(completion_text)
-        prev_gs = game_state_history[-1] if game_state_history else None
+        prev_gs   = game_state_history[-1] if game_state_history else None
+        legal_map = prev_gs.legal_actions if prev_gs else None
+        action_to_send = _parse_action(completion_text, legal_map)
+
+        # Fallback: Nash-based selection when model output is invalid
+        if not action_to_send:
+            action_to_send = _select_fallback_action(prev_gs)
+            consecutive_invalids += 1
+            invalid_count += 1
+            # Escalating penalty: -0.10, -0.15, -0.20, ...
+            penalty = _INVALID_PENALTY + 0.05 * max(0, consecutive_invalids - 1)
+            episode_reward += penalty
+        else:
+            consecutive_invalids = 0  # reset on valid action
 
         try:
             step_res = requests.post(
