@@ -62,7 +62,7 @@ from envs.shared_env import (
     GAMES_TO_TASK_ID_RANGE,
     CurriculumScheduler,
     init_env_pool,
-    rollout_reward_func,  # re-exported for callers
+    rollout_reward_func,  # re-exported for callers  # noqa: F401
 )
 
 
@@ -70,11 +70,11 @@ from envs.shared_env import (
 # Constants
 # ---------------------------------------------------------------------------
 
-_SELECTED_GAME = "gin_rummy"
-_MAX_EPISODE_TOKENS = 16384
-_MAX_PROMPT_LEN = 16384 - 256
-_TIMEOUT = 2400
-_MCTS_SIMS = 50
+_SELECTED_GAME      = "gin_rummy"
+_MAX_EPISODE_TOKENS = 16384   # max tokens per full-prompt episode (16k context)
+_MAX_PROMPT_LEN     = 5000    # prompt token cap — 5k GR (longer obs due to hand display)
+_TIMEOUT            = 2400    # HTTP timeout (seconds) — 40 min covers slow MCTS
+_MCTS_SIMS          = 50      # fixed MCTS simulations
 
 CARD_VALUES = {
     'A': 1, '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9,
