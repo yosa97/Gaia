@@ -955,7 +955,7 @@ def _ensure_initialized(trainer) -> None:
         "task_id": GAMES_TO_TASK_ID_RANGE[_SELECTED_GAME][0],
         "seed": 42,
         "opponent": "mcts",
-        "mcts_max_simulations": _MCTS_SIMS,
+        "mcts_max_simulations": _MCTS_SIMS,  # 50 fixed
         "mcts_num_rollouts": 1,
     }
     rank, env_pool, num_servers, thread_pool, generation_semaphore = init_env_pool(reset_payload)
@@ -1089,17 +1089,17 @@ def _run_episode(
     try:
         reset_res = requests.post(f"{env_endpoint}/reset", json=reset_payload, timeout=_TIMEOUT)
         reset_res.raise_for_status()
-        result_block        = reset_res.json()["result"]
-        episode_id          = result_block.get("episode_id", "")
-        raw_observation     = result_block.get("observation", "")
+        result_block          = reset_res.json()["result"]
+        episode_id            = result_block.get("episode_id", "")
+        raw_observation       = result_block.get("observation", "")
         formatted_observation = extract_and_format_observation(raw_observation)
-        initial_game_state  = parse_game_state(formatted_observation)
+        initial_game_state    = parse_game_state(formatted_observation)
         game_state_history.append(initial_game_state)
         dead_card_tracker.update_from_discard_pile(initial_game_state.discard_pile)
         prev_discard_pile = list(initial_game_state.discard_pile)
         if not use_full_prompt and bayes_hand is not None:
-            actual_hand_size = len(initial_game_state.hand)
-            bayes_hand._opp_hand_size = actual_hand_size if actual_hand_size > 0 else 7
+            actual_hand_size           = len(initial_game_state.hand)  # fallback 7 if parse fails
+            bayes_hand._opp_hand_size  = actual_hand_size if actual_hand_size > 0 else 7
             bayes_hand.initialize(
                 our_hand=initial_game_state.hand,
                 discard_pile=initial_game_state.discard_pile,
@@ -1117,13 +1117,39 @@ def _run_episode(
     # --- Interaction loop ---
     while not done and turn_number < current_max_turn:
         with generation_semaphore:
-            rollout_outputs = generate_rollout_completions(trainer, prompts=[messages], as_chat=True)[0]
+            try:
+                rollout_outputs = generate_rollout_completions(trainer, prompts=[messages], as_chat=True)[0]
+            except Exception as exc:
+                print(
+                    f"Warning: vLLM error at turn {turn_number} "
+                    f"(game {game_id}): {type(exc).__name__}: {exc}"
+                )
+                done = True
+                break
 
         prompt_ids     = rollout_outputs.get("prompt_ids", [])
         completion_ids = rollout_outputs.get("completion_ids", [])
         logprobs       = rollout_outputs.get("logprobs", [])
         completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
         action_to_send  = extract_action_id(completion_text)
+        
+        # Phase-aware fallback: if model output is not a valid legal action ID
+        try:
+            last_obs = messages[-1]["content"] if messages and messages[-1]["role"] == "user" else ""
+            legal_ids = [int(m.group(1)) for m in re.finditer(r"^(\d+)\s*->", last_obs, re.MULTILINE)]
+            parsed_id = int(action_to_send.strip())
+            if legal_ids and parsed_id not in legal_ids:
+                prev_gs = game_state_history[-1] if game_state_history else None
+                phase   = prev_gs.phase if prev_gs else ""
+                if phase == "Draw" and 53 in legal_ids:
+                    action_to_send = "53"   # draw stock — always safe in Draw phase
+                elif phase in ("FirstUpcard", "Layoff") and 54 in legal_ids:
+                    action_to_send = "54"   # pass — always safe in FirstUpcard/Layoff
+                else:
+                    action_to_send = str(legal_ids[0])  # first legal = safest fallback
+                print(f"[GR-FALLBACK] T{turn_number}: invalid ({parsed_id}) → {action_to_send} (phase={phase})")
+        except Exception:
+            pass  # Let env handle unparseable output
 
         # --- Full-prompt token accumulation ---
         if use_full_prompt:
@@ -1354,6 +1380,24 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
     wins     = sum(1 for r in list_results if r["final_score"] > 0.5)
     avg_return = sum(r["reward"] for r in list_results) / len(list_results) if list_results else 0
     print(f"[BATCH] Finished:{finished}/{len(list_results)} Wins:{wins} AvgReturn:{avg_return:.3f}")
+
+    # WandB metrics (best-effort — no crash if wandb not active)
+    try:
+        import wandb as _wandb
+        if _wandb.run is not None:
+            _wandb.log(
+                {
+                    "env/gin_rummy/win_rate":    wins / len(list_results) if list_results else 0.0,
+                    "env/gin_rummy/avg_return":  avg_return,
+                    "curriculum/max_turn":       current_max_turn,
+                    "curriculum/hint_prob":      current_hint_prob,
+                    "curriculum/rollouts":       curriculum.total_rollouts,
+                },
+                commit=False,
+            )
+    except Exception:
+        pass
+
 
     out = {
         "prompt_ids":     [r["prompt_ids"]     for r in list_results],
