@@ -45,19 +45,23 @@ from envs.shared_env import (
 # Constants (same as liar_dice_env.py)
 # ---------------------------------------------------------------------------
 
-_SELECTED_GAME = "liars_dice"
-_MAX_EPISODE_TOKENS = 16384
-_MAX_PROMPT_LEN = 5000
-_TIMEOUT = 2400
+_SELECTED_GAME      = "liars_dice"
+_MAX_EPISODE_TOKENS = 16384   # max tokens per full-prompt episode (16k context)
+_MAX_PROMPT_LEN     = 5000    # prompt token cap — 5k tokens (LD obs shorter than GR)
+_TIMEOUT            = 2400    # HTTP timeout (seconds) — 40 min covers slow MCTS reset
 
-BLUFF_PROB_THRESHOLD  = 0.35
-RISKY_LIAR_PROB_MIN   = 0.35
+BLUFF_PROB_THRESHOLD  = 0.35   # below this = model is bluffing (unlikely bid)
+RISKY_LIAR_PROB_MIN   = 0.35   # liar call in [0.35, 0.60] = risky-but-correct zone
 RISKY_LIAR_PROB_MAX   = 0.60
-BLUFF_WIN_BONUS       = 0.5
-RISKY_LIAR_WIN_BONUS  = 0.5
-RISKY_BONUS_MAX_COUNT = 2
-SHUFFLE_PROB          = 0.5
-NORMALIZE_REWARDS     = False
+BLUFF_WIN_BONUS       = 0.5    # bonus for winning after calling a bluff
+RISKY_LIAR_WIN_BONUS  = 0.5    # bonus for winning after risky liar call
+RISKY_BONUS_MAX_COUNT = 2      # cap: max 2 bluff/risky events per episode credited
+SHUFFLE_PROB          = 0.5    # probability of shuffling displayed action order each turn
+NORMALIZE_REWARDS     = False  # disable reward normalization (raw discounted return)
+
+# Bayesian-informed bonus/penalty (supplements existing score-based rewards)
+BAYES_GOOD_CALL_BONUS   =  0.15  # call liar when Bayesian says bid unlikely (P<35%)
+BAYES_OVERREACH_PENALTY = -0.05  # bid far exceeding Bayesian estimate (+2 over expected)
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +79,7 @@ class Bid:
 
 @dataclass
 class Action:
-    SCORE_TEMPERATURE = 0.5
+    SCORE_TEMPERATURE = 0.5   # temperature for softmax-like action scoring
 
     action_id: int
     label: str
@@ -98,10 +102,10 @@ class Action:
 
 @dataclass
 class GameState:
-    our_dice: list[int]
-    total_dice: int
+    our_dice:    list[int]
+    total_dice:  int
     current_bid: "Bid | None"
-    actions: list[Action]
+    actions:     list[Action]
 
     @property
     def liar_action(self) -> "Action | None":
@@ -168,7 +172,7 @@ def parse_game_state(messages: "list[dict] | str") -> GameState:
         raise ValueError("Could not parse 'Total dice in game'")
     total_dice = int(total_match.group(1))
 
-    bid_match = re.search(r'Current bid:\s*"(\d+)-(\d+)"', last_user_msg)
+    bid_match  = re.search(r'Current bid:\s*"(\d+)-(\d+)"', last_user_msg)
     current_bid = Bid(int(bid_match.group(1)), int(bid_match.group(2))) if bid_match else None
 
     raw_actions = re.findall(r"^\s*(\d+)\s*->\s*(.+)$", last_user_msg, re.MULTILINE)
@@ -178,7 +182,7 @@ def parse_game_state(messages: "list[dict] | str") -> GameState:
     tmp_state = GameState(our_dice=our_dice, total_dice=total_dice, current_bid=current_bid, actions=[])
     actions = []
     for aid, label in raw_actions:
-        bid = _parse_bid_label(label)
+        bid     = _parse_bid_label(label)
         is_liar = label.strip().lower() == "liar"
         prob = (
             1.0 - bid_probability(current_bid, tmp_state) if is_liar and current_bid
@@ -484,11 +488,11 @@ def _run_episode(
     env_endpoint = env_pool[server_idx]["base_url"]
 
     # Full-prompt accumulation state
-    episode_prompt_ids:    list[int]   = []
-    episode_completion_ids: list[int]  = []
-    episode_logprobs:      list[float] = []
-    episode_action_mask:   list[int]   = []
-    prev_full_ids: "list[int] | None"  = None
+    episode_prompt_ids:     list[int]   = []
+    episode_completion_ids: list[int]   = []
+    episode_logprobs:       list[float] = []
+    episode_action_mask:    list[int]   = []
+    prev_full_ids: "list[int] | None"   = None
 
     # Last-prompt state (overwritten each turn)
     prompt_ids:     list[int]   = []
@@ -504,7 +508,7 @@ def _run_episode(
     rewards:      list[float] = []
     step_scores:  list[float] = []
     terminal_reward: float    = 0.0
-    calculator = RewardCalculator()
+    calculator     = RewardCalculator()
     bluff_count      = 0
     risky_liar_count = 0
     last_action_prob = 0.0
@@ -541,9 +545,9 @@ def _run_episode(
         print(f"Failed to reset environment (Game {game_id}): {exc}")
         return index, None
 
-    # --- Build system prompt ---
+    # Build system prompt
     system_prompt = (
-        '"You are playing liars_dice.\n\n# Game Rules\nLIAR\'S DICE RULES:\n\n'
+        'You are playing liars_dice.\n\n# Game Rules\nLIAR\'S DICE RULES:\n\n'
         'Setup: Each player has N dice (1-5 depending on variant). All players roll their dice secretly.\n\n'
         'Goal: Make bids about total dice across ALL players, or call "Liar" on opponent\'s bid.\n\n'
         'Actions:\n- Bid (quantity, face): Claim there are at least \'quantity\' dice showing \'face\' among all dice.\n'
@@ -558,7 +562,6 @@ def _run_episode(
         '# Output Format\nYou must respond with ONLY the action ID (a single number).\n'
         'Do NOT include descriptions or explanations.\n\n'
         'Examples:\n- For action "0 -> roll": respond "0"\n- For action "89 -> a3": respond "89"'
-        '"'
     )
     if use_hints:
         system_prompt += (
@@ -577,11 +580,19 @@ def _run_episode(
     # --- Interaction loop ---
     while not done and turn_number < current_max_turn:
         with generation_semaphore:
-            rollout_outputs = generate_rollout_completions(trainer, prompts=[messages], as_chat=True)[0]
+            try:
+                rollout_outputs = generate_rollout_completions(trainer, prompts=[messages], as_chat=True)[0]
+            except Exception as exc:
+                print(
+                    f"Warning: vLLM error at turn {turn_number} "
+                    f"(game {game_id}): {type(exc).__name__}: {exc}"
+                )
+                done = True
+                break
 
-        prompt_ids     = rollout_outputs.get("prompt_ids", [])
-        completion_ids = rollout_outputs.get("completion_ids", [])
-        logprobs       = rollout_outputs.get("logprobs", [])
+        prompt_ids      = rollout_outputs.get("prompt_ids", [])
+        completion_ids  = rollout_outputs.get("completion_ids", [])
+        logprobs        = rollout_outputs.get("logprobs", [])
         completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
 
         # --- Token accumulation ---
@@ -728,6 +739,14 @@ def _run_episode(
 
                 if not done:
                     immediate_reward = calculator.calculate_step_reward(taken_action, 0.0)
+                    # Bayesian step bonuses/penalties
+                    if taken_action is not None:
+                        if taken_action.is_liar and taken_action.prob > (1 - BLUFF_PROB_THRESHOLD):
+                            # Calling Liar when bid is clearly unlikely (P(bid true) < 35%) = good call
+                            immediate_reward += BAYES_GOOD_CALL_BONUS
+                        elif not taken_action.is_liar and taken_action.prob < 0.15:
+                            # Bidding far beyond what is plausible = overreach
+                            immediate_reward += BAYES_OVERREACH_PENALTY
                     step_scores.append(taken_action.score if taken_action else 0.0)
                 else:
                     won = step_reward > 0.5
@@ -828,9 +847,31 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
     curriculum.step(len(prompts))
 
     list_results = [r for r in results if r is not None]
-    finished  = sum(1 for r in list_results if r["final_score"] != 0)
-    avg_return = sum(r["reward"] for r in list_results) / len(list_results) if list_results else 0
-    print(f"[BATCH] Finished: {finished}/{len(list_results)}, AvgReturn: {avg_return:.2f}")
+    finished     = sum(1 for r in list_results if r["final_score"] != 0)
+    wins         = sum(1 for r in list_results if r["final_score"] > 0)
+    avg_return   = sum(r["reward"] for r in list_results) / len(list_results) if list_results else 0.0
+    print(
+        f"[BATCH] Finished: {finished}/{len(list_results)}, "
+        f"Wins: {wins}/{len(list_results)}, "
+        f"AvgReturn: {avg_return:.3f}"
+    )
+
+    # WandB metrics (best-effort — no crash if wandb not active)
+    try:
+        import wandb as _wandb
+        if _wandb.run is not None:
+            _wandb.log(
+                {
+                    "env/liars_dice/win_rate":   wins / len(list_results) if list_results else 0.0,
+                    "env/liars_dice/avg_return": avg_return,
+                    "curriculum/max_turn":       current_max_turn,
+                    "curriculum/hint_prob":      current_hint_prob,
+                    "curriculum/rollouts":       curriculum.total_rollouts,
+                },
+                commit=False,
+            )
+    except Exception:
+        pass
 
     out = {
         "prompt_ids":     [r["prompt_ids"]     for r in list_results],
