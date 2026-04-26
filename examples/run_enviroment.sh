@@ -53,6 +53,9 @@ docker build -t trainer-downloader -f dockerfiles/trainer-downloader.dockerfile 
 # Build the trainer image
 docker build -t standalone-text-trainer -f dockerfiles/standalone-text-trainer.dockerfile .
 
+# Build the hf-uploader image
+docker build -t hf-uploader -f dockerfiles/hf-uploader.dockerfile .
+
 # Download model and generate dummy dataset
 echo "Downloading model..."
 docker run --rm \
@@ -86,6 +89,12 @@ ENV_SERVER_URLS="http://env-server-0:8000"
 # The token is read from the WANDB_API_KEY / WANDB_TOKEN env var inside the container.
 # WANDB_RUN_ID and WANDB_NAME env vars are set by text_trainer.py automatically.
 echo "Starting trainer (wandb mode: $WANDB_MODE)..."
+
+# EXTERNAL WATCHDOG TIMER (Ensures strictly accurate timeout)
+TIMEOUT_SECONDS=$(echo "$HOURS_TO_COMPLETE * 3600" | bc | cut -d. -f1)
+(sleep $TIMEOUT_SECONDS && echo "[WATCHDOG] TIMEOUT REACHED ($HOURS_TO_COMPLETE hrs) - Stopping container..." && docker stop grpo-text-trainer-example 2>/dev/null) &
+TIMER_PID=$!
+
 docker run --rm --gpus all \
   --shm-size=100gb \
   --security-opt=no-new-privileges \
@@ -110,7 +119,10 @@ docker run --rm --gpus all \
   --hours-to-complete "$HOURS_TO_COMPLETE" \
   --expected-repo-name "$EXPECTED_REPO_NAME" \
   --wandb-mode "$WANDB_MODE" \
-  --wandb-project "$WANDB_PROJECT"
+  --wandb-project "$WANDB_PROJECT" || true
+
+# Batalkan Watchdog jika proses trainer selesai lebih cepat secara natural
+kill $TIMER_PID 2>/dev/null || true
 
 # Cleanup env server and network
 echo "Stopping environment server..."
