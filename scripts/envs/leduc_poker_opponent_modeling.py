@@ -728,14 +728,16 @@ def _run_episode(
 
         # Fallback: Nash-based selection when model output is invalid
         if not action_to_send:
-            action_to_send = _select_fallback_action(prev_gs)
+            action_to_send   = _select_fallback_action(prev_gs)
             consecutive_invalids += 1
-            invalid_count += 1
+            invalid_count    += 1
             # Escalating penalty: -0.10, -0.15, -0.20, ...
             penalty = _INVALID_PENALTY + 0.05 * max(0, consecutive_invalids - 1)
-            episode_reward += penalty
+            episode_reward   += penalty
+            already_penalized = True   # Fix #3: flag to prevent double-penalty below
         else:
-            consecutive_invalids = 0  # reset on valid action
+            consecutive_invalids = 0   # reset on valid action
+            already_penalized    = False
 
         try:
             step_res = requests.post(
@@ -754,11 +756,13 @@ def _run_episode(
                     game_state_history.append(gs)
         except Exception as exc:
             print(f"Step failed (Game {game_id}, turn {turn_number}): {exc}")
-            observation = ""
-            step_reward = 0
-            done        = False
-            invalid_count += 1
-            episode_reward += _INVALID_PENALTY
+            observation       = ""
+            step_reward       = 0
+            done              = False
+            step_block        = {"reward": 0.0, "done": False}
+            if not already_penalized:   # Fix #3: only penalize if not already counted
+                invalid_count  += 1
+                episode_reward += _INVALID_PENALTY
 
         if "Nothing happens" in observation or "Invalid" in observation:
             invalid_count += 1
@@ -794,7 +798,10 @@ def _run_episode(
             action_str = prev_gs.legal_actions.get(int(action_to_send.strip()), "") if prev_gs else ""
         except (ValueError, AttributeError):
             action_str = ""
-        step_shaped = calculator.calculate_step_reward(prev_gs, action_str, step_reward if done else 0.0)
+        # Fix #2: use final_reward instead of raw step_reward for terminal scaling
+        # (calculate_pot_commitment_bonus tidak ada di RewardCalculator — dihapus)
+        terminal_for_scale = final_reward if done else 0.0
+        step_shaped  = calculator.calculate_step_reward(prev_gs, action_str, terminal_for_scale)
         rewards.append(step_shaped)
 
         messages.append({"role": "user", "content": observation})
@@ -870,9 +877,13 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
     curriculum.step(len(prompts))
 
     list_results = [r for r in results if r is not None]
-    finished   = sum(1 for r in list_results if r["final_score"] != 0)
-    avg_return = sum(r["reward"] for r in list_results) / len(list_results) if list_results else 0
-    print(f"[BATCH] Finished: {finished}/{len(list_results)}, AvgReturn: {avg_return:.2f}")
+    finished      = sum(1 for r in list_results if r["final_score"] != 0)
+    wins          = sum(1 for r in list_results if r["final_score"] > 0)
+    avg_return    = sum(r["reward"] for r in list_results) / len(list_results) if list_results else 0.0
+    n             = len(list_results)
+    finished_rate = finished / n if n > 0 else 0.0
+    print(
+        f"[BATCH] Finished: {finished}/{len(list_results)}, AvgReturn: {avg_return:.2f}")
 
     out = {
         "prompt_ids":     [r["prompt_ids"]     for r in list_results],

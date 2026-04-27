@@ -75,6 +75,17 @@ _MAX_EPISODE_TOKENS = 16384   # max tokens per full-prompt episode (16k context)
 _MAX_PROMPT_LEN     = 5000    # prompt token cap — 5k GR (longer obs due to hand display)
 _TIMEOUT            = 2400    # HTTP timeout (seconds) — 40 min covers slow MCTS
 _MCTS_SIMS          = 50      # fixed MCTS simulations
+_MCTS_SIMS_INITIAL  = 50
+_MCTS_SIMS_FINAL    = 60
+_MCTS_RAMP_ROLLOUTS = 300
+
+# Invalid action penalty — escalating per consecutive invalid (OPT-2)
+_INVALID_PENALTY    = -0.5   # base penalty per invalid action
+_CONSEC_INVALID_ESC =  0.1   # escalation per consecutive: -0.5, -0.6, -0.7, ...
+
+# Win-strategy bonus — reward cara menang yang optimal (OPT-4, inspired by LD bluff win bonus)
+GIN_WIN_BONUS         = 1.0   # menang dengan 0 deadwood (Gin) — best possible outcome
+CLEAN_KNOCK_WIN_BONUS = 0.5   # menang dengan deadwood ≤ 5 — clean knock
 
 CARD_VALUES = {
     'A': 1, '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9,
@@ -944,6 +955,9 @@ def _curriculum_factory(args) -> CurriculumScheduler:
         initial_hint_prob=0.5,
         final_hint_prob=0.0,
         warmup_rollouts=args.rollouts_per_stage,
+        # NOTE: CurriculumScheduler (shared_env.py) tidak support MCTS ramping.
+        # Parameter initial_mcts_sims/final_mcts_sims/mcts_ramp_rollouts dihapus
+        # untuk mencegah TypeError. MCTS sims tetap _MCTS_SIMS (50) via reset_payload.
     )
 
 
@@ -1056,16 +1070,18 @@ def _run_episode(
     completion_ids: list[int]   = []
     logprobs:       list[float] = []
 
-    invalid_count = 0
-    done          = False
-    train_reward  = 0.0
-    final_reward  = 0.0
-    turn_number   = 0
+    invalid_count        = 0
+    consecutive_invalids = 0   # tracks back-to-back invalids for escalating penalty (OPT-2)
+    done                 = False
+    train_reward         = 0.0
+    final_reward         = 0.0
+    turn_number          = 0
     game_state_history: list[GameState] = []
     rewards:            list[float]     = []
     calculator          = RewardCalculator()
     dead_card_tracker   = DeadCardTracker()
     prev_discard_pile:  list[str]       = []
+    last_known_deadwood: int             = 0  # Bug fix: always the latest EXPLICITLY parsed deadwood
 
     # Opponent modelling — full Bayesian models only for last-prompt mode
     bayesian_model: "BayesianOpponentModel | None"     = None
@@ -1213,7 +1229,17 @@ def _run_episode(
 
         immediate_reward = 0.0
         if done:
-            final_reward = step_reward
+            immediate_reward = max(min((step_reward - 0.5) * 30.0, 30.0), -30.0)  # OPT-1: ×30 — was ×100; balances vs intermediate (meld=12, run=12, knock=20)
+            # OPT-4: win-strategy bonus — reward cara menang yang optimal
+            # Bug fix: use last_known_deadwood (always explicitly parsed, never defaulted)
+            # instead of game_state_history[-1].deadwood which could be stale or from wrong turn
+            if step_reward > 0.5:  # kita menang
+                if last_known_deadwood == 0:
+                    immediate_reward += GIN_WIN_BONUS           # Gin! (0 deadwood)
+                    print(f"[GR-GIN] T{turn_number}: GIN bonus +{GIN_WIN_BONUS} (dw={last_known_deadwood})")
+                elif last_known_deadwood <= 5:
+                    immediate_reward += CLEAN_KNOCK_WIN_BONUS   # Clean knock (≤5 deadwood)
+                    print(f"[GR-KNOCK] T{turn_number}: clean knock bonus +{CLEAN_KNOCK_WIN_BONUS} (dw={last_known_deadwood})")
             messages.append({"role": "user", "content": formatted_observation})
         else:
             # --- Build augmented observation ---
@@ -1258,6 +1284,11 @@ def _run_episode(
                 else:
                     game_state_history.append(game_state)
                     dead_card_tracker.update_from_discard_pile(game_state.discard_pile)
+
+                    # Bug fix #3: update last_known_deadwood dari state yg baru di-parse
+                    # sehingga win bonus (GIN/clean knock) di bawah menggunakan nilai akurat
+                    if game_state.hand:  # hanya update jika hand ter-parse (bukan fallback)
+                        last_known_deadwood = compute_optimal_deadwood(game_state.hand)
 
                     if not use_full_prompt and bayesian_model is not None and bayes_hand is not None:
                         # Tentukan apakah ini giliran opp: turn genap = giliran kita jika player_id=0
