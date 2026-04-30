@@ -186,7 +186,7 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         no_mask=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
         full_prompt=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
         num_generations=8,
-        temperature=2.0,
+        temperature=2.0,   # T=2.0: matches top competitor — higher entropy → stronger GRPO gradient
         top_k=5,
     ),
     "liars_dice_opponent_modeling": EnvTrainingConfig(
@@ -202,7 +202,7 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         no_mask=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
         full_prompt=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
         num_generations=8,
-        temperature=2.0,
+        temperature=2.0,   # T=2.0: matches top competitor — higher entropy → stronger GRPO gradient
         top_k=5,
     ),
     "leduc_poker": EnvTrainingConfig(
@@ -211,7 +211,7 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         reward_func=_leduc_reward,
         curriculum_factory=_leduc_curriculum,
         num_generations=8,
-        temperature=2.0,
+        temperature=2.0,   # T=2.0: matches top competitor — higher entropy → stronger GRPO gradient
         top_k=5,
     ),
     "leduc_poker_opponent_modeling": EnvTrainingConfig(
