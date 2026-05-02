@@ -341,6 +341,14 @@ def get_training_json(train_info: dict) -> dict:
 
     run_config["learning_rate"] *= train_info["reg_ratio"]
 
+    # ── Inject max_steps ke training command ─────────────────────────────────
+    # max_steps dari train_info (berasal dari --max-steps CLI flag di job_handler / run_environment_task.sh)
+    # HARUS di-pass ke GRPOConfig via --max_steps agar trainer benar-benar berhenti
+    # di step yang ditentukan. Tanpa ini, trainer jalan sampai epoch selesai.
     run_cmd = get_run_cmd(run_config, run_config["gpu_nums"])
-
+    max_steps = train_info.get("max_steps", -1)
+    if max_steps and max_steps > 0:
+        run_cmd = run_cmd + f" --max_steps {max_steps}"
+        print(f"[grpo_env_config] max_steps={max_steps} → ditambahkan ke training command")
+    
     return {"train_request": train_request, "run_cmd": run_cmd}

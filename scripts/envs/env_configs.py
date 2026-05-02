@@ -213,6 +213,11 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         num_generations=8,
         temperature=2.0,   # T=2.0: matches top competitor — higher entropy → stronger GRPO gradient
         top_k=5,
+        # Leduc Poker episodes pendek (max 10 turns) — rollouts lebih banyak per stage
+        # agar curriculum naik lebih sering, mirip pola Liar's Dice.
+        reasoning=ModeConfig(initial_max_turn=1, rollouts_per_stage=512),
+        no_mask=ModeConfig(initial_max_turn=1, rollouts_per_stage=512),
+        full_prompt=ModeConfig(initial_max_turn=1, rollouts_per_stage=512),
     ),
     "leduc_poker_opponent_modeling": EnvTrainingConfig(
         rollout_full=_leduc_opp_rollout_full,
@@ -221,8 +226,11 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         curriculum_factory=_leduc_opp_curriculum,
         num_generations=8,
         temperature=2.0,
-        top_k=20,   # was 5: terlalu sempit → model shortcut ke angka aksi langsung (3 token, no CoT).
-                    # 20 memberikan cukup vocab space untuk reasoning tanpa kehilangan fokus.
+        top_k=5,
+        # Sama dengan leduc_poker — episodes pendek, curriculum naik lebih sering.
+        reasoning=ModeConfig(initial_max_turn=1, rollouts_per_stage=512),
+        no_mask=ModeConfig(initial_max_turn=1, rollouts_per_stage=512),
+        full_prompt=ModeConfig(initial_max_turn=1, rollouts_per_stage=512),
     ),
     "alfworld": EnvTrainingConfig(
         rollout_full=_alf_rollout_full,

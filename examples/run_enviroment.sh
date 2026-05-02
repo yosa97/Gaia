@@ -9,6 +9,13 @@ DATASET_TYPE='{
 FILE_FORMAT="s3"
 HOURS_TO_COMPLETE=3
 
+# ── Max training steps ─────────────────────────────────────────────────────
+# Berdasarkan observasi aktual step time:
+#   gin_rummy   → 250  (step time 47-57s setelah curriculum max_turn naik ke 11-12)
+#   liars_dice  → 280  (step time ~31s, 3 jam ≈ 280 steps)
+#   leduc_poker → 300  (step time lebih cepat)
+MAX_STEPS=300
+
 # ── Wandb ──────────────────────────────────────────────────────────────────
 # Set WANDB_TOKEN to enable online logging.
 # Leave it empty (WANDB_TOKEN="") to fall back to offline mode automatically.
@@ -119,7 +126,8 @@ docker run --rm --gpus all \
   --hours-to-complete "$HOURS_TO_COMPLETE" \
   --expected-repo-name "$EXPECTED_REPO_NAME" \
   --wandb-mode "$WANDB_MODE" \
-  --wandb-project "$WANDB_PROJECT" || true
+  --wandb-project "$WANDB_PROJECT" \
+  --max-steps "$MAX_STEPS" || true
 
 # Batalkan Watchdog jika proses trainer selesai lebih cepat secara natural
 kill $TIMER_PID 2>/dev/null || true
