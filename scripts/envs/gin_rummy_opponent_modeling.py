@@ -156,6 +156,35 @@ def find_potential_runs(hand: list[str], additional_card: Optional[str] = None) 
 def count_complete_runs(hand: list[str]) -> int:
     return sum(1 for r in find_potential_runs(hand) if len(r) >= 3)
 
+def would_complete_run(hand: list[str], card: str) -> bool:
+    """True jika card melengkapi run baru (≥3 kartu) yang sebelumnya belum ada."""
+    current = sum(1 for r in find_potential_runs(hand) if len(r) >= 3)
+    return sum(1 for r in find_potential_runs(hand, card) if len(r) >= 3) > current
+
+
+def would_improve_run(hand: list[str], card: str) -> bool:
+    """True jika card memperpanjang run yang sudah ada menjadi lebih panjang."""
+    rank_idx = RANK_ORDER.index(get_rank(card))
+    suit     = get_suit(card)
+    for existing in hand:
+        if get_suit(existing) != suit:
+            continue
+        if abs(rank_idx - RANK_ORDER.index(get_rank(existing))) == 1:
+            for run in find_potential_runs(hand + [card]):
+                if card in run and len(run) >= 3:
+                    return True
+    return False
+
+
+def would_complete_set(hand: list[str], card: str) -> bool:
+    """True jika card melengkapi set (3+ kartu rank sama)."""
+    return sum(1 for c in hand if get_rank(c) == get_rank(card)) >= 2
+
+
+def would_improve_set(hand: list[str], card: str) -> bool:
+    """True jika card mulai membentuk sepasang (2 kartu rank sama)."""
+    return sum(1 for c in hand if get_rank(c) == get_rank(card)) == 1
+
 
 # ---------------------------------------------------------------------------
 # DP optimal deadwood
@@ -1149,6 +1178,26 @@ def _run_episode(
         completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
         action_to_send  = extract_action_id(completion_text)
         
+        # --- Phase-aware fallback: koreksi action invalid sebelum kirim ke env ---
+        # Dari repo pemenang: jika output model bukan legal action, fallback aman per fase.
+        # Ini langsung mengurangi Inv: di logs → gradient signal lebih bersih.
+        try:
+            last_obs  = messages[-1]["content"] if messages and messages[-1]["role"] == "user" else ""
+            legal_ids = [int(m.group(1)) for m in re.finditer(r"^(\d+)\s*->", last_obs, re.MULTILINE)]
+            parsed_id = int(action_to_send.strip())
+            if legal_ids and parsed_id not in legal_ids:
+                prev_gs = game_state_history[-1] if game_state_history else None
+                phase   = prev_gs.phase if prev_gs else ""
+                if phase == "Draw" and 53 in legal_ids:
+                    action_to_send = "53"   # draw stock — selalu aman di Draw
+                elif phase in ("FirstUpcard", "Layoff") and 54 in legal_ids:
+                    action_to_send = "54"   # pass — selalu aman di FirstUpcard/Layoff
+                else:
+                    action_to_send = str(legal_ids[0])  # legal pertama = paling aman
+                print(f"[GR-FALLBACK] T{turn_number}: invalid ({parsed_id}) → {action_to_send} (phase={phase})")
+        except Exception:
+            pass  # Biarkan env handle jika output benar-benar tidak bisa di-parse
+
         # Phase-aware fallback: if model output is not a valid legal action ID
         try:
             last_obs = messages[-1]["content"] if messages and messages[-1]["role"] == "user" else ""
@@ -1401,7 +1450,11 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
     results = [None] * len(prompts)
     futures = [_state["thread_pool"].submit(run, i, p) for i, p in enumerate(prompts)]
     for f in as_completed(futures):
-        idx, res = f.result()
+        try:
+            idx, res = f.result()
+        except Exception as exc:
+            print(f"[ERROR] Game thread threw unhandled exception: {type(exc).__name__}: {exc}")
+            continue
         results[idx] = res if res is not None else _fallback
 
     curriculum.step(len(prompts))
@@ -1411,6 +1464,23 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
     wins     = sum(1 for r in list_results if r["final_score"] > 0.5)
     avg_return = sum(r["reward"] for r in list_results) / len(list_results) if list_results else 0
     print(f"[BATCH] Finished:{finished}/{len(list_results)} Wins:{wins} AvgReturn:{avg_return:.3f}")
+    
+    # WandB metrics (best-effort — tidak crash jika wandb tidak aktif)
+    try:
+        import wandb as _wandb
+        if _wandb.run is not None:
+            _wandb.log(
+                {
+                    "env/gin_rummy/win_rate":   wins / len(list_results) if list_results else 0.0,
+                    "env/gin_rummy/avg_return": avg_return,
+                    "curriculum/max_turn":      current_max_turn,
+                    "curriculum/hint_prob":     current_hint_prob,
+                    "curriculum/rollouts":      curriculum.total_rollouts,
+                },
+                commit=False,
+            )
+    except Exception:
+        pass
 
     # WandB metrics (best-effort — no crash if wandb not active)
     try:

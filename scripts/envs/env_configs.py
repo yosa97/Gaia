@@ -221,7 +221,8 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         curriculum_factory=_leduc_opp_curriculum,
         num_generations=8,
         temperature=2.0,
-        top_k=5,
+        top_k=20,   # was 5: terlalu sempit → model shortcut ke angka aksi langsung (3 token, no CoT).
+                    # 20 memberikan cukup vocab space untuk reasoning tanpa kehilangan fokus.
     ),
     "alfworld": EnvTrainingConfig(
         rollout_full=_alf_rollout_full,
