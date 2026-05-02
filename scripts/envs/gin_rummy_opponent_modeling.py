@@ -1198,23 +1198,6 @@ def _run_episode(
         except Exception:
             pass  # Biarkan env handle jika output benar-benar tidak bisa di-parse
 
-        # Phase-aware fallback: if model output is not a valid legal action ID
-        try:
-            last_obs = messages[-1]["content"] if messages and messages[-1]["role"] == "user" else ""
-            legal_ids = [int(m.group(1)) for m in re.finditer(r"^(\d+)\s*->", last_obs, re.MULTILINE)]
-            parsed_id = int(action_to_send.strip())
-            if legal_ids and parsed_id not in legal_ids:
-                prev_gs = game_state_history[-1] if game_state_history else None
-                phase   = prev_gs.phase if prev_gs else ""
-                if phase == "Draw" and 53 in legal_ids:
-                    action_to_send = "53"   # draw stock — always safe in Draw phase
-                elif phase in ("FirstUpcard", "Layoff") and 54 in legal_ids:
-                    action_to_send = "54"   # pass — always safe in FirstUpcard/Layoff
-                else:
-                    action_to_send = str(legal_ids[0])  # first legal = safest fallback
-                print(f"[GR-FALLBACK] T{turn_number}: invalid ({parsed_id}) → {action_to_send} (phase={phase})")
-        except Exception:
-            pass  # Let env handle unparseable output
 
         # --- Full-prompt token accumulation ---
         if use_full_prompt:
@@ -1476,23 +1459,6 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
                     "curriculum/max_turn":      current_max_turn,
                     "curriculum/hint_prob":     current_hint_prob,
                     "curriculum/rollouts":      curriculum.total_rollouts,
-                },
-                commit=False,
-            )
-    except Exception:
-        pass
-
-    # WandB metrics (best-effort — no crash if wandb not active)
-    try:
-        import wandb as _wandb
-        if _wandb.run is not None:
-            _wandb.log(
-                {
-                    "env/gin_rummy/win_rate":    wins / len(list_results) if list_results else 0.0,
-                    "env/gin_rummy/avg_return":  avg_return,
-                    "curriculum/max_turn":       current_max_turn,
-                    "curriculum/hint_prob":      current_hint_prob,
-                    "curriculum/rollouts":       curriculum.total_rollouts,
                 },
                 commit=False,
             )
