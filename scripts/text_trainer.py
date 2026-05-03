@@ -32,6 +32,7 @@ from dpo_config import get_training_json as get_dpo_training_json
 from grpo_config import get_training_json as get_grpo_training_json
 from instruct_config import get_training_json as get_instruct_training_json
 from grpo_env_config import get_training_json as get_env_training_json
+from sft_env_config import get_training_json as get_sft_env_training_json
 from transformers import AutoConfig
 
 
@@ -429,9 +430,41 @@ def main():
         train_cmd = train_info["run_cmd"]
 
     elif args.task_type == TaskType.ENVIRONMENTTASK.value:
-        train_info = get_env_training_json(train_info)
-        tokenize_cmd = ""
-        train_cmd = train_info["run_cmd"]
+        # ── SFT-first → GRPO fallback ─────────────────────────────────────────
+        # Sejak update G.O.D tournament (Mon 2026-05-05), environment tasks
+        # disertai small SFT datasets. Kita coba SFT dulu; kalau dataset tidak
+        # tersedia (DatasetNotAvailableError) atau URL dummy → fallback ke GRPO.
+        tokenize_cmd = ""  # EnvTask tidak perlu tokenize terpisah
+        _dataset_url  = dataset_type_dict.get("dataset_url") or args.dataset
+        _sft_eligible = (
+            _dataset_url
+            and _dataset_url != "dummy"
+            and not _dataset_url.endswith("Computational_STEM_QA_Dataset.json")
+        )
+        if _sft_eligible:
+            print(
+                f"[EnvTask] Dataset URL detected: {_dataset_url!r}. Mencoba SFT dulu...",
+                flush=True,
+            )
+            try:
+                train_info = get_sft_env_training_json(train_info)
+                train_cmd  = train_info["run_cmd"]
+                print("[EnvTask] SFT training mode aktif.", flush=True)
+            except Exception as sft_cfg_err:
+                # Config error (bukan dataset error) → tetap fallback ke GRPO
+                print(
+                    f"[EnvTask] WARNING: SFT config gagal ({sft_cfg_err}). Fallback ke GRPO.",
+                    flush=True,
+                )
+                train_info = get_env_training_json(train_info)
+                train_cmd  = train_info["run_cmd"]
+        else:
+            print(
+                "[EnvTask] Tidak ada SFT dataset (URL dummy/kosong). Langsung pakai GRPO.",
+                flush=True,
+            )
+            train_info = get_env_training_json(train_info)
+            train_cmd  = train_info["run_cmd"]
     else:
         raise ValueError(f"Task type {args.task_type} not supported")
 
@@ -529,10 +562,47 @@ def main():
                 args.wandb_project,
                 args.wandb_entity,
             )
+
+            # ── Runtime SFT → GRPO fallback ────────────────────────────────
+            # Kalau SFT gagal karena DatasetNotAvailableError (dataset tidak ada
+            # saat runtime, bukan saat config time), otomatis retry dengan GRPO.
+            if (
+                not success
+                and args.task_type == TaskType.ENVIRONMENTTASK.value
+                and "train_sft_env.py" in train_cmd
+            ):
+                _sft_log = os.path.join(ds_folder, f"train_{args.task_id}.log")
+                _log_text = ""
+                if os.path.exists(_sft_log):
+                    with open(_sft_log) as _lf:
+                        _log_text = _lf.read()
+                if "DatasetNotAvailableError" in _log_text or "Gagal download SFT dataset" in _log_text:
+                    print(
+                        "[EnvTask] SFT runtime fallback: DatasetNotAvailableError terdeteksi "
+                        "di log. Beralih ke GRPO...",
+                        flush=True,
+                    )
+                    _grpo_info = get_env_training_json(dict(train_info))
+                    train_cmd  = _grpo_info["run_cmd"]
+                    train_cmd  = replace_args_in_cmd(train_cmd, "output_dir", run_output_dir)
+                    train_cmd  = replace_args_in_cmd(train_cmd, "request_path", current_request_path)
+                    success = run_training(
+                        train_cmd,
+                        log_path,
+                        args.task_id,
+                        args.retries,
+                        args.task_type,
+                        args.expected_repo_name,
+                        args.wandb_mode,
+                        args.wandb_project,
+                        args.wandb_entity,
+                    )
+            # ───────────────────────────────────────────────────────────────
+
             time.sleep(5)
             if not success:
                 print(f"Training failed for task {args.task_id} at count={count}", flush=True)
-                break 
+                break
             else:
                 print(f"Training successfully done for task {args.task_id} at count={count}", flush=True)
                 break
