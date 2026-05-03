@@ -25,7 +25,7 @@ HOURS_TO_COMPLETE=3
 #   gin_rummy   → 250  (step time 47-57s setelah curriculum max_turn naik ke 11-12)
 #   liars_dice  → 280  (step time ~31s, 3 jam ≈ 280 steps)
 #   leduc_poker → 300  (step time lebih cepat)
-MAX_STEPS=300
+MAX_STEPS=320
 
 # ── SFT Warm-start Dataset (opsional) ──────────────────────────────────────
 # Isi dengan HF dataset ID dari whitelist G.O.D untuk SFT warm-start.
