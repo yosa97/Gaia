@@ -6,6 +6,17 @@ DATASET="dummy"
 DATASET_TYPE='{
   "environment_name": "gin_rummy"
 }'
+
+# Inject requested_datasets ke DATASET_TYPE jika diset
+# text_trainer.py akan membaca field ini untuk memilih SFT warm-start
+if [ -n "$REQUESTED_DATASETS" ]; then
+  DATASET_TYPE=$(echo "$DATASET_TYPE" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+d['requested_datasets'] = ['$REQUESTED_DATASETS']
+print(json.dumps(d))
+")
+fi
 FILE_FORMAT="s3"
 HOURS_TO_COMPLETE=3
 
@@ -15,6 +26,17 @@ HOURS_TO_COMPLETE=3
 #   liars_dice  → 280  (step time ~31s, 3 jam ≈ 280 steps)
 #   leduc_poker → 300  (step time lebih cepat)
 MAX_STEPS=300
+
+# ── SFT Warm-start Dataset (opsional) ──────────────────────────────────────
+# Isi dengan HF dataset ID dari whitelist G.O.D untuk SFT warm-start.
+# Kosongkan ("") untuk skip SFT dan langsung GRPO.
+# Whitelist: GoodStartLabs/gin-rummy-trajectories-32k
+#            gradients-io-tournaments/ArkadiumGinrummy
+#            SoelMgd/Poker_Dataset
+#            RZ412/PokerBench
+#            the-acorn-ai/textarena-player-game-traces
+#            tasksource/Boardgame-QA
+REQUESTED_DATASETS="GoodStartLabs/gin-rummy-trajectories-32k"
 
 # ── Wandb ──────────────────────────────────────────────────────────────────
 # Set WANDB_TOKEN to enable online logging.
@@ -127,7 +149,8 @@ docker run --rm --gpus all \
   --expected-repo-name "$EXPECTED_REPO_NAME" \
   --wandb-mode "$WANDB_MODE" \
   --wandb-project "$WANDB_PROJECT" \
-  --max-steps "$MAX_STEPS" || true
+  --max-steps "$MAX_STEPS" \
+  --dataset-type "$DATASET_TYPE" || true
 
 # Batalkan Watchdog jika proses trainer selesai lebih cepat secara natural
 kill $TIMER_PID 2>/dev/null || true

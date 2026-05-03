@@ -1,15 +1,18 @@
 """
-train_sft_env.py — SFT trainer for environment tasks (G.O.D tournament).
+train_sft_env.py — SFT warm-start trainer untuk environment tasks (G.O.D tournament).
+
+Pipeline:
+  SFT warm-start (file ini) → checkpoint → GRPO (train_grpo_env.py)
 
 Flow:
-  1. Baca train_request dari request_path JSON.
-  2. Download & parse dataset dari URL yang disediakan G.O.D server.
-  3. Tokenize dataset dengan format chat (system + user + assistant).
-  4. Train dengan HuggingFace Trainer (LoRA kalau model besar, full sinon).
-  5. Tulis success.txt ke output_dir kalau berhasil.
+  1. Load dataset dari HuggingFace (pakai whitelisted dataset ID)
+  2. Game-aware field mapping (gin_rummy / poker / textarena / generic)
+  3. Tokenize dengan apply_chat_template (format per model)
+  4. Train dengan TRL SFTTrainer (lebih robust dari bare HF Trainer)
+  5. Simpan checkpoint → path diteruskan ke GRPO sebagai base model
 
-Jika dataset tidak tersedia / kosong → raise DatasetNotAvailableError
-agar text_trainer.py bisa fallback ke GRPO.
+Jika dataset tidak tersedia → raise DatasetNotAvailableError
+agar text_trainer.py bisa skip SFT dan langsung GRPO.
 """
 
 from __future__ import annotations
@@ -17,176 +20,244 @@ from __future__ import annotations
 import json
 import os
 import sys
-import requests
 from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
 import transformers
-from transformers import (
-    AutoTokenizer,
-    Trainer,
-    TrainingArguments,
-    BitsAndBytesConfig,
-)
+from transformers import AutoTokenizer, BitsAndBytesConfig
 from transformers.trainer_utils import is_main_process
-from torch.utils.data import Dataset
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-
-from utility import log_info
-from customized_trainer import (
-    resize_if_needed,
-    set_generation_config,
-    CustomEvalSaveCallback,
-    WhenToEvalHandler,
-)
+from peft import LoraConfig
 
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
 
-# ──────────────────────────────────────────────────────────────
-# Custom exception — ditangkap oleh text_trainer.py untuk fallback
-# ──────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Custom exception — ditangkap text_trainer.py untuk skip SFT → langsung GRPO
+# ──────────────────────────────────────────────────────────────────────────────
 class DatasetNotAvailableError(RuntimeError):
-    """Raised when the SFT dataset cannot be fetched or is empty."""
+    """Raised when SFT dataset tidak bisa diload atau kosong setelah filtering."""
 
 
-# ──────────────────────────────────────────────────────────────
-# CLI arguments (diparsing oleh text_trainer.py → train_sft_env)
-# ──────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI arguments
+# ──────────────────────────────────────────────────────────────────────────────
 @dataclass
-class SftEnvTrainingArguments(transformers.TrainingArguments):
-    request_path: Optional[str] = field(default=None)
-    use_lora:     Optional[bool] = field(default=True)
-    disable_fa:   Optional[bool] = field(default=False)
+class SftEnvArguments(transformers.TrainingArguments):
+    request_path:       Optional[str]  = field(default=None)
+    use_lora:           Optional[bool] = field(default=True)
+    disable_fa:         Optional[bool] = field(default=False)
+    sft_dataset_id:     Optional[str]  = field(default=None,
+                            metadata={"help": "HuggingFace dataset repo ID untuk SFT warm-start"})
+    sft_dataset_split:  Optional[str]  = field(default="train",
+                            metadata={"help": "Split yang dipakai (train/test/validation)"})
+    max_sft_samples:    Optional[int]  = field(default=5000,
+                            metadata={"help": "Max jumlah sample SFT (cukup kecil utk warm-start)"})
 
 
-# ──────────────────────────────────────────────────────────────
-# Dataset helpers
-# ──────────────────────────────────────────────────────────────
-_SFT_FIELDS = ("instruction", "input", "output")   # format G.O.D
-_MAX_LENGTH  = 2048
+# ──────────────────────────────────────────────────────────────────────────────
+# Game-aware field mapping
+# Format: dataset_id → fungsi yang mengkonversi satu row ke dict {system, user, assistant}
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _map_gin_rummy(row: dict) -> dict | None:
+    """Gin Rummy: GoodStartLabs/gin-rummy-trajectories-32k, ArkadiumGinrummy."""
+    # Coba beberapa kemungkinan field schema dari dataset HF
+    obs   = row.get("observation") or row.get("state") or row.get("prompt") or row.get("input") or ""
+    act   = row.get("action") or row.get("response") or row.get("output") or row.get("completion") or ""
+    reason = row.get("reasoning") or row.get("rationale") or ""
+
+    if not obs or not act:
+        return None
+
+    user_text = f"You are playing Gin Rummy.\n\nGame state:\n{obs}"
+    assistant_text = f"{reason}\n\nAction: {act}".strip() if reason else f"Action: {act}"
+    return {
+        "system":    "You are an expert Gin Rummy player. Analyze the game state carefully and choose the best action.",
+        "user":      user_text,
+        "assistant": assistant_text,
+    }
 
 
-def _fetch_dataset(dataset_url: str) -> list[dict]:
-    """Download dataset JSON dari URL. Return list of dicts.
+def _map_poker(row: dict) -> dict | None:
+    """Poker: SoelMgd/Poker_Dataset, RZ412/PokerBench."""
+    obs   = row.get("prompt") or row.get("question") or row.get("observation") or row.get("input") or ""
+    act   = row.get("completion") or row.get("answer") or row.get("action") or row.get("output") or ""
 
-    Raises DatasetNotAvailableError jika URL tidak bisa diakses atau kosong.
-    """
-    if not dataset_url or dataset_url == "dummy":
-        raise DatasetNotAvailableError("Dataset URL is empty or 'dummy' — tidak ada SFT dataset.")
+    if not obs or not act:
+        return None
 
-    # Kalau sudah berupa path lokal (sudah didownload oleh trainer_downloader)
-    if os.path.exists(dataset_url):
-        log_info(f"[SFT] Loading dataset from local path: {dataset_url}")
-        with open(dataset_url, "r") as f:
-            data = json.load(f)
-    else:
-        log_info(f"[SFT] Downloading dataset from: {dataset_url}")
-        try:
-            resp = requests.get(dataset_url, timeout=120)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as exc:
-            raise DatasetNotAvailableError(
-                f"Gagal download SFT dataset dari {dataset_url!r}: {exc}"
-            ) from exc
-
-    if not data:
-        raise DatasetNotAvailableError("Dataset berhasil didownload tapi kosong (0 rows).")
-
-    log_info(f"[SFT] Dataset loaded: {len(data)} rows.")
-    return data
+    return {
+        "system":    "You are an expert poker player. Analyze the hand and betting situation, then decide the optimal action.",
+        "user":      obs,
+        "assistant": act,
+    }
 
 
-def _format_sample(item: dict, tokenizer: AutoTokenizer) -> dict:
-    """Konversi satu row dataset ke format chat message lalu tokenize."""
-    instruction = item.get("instruction") or item.get("instruct") or ""
-    inp         = item.get("input", "")
-    output      = item.get("output", "")
+def _map_textarena(row: dict) -> dict | None:
+    """TextArena multi-game: the-acorn-ai/textarena-player-game-traces."""
+    game   = row.get("game_name") or row.get("game") or "unknown game"
+    obs    = row.get("observation") or row.get("state") or row.get("prompt") or ""
+    act    = row.get("action") or row.get("response") or row.get("output") or ""
 
-    if inp:
-        user_text = f"{instruction}\n\n{inp}"
-    else:
-        user_text = instruction
+    if not obs or not act:
+        return None
+
+    return {
+        "system":    f"You are an expert {game} player. Choose actions that maximize your chance of winning.",
+        "user":      obs,
+        "assistant": act,
+    }
+
+
+def _map_boardgame_qa(row: dict) -> dict | None:
+    """Boardgame QA: tasksource/Boardgame-QA."""
+    q = row.get("question") or row.get("input") or ""
+    a = row.get("answer") or row.get("output") or ""
+    if not q or not a:
+        return None
+    return {
+        "system":    "You are an expert in board games. Answer the question accurately.",
+        "user":      q,
+        "assistant": a,
+    }
+
+
+def _map_generic(row: dict) -> dict | None:
+    """Generic fallback — coba semua field umum."""
+    # Prioritas: messages (chat format) → instruction/output → prompt/completion → question/answer
+    if "messages" in row and isinstance(row["messages"], list):
+        msgs = row["messages"]
+        user_msg = next((m.get("content", "") for m in msgs if m.get("role") == "user"), "")
+        asst_msg = next((m.get("content", "") for m in msgs if m.get("role") == "assistant"), "")
+        sys_msg  = next((m.get("content", "") for m in msgs if m.get("role") == "system"),
+                        "You are a helpful strategic game-playing assistant.")
+        if user_msg and asst_msg:
+            return {"system": sys_msg, "user": user_msg, "assistant": asst_msg}
+
+    pairs = [
+        ("instruction", "output"),
+        ("prompt",       "completion"),
+        ("question",     "answer"),
+        ("input",        "output"),
+        ("observation",  "action"),
+    ]
+    for user_key, asst_key in pairs:
+        u = row.get(user_key, "")
+        a = row.get(asst_key, "")
+        if u and a:
+            return {
+                "system":    "You are a helpful strategic game-playing assistant.",
+                "user":      u,
+                "assistant": a,
+            }
+    return None
+
+
+GAME_MAPPERS = {
+    "gin_rummy":    _map_gin_rummy,
+    "poker":        _map_poker,
+    "textarena":    _map_textarena,
+    "boardgame_qa": _map_boardgame_qa,
+    "generic":      _map_generic,
+    "env_generic":  _map_generic,
+}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Dataset loading & tokenization
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _load_hf_dataset(dataset_id: str, split: str, max_samples: int):
+    """Load dataset dari HuggingFace. Raise DatasetNotAvailableError jika gagal."""
+    try:
+        from datasets import load_dataset
+    except ImportError as e:
+        raise DatasetNotAvailableError(f"Package 'datasets' tidak tersedia: {e}") from e
+
+    print(f"[SFT] Loading dataset: {dataset_id} (split={split})", flush=True)
+    try:
+        ds = load_dataset(dataset_id, split=split, trust_remote_code=True)
+    except Exception as exc:
+        raise DatasetNotAvailableError(
+            f"Gagal load dataset {dataset_id!r}: {exc}"
+        ) from exc
+
+    if ds is None or len(ds) == 0:
+        raise DatasetNotAvailableError(f"Dataset {dataset_id!r} kosong (0 rows).")
+
+    if max_samples > 0 and len(ds) > max_samples:
+        ds = ds.select(range(max_samples))
+
+    print(f"[SFT] Dataset loaded: {len(ds)} rows.", flush=True)
+    return ds
+
+
+def _build_text_field(row: dict, game: str, tokenizer) -> str | None:
+    """Konversi satu row ke string teks siap tokenize (dengan chat template)."""
+    mapper = GAME_MAPPERS.get(game, _map_generic)
+    mapped = mapper(row)
+    if mapped is None:
+        return None
 
     messages = [
-        {"role": "system",    "content": "You are a strategic game-playing assistant."},
-        {"role": "user",      "content": user_text},
-        {"role": "assistant", "content": output},
+        {"role": "system",    "content": mapped["system"]},
+        {"role": "user",      "content": mapped["user"]},
+        {"role": "assistant", "content": mapped["assistant"]},
     ]
-
-    # apply_chat_template mengikuti format model (Qwen, Llama, Mistral, dst.)
-    text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=False,
-    )
-
-    encoded = tokenizer(
-        text,
-        max_length=_MAX_LENGTH,
-        truncation=True,
-        padding=False,
-    )
-
-    # Labels: mask prompt, hanya hitung loss pada assistant turn.
-    # Cari posisi "assistant" reply di token ids.
-    input_ids = encoded["input_ids"]
-    labels    = [-100] * len(input_ids)
-
-    # Encode hanya bagian assistant untuk menentukan offset awal reply
-    assistant_encoded = tokenizer(output, add_special_tokens=False)
-    assistant_ids     = assistant_encoded["input_ids"]
-    n_assist          = len(assistant_ids)
-
-    if n_assist > 0 and n_assist <= len(input_ids):
-        # Geser label ke posisi akhir — assistant tokens berada di akhir sequence
-        for j in range(n_assist):
-            labels[len(input_ids) - n_assist + j] = input_ids[len(input_ids) - n_assist + j]
-
-    encoded["labels"] = labels
-    return encoded
+    try:
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        return text
+    except Exception:
+        # Fallback: manual format kalau model tidak punya chat template
+        text = (
+            f"<|system|>{mapped['system']}<|end|>\n"
+            f"<|user|>{mapped['user']}<|end|>\n"
+            f"<|assistant|>{mapped['assistant']}<|end|>"
+        )
+        return text
 
 
-class SftEnvDataset(Dataset):
-    """Torch Dataset yang sudah di-tokenize untuk SFT."""
+def prepare_sft_dataset(dataset_id: str, game: str, tokenizer, split: str, max_samples: int):
+    """Load + map + tokenize dataset, return HuggingFace Dataset dengan field 'text'."""
+    from datasets import Dataset as HFDataset
 
-    def __init__(self, items: list[dict], tokenizer: AutoTokenizer):
-        self.samples = []
-        skipped = 0
-        for item in items:
-            # Lewati item dengan output kosong
-            if not item.get("output") and not item.get("assistant"):
-                skipped += 1
-                continue
-            try:
-                enc = _format_sample(item, tokenizer)
-                # Lewati jika semua label -100 (tidak ada loss)
-                if all(l == -100 for l in enc["labels"]):
-                    skipped += 1
-                    continue
-                self.samples.append(enc)
-            except Exception:
-                skipped += 1
-        log_info(f"[SFT] Dataset setelah filtering: {len(self.samples)} valid, {skipped} skipped.")
-        if len(self.samples) == 0:
-            raise DatasetNotAvailableError("Semua sampel dataset tidak valid setelah filtering.")
+    raw_ds = _load_hf_dataset(dataset_id, split, max_samples)
 
-    def __len__(self):
-        return len(self.samples)
+    texts = []
+    skipped = 0
+    for row in raw_ds:
+        text = _build_text_field(dict(row), game, tokenizer)
+        if text:
+            texts.append({"text": text})
+        else:
+            skipped += 1
 
-    def __getitem__(self, idx):
-        item = self.samples[idx]
-        return {k: torch.tensor(v) for k, v in item.items()}
+    print(f"[SFT] Mapped: {len(texts)} valid, {skipped} skipped.", flush=True)
+
+    if len(texts) == 0:
+        raise DatasetNotAvailableError(
+            f"Semua {len(raw_ds)} row dari {dataset_id!r} gagal di-map (field tidak dikenali)."
+        )
+
+    # Split train/dev (90/10)
+    n_dev   = min(200, max(10, len(texts) // 10))
+    dev_ds  = HFDataset.from_list(texts[:n_dev])
+    train_ds = HFDataset.from_list(texts[n_dev:])
+    print(f"[SFT] train={len(train_ds)}, dev={len(dev_ds)}", flush=True)
+    return train_ds, dev_ds
 
 
-# ──────────────────────────────────────────────────────────────
-# Model loaders
-# ──────────────────────────────────────────────────────────────
-def _load_model_for_sft(training_args: SftEnvTrainingArguments, model_path: str):
-    """Load model — pakai LoRA untuk model ≥4B, full weight untuk kecil."""
-    attn_impl = "eager" if training_args.disable_fa else "flash_attention_2"
+# ──────────────────────────────────────────────────────────────────────────────
+# Model loading
+# ──────────────────────────────────────────────────────────────────────────────
 
+def _load_model(model_path: str, use_lora: bool, disable_fa: bool):
+    attn_impl = "eager" if disable_fa else "flash_attention_2"
     base = transformers.AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch.bfloat16,
@@ -194,10 +265,8 @@ def _load_model_for_sft(training_args: SftEnvTrainingArguments, model_path: str)
     )
     base.config.use_cache = False
 
-    if training_args.use_lora:
-        if training_args.gradient_checkpointing:
-            base.enable_input_require_grads()
-
+    if use_lora:
+        from peft import get_peft_model
         lora_cfg = LoraConfig(
             r=32,
             lora_alpha=64,
@@ -213,119 +282,127 @@ def _load_model_for_sft(training_args: SftEnvTrainingArguments, model_path: str)
     return base
 
 
-# ──────────────────────────────────────────────────────────────
-# Data collator (padding dynamic batch)
-# ──────────────────────────────────────────────────────────────
-def _collate_fn(batch: list[dict], pad_token_id: int) -> dict:
-    import torch
-    from torch.nn.utils.rnn import pad_sequence
+# ──────────────────────────────────────────────────────────────────────────────
+# Entry point (dipanggil oleh text_trainer.py via subprocess)
+# ──────────────────────────────────────────────────────────────────────────────
 
-    input_ids = pad_sequence(
-        [b["input_ids"] for b in batch],
-        batch_first=True,
-        padding_value=pad_token_id,
-    )
-    attention_mask = pad_sequence(
-        [b["attention_mask"] for b in batch],
-        batch_first=True,
-        padding_value=0,
-    )
-    labels = pad_sequence(
-        [b["labels"] for b in batch],
-        batch_first=True,
-        padding_value=-100,
-    )
-    return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
-
-
-# ──────────────────────────────────────────────────────────────
-# Entry point dipanggil oleh text_trainer.py
-# ──────────────────────────────────────────────────────────────
 def main():
-    """Dipanggil via: torchrun train_sft_env.py --request_path ... [huggingface TrainingArguments]"""
-    argument_parser = transformers.HfArgumentParser((SftEnvTrainingArguments,))
-    (training_args,) = argument_parser.parse_args_into_dataclasses()
+    """Run SFT warm-start training."""
+    argument_parser = transformers.HfArgumentParser((SftEnvArguments,))
+    (args,) = argument_parser.parse_args_into_dataclasses()
 
-    train_info_full = json.load(open(training_args.request_path))
-    train_request   = train_info_full["train_request"]
+    # ── Load train_request ──
+    if not args.request_path or not os.path.exists(args.request_path):
+        raise FileNotFoundError(f"request_path tidak ditemukan: {args.request_path!r}")
 
-    task_id    = train_request["task_id"]
-    model_path = train_request["model_path"]
-    dataset_url = train_request["dataset"]
+    with open(args.request_path) as f:
+        train_info_full = json.load(f)
+    train_request = train_info_full.get("train_request", train_info_full)
 
-    # ── 1. Tokenizer ──
+    model_path     = train_request["model_path"]
+    dataset_id     = args.sft_dataset_id or train_request.get("sft_dataset_id", "")
+    game           = train_request.get("sft_game", "generic")
+
+    if not dataset_id:
+        raise DatasetNotAvailableError("Tidak ada sft_dataset_id di args maupun train_request.")
+
+    # ── Tokenizer ──
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    log_info(f"[SFT] Tokenizer loaded. pad_token={tokenizer.pad_token!r}")
+    print(f"[SFT] Tokenizer: {model_path}, pad={tokenizer.pad_token!r}", flush=True)
 
-    # ── 2. Dataset — akan raise DatasetNotAvailableError jika tidak ada ──
-    raw_data = _fetch_dataset(dataset_url)
-
-    import random
-    random.seed(42)
-    random.shuffle(raw_data)
-    dev_size  = min(200, max(10, len(raw_data) // 10))
-    dev_raw   = raw_data[:dev_size]
-    train_raw = raw_data[dev_size:]
-
-    train_ds = SftEnvDataset(train_raw, tokenizer)
-    dev_ds   = SftEnvDataset(dev_raw,   tokenizer)
-    log_info(f"[SFT] train={len(train_ds)}, dev={len(dev_ds)}")
-
-    # ── 3. Model ──
-    set_generation_config(train_request["model_name"], None)
-    model = _load_model_for_sft(training_args, model_path)
-
-    # ── 4. Callback (save/eval sesuai waktu tournament) ──
-    max_steps = train_request.get("max_steps", -1)
-    total_steps_per_epoch = max(1, len(train_ds) // (
-        training_args.per_device_train_batch_size
-        * training_args.gradient_accumulation_steps
-        * training_args.world_size
-    ))
-
-    import functools
-    collate = functools.partial(_collate_fn, pad_token_id=tokenizer.pad_token_id)
-
-    if is_main_process(LOCAL_RANK):
-        os.makedirs(training_args.output_dir, exist_ok=True)
-
-    training_args.save_only_model = True
-
-    callback = CustomEvalSaveCallback(
-        WhenToEvalHandler(
-            train_request["end_time"],
-            train_request.get("save_before_remaining_time", 10),
-            periodic_save_steps=train_request.get("periodic_save_steps", 75),
-            steps_per_epoch=total_steps_per_epoch,
-            max_steps=max_steps,
-        ),
-        train_request["submission_dir"],
-        training_args.output_dir,
-        train_request["model_name"],
-        max_steps,
-    )
-
-    # ── 5. Train ──
-    trainer = Trainer(
-        model=model,
+    # ── Dataset (akan raise DatasetNotAvailableError jika gagal) ──
+    train_ds, dev_ds = prepare_sft_dataset(
+        dataset_id=dataset_id,
+        game=game,
         tokenizer=tokenizer,
-        args=training_args,
-        train_dataset=train_ds,
-        eval_dataset=dev_ds,
-        data_collator=collate,
-        callbacks=[callback],
+        split=args.sft_dataset_split,
+        max_samples=args.max_sft_samples,
     )
 
-    log_info("[SFT] Starting SFT training...")
+    # ── Model ──
+    model = _load_model(model_path, args.use_lora, args.disable_fa)
+
+    # ── SFTTrainer (TRL) ──
+    try:
+        from trl import SFTTrainer, SFTConfig
+        print("[SFT] Using TRL SFTTrainer.", flush=True)
+
+        sft_config = SFTConfig(
+            output_dir=args.output_dir,
+            num_train_epochs=args.num_train_epochs,
+            per_device_train_batch_size=args.per_device_train_batch_size,
+            per_device_eval_batch_size=1,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            learning_rate=args.learning_rate,
+            lr_scheduler_type="cosine",
+            warmup_steps=20,
+            weight_decay=0.01,
+            bf16=True,
+            tf32=True,
+            logging_steps=10,
+            save_strategy="no",
+            eval_strategy="no",
+            gradient_checkpointing=args.gradient_checkpointing,
+            optim=args.optim if args.optim else "paged_adamw_8bit",
+            report_to=args.report_to if args.report_to else "none",
+            dataset_text_field="text",
+            max_seq_length=2048,
+            packing=True,         # SFTTrainer mendukung packing langsung
+        )
+
+        trainer = SFTTrainer(
+            model=model,
+            tokenizer=tokenizer,
+            args=sft_config,
+            train_dataset=train_ds,
+            eval_dataset=dev_ds,
+        )
+
+    except ImportError:
+        # Fallback ke bare HF Trainer kalau TRL belum terinstall
+        print("[SFT] TRL tidak tersedia, pakai HF Trainer fallback.", flush=True)
+        from transformers import Trainer
+        from torch.nn.utils.rnn import pad_sequence
+        import functools
+
+        def _collate(batch, pad_id):
+            from transformers import DataCollatorForSeq2Seq
+            # Tokenize on-the-fly
+            enc_list = [tokenizer(b["text"], truncation=True, max_length=2048) for b in batch]
+            ids = pad_sequence([torch.tensor(e["input_ids"]) for e in enc_list], True, pad_id)
+            mask = pad_sequence([torch.tensor(e["attention_mask"]) for e in enc_list], True, 0)
+            return {"input_ids": ids, "attention_mask": mask, "labels": ids.clone()}
+
+        collate_fn = functools.partial(_collate, pad_id=tokenizer.pad_token_id)
+
+        if is_main_process(LOCAL_RANK):
+            os.makedirs(args.output_dir, exist_ok=True)
+
+        trainer = Trainer(
+            model=model,
+            tokenizer=tokenizer,
+            args=args,
+            train_dataset=train_ds,
+            eval_dataset=dev_ds,
+            data_collator=collate_fn,
+        )
+
+    # ── Train ──
+    print(f"[SFT] Starting SFT warm-start: dataset={dataset_id}, game={game}", flush=True)
     trainer.train()
 
+    # ── Simpan checkpoint ──
     if is_main_process(LOCAL_RANK):
-        success_file = os.path.join(training_args.output_dir, "success.txt")
+        trainer.save_model(args.output_dir)
+        tokenizer.save_pretrained(args.output_dir)
+        success_file = os.path.join(args.output_dir, "sft_success.txt")
         with open(success_file, "w") as f:
-            f.write("Success")
-    log_info("[SFT] Training successfully completed.")
+            f.write(f"SFT warm-start completed. dataset={dataset_id}, game={game}")
+        print(f"[SFT] Checkpoint saved to: {args.output_dir}", flush=True)
+
+    print("[SFT] Warm-start training selesai.", flush=True)
 
 
 if __name__ == "__main__":

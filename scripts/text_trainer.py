@@ -33,6 +33,7 @@ from grpo_config import get_training_json as get_grpo_training_json
 from instruct_config import get_training_json as get_instruct_training_json
 from grpo_env_config import get_training_json as get_env_training_json
 from sft_env_config import get_training_json as get_sft_env_training_json
+from whitelisted_sft_datasets import validate_requested_datasets
 from transformers import AutoConfig
 
 
@@ -430,41 +431,68 @@ def main():
         train_cmd = train_info["run_cmd"]
 
     elif args.task_type == TaskType.ENVIRONMENTTASK.value:
-        # ── SFT-first → GRPO fallback ─────────────────────────────────────────
-        # Sejak update G.O.D tournament (Mon 2026-05-05), environment tasks
-        # disertai small SFT datasets. Kita coba SFT dulu; kalau dataset tidak
-        # tersedia (DatasetNotAvailableError) atau URL dummy → fallback ke GRPO.
-        tokenize_cmd = ""  # EnvTask tidak perlu tokenize terpisah
-        _dataset_url  = dataset_type_dict.get("dataset_url") or args.dataset
-        _sft_eligible = (
-            _dataset_url
-            and _dataset_url != "dummy"
-            and not _dataset_url.endswith("Computational_STEM_QA_Dataset.json")
-        )
-        if _sft_eligible:
+        # ── SFT Warm-start → GRPO Sequential Pipeline ───────────────────────────
+        # Sesuai mekanisme G.O.D branch feature/miner-dataset-whitelist:
+        # - Jika ada requested_datasets (HF dataset ID dari whitelist G.O.D)
+        #   → Step 1: SFT warm-start, simpan checkpoint
+        #   → Step 2: GRPO mulai dari SFT checkpoint
+        # - Jika tidak ada requested_datasets → langsung GRPO
+        tokenize_cmd  = ""  # EnvTask tidak perlu tokenize
+        _sft_info     = None
+        _sft_output   = None
+
+        # requested_datasets dikirim dari G.O.D server via dataset_type field
+        # Format: dataset_type_dict["requested_datasets"] = ["org/dataset-name"]
+        _requested_ds = dataset_type_dict.get("requested_datasets") or []
+        _valid_ds     = validate_requested_datasets(_requested_ds)
+
+        if _valid_ds:
             print(
-                f"[EnvTask] Dataset URL detected: {_dataset_url!r}. Mencoba SFT dulu...",
+                f"[EnvTask] requested_datasets terdeteksi: {_valid_ds}. "
+                "Menjalankan SFT warm-start...",
                 flush=True,
             )
             try:
-                train_info = get_sft_env_training_json(train_info)
-                train_cmd  = train_info["run_cmd"]
-                print("[EnvTask] SFT training mode aktif.", flush=True)
+                _sft_result = get_sft_env_training_json(train_info, _valid_ds)
+                if _sft_result:
+                    _sft_output = _sft_result["sft_output_dir"]
+                    # Merge sft info ke train_info untuk request_path
+                    train_info.update(_sft_result["train_request"])
+                    _sft_info   = _sft_result
+                    print(
+                        f"[EnvTask] SFT config OK. Dataset={_sft_result['dataset_id']}, "
+                        f"Game={_sft_result['game']}",
+                        flush=True,
+                    )
+                else:
+                    print("[EnvTask] Dataset tidak ada di whitelist. Skip SFT.", flush=True)
             except Exception as sft_cfg_err:
-                # Config error (bukan dataset error) → tetap fallback ke GRPO
                 print(
-                    f"[EnvTask] WARNING: SFT config gagal ({sft_cfg_err}). Fallback ke GRPO.",
+                    f"[EnvTask] WARNING: SFT config error ({sft_cfg_err}). Skip SFT.",
                     flush=True,
                 )
-                train_info = get_env_training_json(train_info)
-                train_cmd  = train_info["run_cmd"]
         else:
             print(
-                "[EnvTask] Tidak ada SFT dataset (URL dummy/kosong). Langsung pakai GRPO.",
+                "[EnvTask] Tidak ada requested_datasets. Langsung GRPO.",
                 flush=True,
             )
-            train_info = get_env_training_json(train_info)
-            train_cmd  = train_info["run_cmd"]
+
+        # GRPO — jika ada SFT checkpoint, GRPO mulai dari sana
+        _grpo_train_info = dict(train_info)
+        if _sft_output:
+            # Override model_path ke SFT checkpoint agar GRPO warm-start
+            _grpo_train_info["model_path"]       = _sft_output
+            _grpo_train_info["sft_checkpoint"]   = _sft_output
+            print(
+                f"[EnvTask] GRPO akan mulai dari SFT checkpoint: {_sft_output}",
+                flush=True,
+            )
+
+        train_info = get_env_training_json(_grpo_train_info)
+        train_cmd  = train_info["run_cmd"]
+
+        # Simpan referensi SFT info untuk dijalankan sebelum GRPO
+        train_info["_sft_info"] = _sft_info
     else:
         raise ValueError(f"Task type {args.task_type} not supported")
 
@@ -532,13 +560,13 @@ def main():
         if train_cmd:
             run_output_dir = output_dir + f"_{count}" if not final_output_dir else final_output_dir
             train_cmd = replace_args_in_cmd(train_cmd, "output_dir", run_output_dir)
-            
+
             current_request_path = os.path.join(ds_folder, f"training_request_{args.task_id}_{count}.json")
             with open(current_request_path, "w") as f:
                 json.dump(c_train_info, f, indent=4, ensure_ascii=False)
-            
+
             train_cmd = replace_args_in_cmd(train_cmd, "request_path", current_request_path)
-            
+
             state["train"] = {
                 "train_cmd": train_cmd,
                 "log_path": os.path.join(ds_folder, f"train_{args.task_id}.log"),
@@ -546,11 +574,48 @@ def main():
                 "output_dir": run_output_dir
             }
             state["train"]["start_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
+
             set_state(state)
-            
+
             log_path = state["train"]["log_path"]
-            # print(f"Run training with train_info: {c_train_info}", flush=True)
+
+            # ── Step 1: SFT Warm-start (EnvTask saja, jika ada dataset) ─────────
+            _sft_info_to_run = train_info.get("_sft_info")
+            if args.task_type == TaskType.ENVIRONMENTTASK.value and _sft_info_to_run:
+                _sft_log_path = os.path.join(ds_folder, f"sft_warmstart_{args.task_id}.log")
+                _sft_cmd      = _sft_info_to_run["run_cmd"]
+                _sft_req_path = os.path.join(ds_folder, f"sft_request_{args.task_id}.json")
+                _sft_cmd      = replace_args_in_cmd(_sft_cmd, "request_path", _sft_req_path)
+
+                # Tulis request untuk SFT
+                with open(_sft_req_path, "w") as _f:
+                    json.dump({"train_request": _sft_info_to_run["train_request"]}, _f, indent=4)
+
+                print(
+                    f"[EnvTask] \u25b6 Step 1/2: SFT warm-start "
+                    f"({_sft_info_to_run['dataset_id']})...",
+                    flush=True,
+                )
+                run_cmd_with_log(_sft_cmd, _sft_log_path)
+
+                # Cek apakah SFT berhasil (sft_success.txt)
+                _sft_output_dir = _sft_info_to_run["sft_output_dir"]
+                if os.path.exists(os.path.join(_sft_output_dir, "sft_success.txt")):
+                    print(
+                        f"[EnvTask] \u2713 SFT warm-start selesai. "
+                        f"Checkpoint: {_sft_output_dir}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[EnvTask] \u26a0 SFT warm-start gagal atau tidak ada checkpoint. "
+                        "Lanjut GRPO dari base model.",
+                        flush=True,
+                    )
+                print(f"[EnvTask] \u25b6 Step 2/2: GRPO training...", flush=True)
+            # ────────────────────────────────────────────────────────────────────
+
+            # ── Step 2: GRPO Training ────────────────────────────────────────────
             success = run_training(
                 train_cmd,
                 log_path,
@@ -562,42 +627,7 @@ def main():
                 args.wandb_project,
                 args.wandb_entity,
             )
-
-            # ── Runtime SFT → GRPO fallback ────────────────────────────────
-            # Kalau SFT gagal karena DatasetNotAvailableError (dataset tidak ada
-            # saat runtime, bukan saat config time), otomatis retry dengan GRPO.
-            if (
-                not success
-                and args.task_type == TaskType.ENVIRONMENTTASK.value
-                and "train_sft_env.py" in train_cmd
-            ):
-                _sft_log = os.path.join(ds_folder, f"train_{args.task_id}.log")
-                _log_text = ""
-                if os.path.exists(_sft_log):
-                    with open(_sft_log) as _lf:
-                        _log_text = _lf.read()
-                if "DatasetNotAvailableError" in _log_text or "Gagal download SFT dataset" in _log_text:
-                    print(
-                        "[EnvTask] SFT runtime fallback: DatasetNotAvailableError terdeteksi "
-                        "di log. Beralih ke GRPO...",
-                        flush=True,
-                    )
-                    _grpo_info = get_env_training_json(dict(train_info))
-                    train_cmd  = _grpo_info["run_cmd"]
-                    train_cmd  = replace_args_in_cmd(train_cmd, "output_dir", run_output_dir)
-                    train_cmd  = replace_args_in_cmd(train_cmd, "request_path", current_request_path)
-                    success = run_training(
-                        train_cmd,
-                        log_path,
-                        args.task_id,
-                        args.retries,
-                        args.task_type,
-                        args.expected_repo_name,
-                        args.wandb_mode,
-                        args.wandb_project,
-                        args.wandb_entity,
-                    )
-            # ───────────────────────────────────────────────────────────────
+            # ────────────────────────────────────────────────────────────────────
 
             time.sleep(5)
             if not success:
