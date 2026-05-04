@@ -1,25 +1,22 @@
 #!/bin/bash
+# Full SFT local runner — pure SFT mode (no GRPO, no env server).
+#
+# Sets SFT_ONLY=1 env var so scripts/text_trainer.py routes to
+# scripts/train_full_sft.py (which uses Boardgame-QA + env_training_gradients
+# mixed 50/50). Datasets pre-downloaded to host then mounted into trainer.
 
 TASK_ID="1"
-MODEL=""           # ← WAJIB DIISI: HuggingFace model repo ID, e.g. Qwen/Qwen2.5-7B-Instruct
+MODEL=""
 DATASET="dummy"
 DATASET_TYPE='{
-  "environment_name": "gin_rummy"
+  "environment_name": "liars_dice"
 }'
 FILE_FORMAT="s3"
 HOURS_TO_COMPLETE=3
 
-# ── SFT Dataset (whitelist) ────────────────────────────────────────────────
-# Comma-separated list of whitelisted HuggingFace dataset repo IDs.
-# Set to empty string to skip SFT cold-start stage.
-MINER_DATASETS="gradients-io-tournaments/env_training_gradients"
-MINER_DATASETS_DIR="$(pwd)/sft_datasets"
-
 # ── Wandb ──────────────────────────────────────────────────────────────────
-# Set WANDB_TOKEN to enable online logging.
-# Leave it empty (WANDB_TOKEN="") to fall back to offline mode automatically.
 WANDB_TOKEN=""
-WANDB_PROJECT="tournament-environments"   # project name on wandb.ai (change freely)
+WANDB_PROJECT="environment"
 
 # ── HuggingFace upload ─────────────────────────────────────────────────────
 HUGGINGFACE_USERNAME=""
@@ -28,61 +25,42 @@ EXPECTED_REPO_NAME=""
 LOCAL_FOLDER="/app/checkpoints/$TASK_ID/$EXPECTED_REPO_NAME"
 DOCKER_BUILDKIT=1
 
+# ── Miner-requested whitelisted datasets (slot 1 + slot 2) ─────────────────
+MINER_DATASETS_HOST_DIR="$(pwd)/miner_datasets_cache"
+MINER_DATASET_REPO_1="gradients-io-tournaments/env_training_gradients"
+MINER_DATASET_DIR_1="gradients-io-tournaments__env_training_gradients"
+MINER_DATASET_REPO_2="tasksource/Boardgame-QA"
+MINER_DATASET_DIR_2="tasksource__Boardgame-QA"
+
 # ── Auto-detect wandb mode ─────────────────────────────────────────────────
-# Online mode when a token is present; offline mode otherwise so logs are
-# saved locally inside the container and can be synced later.
-WANDB_RUN_NAME="${TASK_ID}_${EXPECTED_REPO_NAME}"
+WANDB_RUN_NAME="${TASK_ID}_${EXPECTED_REPO_NAME}_full_sft"
 
 if [ -n "$WANDB_TOKEN" ]; then
   WANDB_MODE="online"
   echo "[wandb] Token detected — ONLINE mode (project: $WANDB_PROJECT, run: $WANDB_RUN_NAME)"
 else
   WANDB_MODE="offline"
-  echo "[wandb] No token set — OFFLINE mode (logs saved locally inside container)"
+  echo "[wandb] No token set — OFFLINE mode"
 fi
 
 # ── Directory setup ────────────────────────────────────────────────────────
 CHECKPOINTS_DIR="$(pwd)/secure_checkpoints"
 OUTPUTS_DIR="$(pwd)/outputs"
-mkdir -p "$CHECKPOINTS_DIR"
-chmod 777 "$CHECKPOINTS_DIR"
-mkdir -p "$OUTPUTS_DIR"
-chmod 777 "$OUTPUTS_DIR"
+mkdir -p "$CHECKPOINTS_DIR" "$OUTPUTS_DIR" "$MINER_DATASETS_HOST_DIR"
+chmod 777 "$CHECKPOINTS_DIR" "$OUTPUTS_DIR" "$MINER_DATASETS_HOST_DIR"
 
-# Prepare SFT dataset directory
-if [ -z "$MODEL" ]; then
-  echo "[ERROR] MODEL is not set. Please fill in the MODEL variable before running."
-  echo "        Example: MODEL=\"Qwen/Qwen2.5-7B-Instruct\""
-  exit 1
-fi
-
-if [ -n "$MINER_DATASETS" ]; then
-  mkdir -p "$MINER_DATASETS_DIR"
-  chmod 777 "$MINER_DATASETS_DIR"
-  echo "[SFT] Dataset dir: $MINER_DATASETS_DIR"
-  echo "[SFT] Datasets: $MINER_DATASETS"
-fi
-
-# Create a shared Docker network for trainer <-> env server communication
 NETWORK_NAME="env_training_net"
 docker network create "$NETWORK_NAME" 2>/dev/null || true
 
-# Build the downloader image
+# Build images
 docker build -t trainer-downloader -f dockerfiles/trainer-downloader.dockerfile .
-
-# Build the trainer image
 docker build -t standalone-text-trainer -f dockerfiles/standalone-text-trainer.dockerfile .
-
-# Build the hf-uploader image
 docker build -t hf-uploader -f dockerfiles/hf-uploader.dockerfile .
 
-# Download model and generate dummy dataset
+# Download model
 echo "Downloading model..."
 docker run --rm \
   --volume "$CHECKPOINTS_DIR:/cache:rw" \
-  --volume "$MINER_DATASETS_DIR:/cache/miner_datasets:rw" \
-  --env MINER_DATASETS="$MINER_DATASETS" \
-  --env MINER_DATASETS_DIR="/cache/miner_datasets" \
   --name downloader-image \
   trainer-downloader \
   --task-id "$TASK_ID" \
@@ -91,31 +69,40 @@ docker run --rm \
   --file-format "$FILE_FORMAT" \
   --task-type "EnvTask"
 
-# Start the environment server (MCTS API for liars dice)
-# One server per GPU — adjust if you have multiple GPUs
-echo "Starting environment server..."
-docker run -d --rm \
-  --network "$NETWORK_NAME" \
-  --name env-server-0 \
-  phoenixbeaudry/game:mcts-api
+# ── Pre-download both whitelisted SFT datasets ─────────────────────────────
+download_dataset() {
+  local repo="$1"
+  local dir_name="$2"
+  local target="$MINER_DATASETS_HOST_DIR/$dir_name"
+  if [ -d "$target" ] && [ -n "$(ls -A "$target" 2>/dev/null)" ]; then
+    echo "[sft] Dataset already cached: $target"
+    return 0
+  fi
+  echo "[sft] Downloading $repo -> $target ..."
+  TOKEN_ARG=""
+  if [ -n "$HUGGINGFACE_TOKEN" ]; then
+    TOKEN_ARG="--token $HUGGINGFACE_TOKEN"
+  fi
+  docker run --rm \
+    --volume "$MINER_DATASETS_HOST_DIR:/data:rw" \
+    -e HF_HUB_DISABLE_PROGRESS_BARS=1 \
+    python:3.11-slim \
+    bash -c "pip install -q huggingface_hub && hf download '$repo' --repo-type dataset --local-dir /data/$dir_name $TOKEN_ARG"
+  if [ -d "$target" ] && [ -n "$(ls -A "$target" 2>/dev/null)" ]; then
+    echo "[sft] Cached: $target"
+  else
+    echo "[sft] WARN: download $repo failed; train_full_sft will fall back to direct download"
+  fi
+}
 
-# Wait for the env server to be ready
-echo "Waiting for environment server to be healthy..."
-sleep 10  # Adjust as needed, or add a proper health check loop
+download_dataset "$MINER_DATASET_REPO_1" "$MINER_DATASET_DIR_1"
+download_dataset "$MINER_DATASET_REPO_2" "$MINER_DATASET_DIR_2"
 
-# Build the ENVIRONMENT_SERVER_URLS
-# For multi-GPU, start additional env-server-1, env-server-2, etc. and comma-separate them
-ENV_SERVER_URLS="http://env-server-0:8000"
+# Run trainer (no env server — full SFT doesn't need rollout)
+echo "Starting full SFT trainer..."
 
-# Run the trainer
-# text_trainer.py reads wandb mode/project from CLI args (--wandb-mode, --wandb-project).
-# The token is read from the WANDB_API_KEY / WANDB_TOKEN env var inside the container.
-# WANDB_RUN_ID and WANDB_NAME env vars are set by text_trainer.py automatically.
-echo "Starting trainer (wandb mode: $WANDB_MODE)..."
-
-# EXTERNAL WATCHDOG TIMER (Ensures strictly accurate timeout)
 TIMEOUT_SECONDS=$(echo "$HOURS_TO_COMPLETE * 3600" | bc | cut -d. -f1)
-(sleep $TIMEOUT_SECONDS && echo "[WATCHDOG] TIMEOUT REACHED ($HOURS_TO_COMPLETE hrs) - Stopping container..." && docker stop grpo-text-trainer-example 2>/dev/null) &
+(sleep $TIMEOUT_SECONDS && echo "[WATCHDOG] TIMEOUT — stopping container..." && docker stop full-sft-trainer 2>/dev/null) &
 TIMER_PID=$!
 
 docker run --rm --gpus all \
@@ -127,18 +114,15 @@ docker run --rm --gpus all \
   --network "$NETWORK_NAME" \
   --volume "$CHECKPOINTS_DIR:/cache:rw" \
   --volume "$OUTPUTS_DIR:/app/checkpoints/:rw" \
-  --volume "$MINER_DATASETS_DIR:/cache/miner_datasets:rw" \
-  --env ENVIRONMENT_SERVER_URLS="$ENV_SERVER_URLS" \
-  --env MINER_DATASETS_DIR="/cache/miner_datasets" \
-  --env MINER_DATASETS="$MINER_DATASETS" \
+  --volume "$MINER_DATASETS_HOST_DIR:/cache/miner_datasets:ro" \
   --env WANDB_API_KEY="$WANDB_TOKEN" \
   --env WANDB_TOKEN="$WANDB_TOKEN" \
   --env WANDB_INIT_TIMEOUT=300 \
-  --env HF_HUB_ENABLE_HF_TRANSFER=0 \
-  --env GLOO_SOCKET_IFNAME=lo \
-  --env NCCL_IB_DISABLE=1 \
-  --env NCCL_SOCKET_IFNAME=lo \
-  --name grpo-text-trainer-example \
+  --env MINER_DATASETS_DIR=/cache/miner_datasets \
+  --env MINER_DATASETS="$MINER_DATASET_DIR_1,$MINER_DATASET_DIR_2" \
+  --env SFT_ONLY=1 \
+  --env HF_TOKEN="$HUGGINGFACE_TOKEN" \
+  --name full-sft-trainer \
   standalone-text-trainer \
   --task-id "$TASK_ID" \
   --model "$MODEL" \
@@ -151,15 +135,12 @@ docker run --rm --gpus all \
   --wandb-mode "$WANDB_MODE" \
   --wandb-project "$WANDB_PROJECT" || true
 
-# Batalkan Watchdog jika proses trainer selesai lebih cepat secara natural
 kill $TIMER_PID 2>/dev/null || true
 
-# Cleanup env server and network
-echo "Stopping environment server..."
-docker stop env-server-0 2>/dev/null || true
+# Cleanup
 docker network rm "$NETWORK_NAME" 2>/dev/null || true
 
-# Upload checkpoints to HuggingFace; also sync offline wandb runs if any
+# Upload to HF
 echo "Uploading outputs..."
 docker run --rm --gpus all \
   --volume "$OUTPUTS_DIR:/app/checkpoints/:rw" \
@@ -171,5 +152,6 @@ docker run --rm --gpus all \
   --env TASK_ID="$TASK_ID" \
   --env EXPECTED_REPO_NAME="$EXPECTED_REPO_NAME" \
   --env LOCAL_FOLDER="$LOCAL_FOLDER" \
+  --env MODEL="$MODEL" \
   --name hf-uploader \
   hf-uploader

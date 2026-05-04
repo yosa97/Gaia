@@ -30,7 +30,7 @@ BLUFF_PROB_THRESHOLD  = 0.35   # below this = model is bluffing (unlikely bid)
 RISKY_LIAR_PROB_MIN   = 0.35   # liar call in [0.35, 0.60] = risky-but-correct zone
 RISKY_LIAR_PROB_MAX   = 0.60
 BLUFF_WIN_BONUS       = 0.5    # bonus for winning after calling a bluff
-RISKY_LIAR_WIN_BONUS  = 0.5    # bonus for winning after risky liar call
+RISKY_LIAR_WIN_BONUS  = 0.8    # EDGE 3: 0.5 → 0.8. More aggressive risky-but-correct challenge bonus
 RISKY_BONUS_MAX_COUNT = 2      # cap: max 2 bluff/risky events per episode credited
 SHUFFLE_PROB          = 0.5    # probability of shuffling displayed action order each turn
 NORMALIZE_REWARDS     = False  # disable reward normalization (raw discounted return)
@@ -55,7 +55,7 @@ class Bid:
 
 @dataclass
 class Action:
-    SCORE_TEMPERATURE = 0.5   # temperature for softmax-like action scoring
+    SCORE_TEMPERATURE = 0.4   # EDGE 2: 0.5 → 0.4. Sharper score curve, more sensitive to high p
 
     action_id: int
     label: str
@@ -289,7 +289,9 @@ class RewardCalculator:
     """Shaped reward calculator for Liar's Dice with Bayesian opponent awareness."""
 
     def __init__(self, gamma: float = 0.9):
-        self.terminal_weight = 10.0   # scale for terminal env reward
+        self.terminal_weight = 3.0    # EDGE 1: was 10.0 (dead code in boss). 3.0 = moderate boost
+                                      # used at done step to amplify ±1 win/loss signal to ±3.
+                                      # Differential WIN-LOSS = 6 (vs boss's effective 2).
         self.gamma           = gamma  # 0.9 discount factor for short LD episodes
 
     def calculate_step_reward(
@@ -324,7 +326,7 @@ class RewardCalculator:
                         reward += BAYES_OVERREACH_PENALTY   # bid far exceeds estimate
 
         if env_reward != 0.0:
-            reward += env_reward * self.terminal_weight  # ×10 terminal scale
+            reward += env_reward * self.terminal_weight  # ×terminal_weight terminal scale
 
         return reward
 
@@ -357,11 +359,11 @@ _state: dict = {}
 def _curriculum_factory(args) -> CurriculumScheduler:
     """Construct this env's curriculum from training args. Referenced by env_configs registry."""
     return CurriculumScheduler(
-        initial_max_turn=args.initial_max_turn,
-        final_max_turn=15,
+        initial_max_turn=args.initial_max_turn,      # from training args
+        final_max_turn=15,                            # 15 = full LD episode upper bound
         rollouts_per_stage=args.rollouts_per_stage,
-        initial_hint_prob=0.5,
-        final_hint_prob=0.0,
+        initial_hint_prob=0.5,   # 50% episodes start with strategy hints
+        final_hint_prob=0.0,     # decay to 0% — model learns without hints
         warmup_rollouts=args.rollouts_per_stage,
     )
 
@@ -671,13 +673,14 @@ def _run_episode(
                         bayes=bayes, gs=previous_game_state,
                     )
                     step_scores.append(taken_action.score if taken_action else 0.0)
-
                 else:
                     won              = step_reward > 0.5
                     immediate_reward = (taken_action.score if taken_action else 0.0)
-                    immediate_reward += (step_reward - 0.5) * 2.0
+                    # EDGE 1: multiply terminal by terminal_weight (was dead code in boss).
+                    # WIN: +2 * terminal_weight = +6 (was +1). LOSS: -2 * terminal_weight = -6 (was -1).
+                    immediate_reward += (step_reward - 0.5) * 2.0 * calculator.terminal_weight
                     step_scores.append(taken_action.score if taken_action else 0.0)
-                    terminal_reward  = (step_reward - 0.5) * 2.0
+                    terminal_reward  = (step_reward - 0.5) * 2.0 * calculator.terminal_weight
                     if won:
                         immediate_reward += BLUFF_WIN_BONUS     * min(bluff_count,      RISKY_BONUS_MAX_COUNT)
                         immediate_reward += RISKY_LIAR_WIN_BONUS * min(risky_liar_count, RISKY_BONUS_MAX_COUNT)

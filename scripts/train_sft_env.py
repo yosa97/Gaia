@@ -1,468 +1,749 @@
-"""
-train_sft_env.py — SFT warm-start trainer untuk environment tasks (G.O.D tournament).
+"""Full SFT trainer — pure SFT mode (no GRPO), 2-phase sequential.
 
-Pipeline:
-  SFT warm-start (file ini) → checkpoint → GRPO (train_grpo_env.py)
+Replaces train_grpo_env.py for branches dedicated to full SFT. Reads two
+miner-requested whitelisted datasets and trains in TWO sequential phases:
 
-Flow:
-  1. Load dataset dari HuggingFace (pakai whitelisted dataset ID)
-  2. Game-aware field mapping (gin_rummy / poker / textarena / generic)
-  3. Tokenize dengan apply_chat_template (format per model)
-  4. Train dengan TRL SFTTrainer (lebih robust dari bare HF Trainer)
-  5. Simpan checkpoint → path diteruskan ke GRPO sebagai base model
+  Phase 1 — Boardgame-QA warm-up (gentle, brief):
+    - 500 randomly sampled rows (from 15000)
+    - LR 5e-6, 1 epoch, no neftune
+    - Goal: instill general logical reasoning patterns into LoRA adapter
+    - ~16 steps, ~3 min on 4 GPU 7B
 
-Jika dataset tidak tersedia → raise DatasetNotAvailableError
-agar text_trainer.py bisa skip SFT dan langsung GRPO.
+  Phase 2 — env_training specialize (DOMINANT):
+    - single-game filter (training_args.environment_name) + OUTCOME-WEIGHTED
+      oversampling (win=5, draw=3, loss=1) instead of hard win/draw filter
+    - For LD: 1100 -> 400 -> ~1500 effective samples (after weighting)
+    - LR 1e-5, 10 epoch (chess SFT paper recipe), neftune_noise_alpha=5
+    - Goal: specialize adapter to game action format
+    - ~120-160 steps, ~25-35 min on 2 GPU 3B
+
+Same model+LoRA adapter across both phases (gradient accumulation). Phase 2
+update magnitude (steps × LR) is ~4.5× Phase 1, so final adapter direction
+is ~80% Phase 2 + 20% Phase 1 reasoning residual.
+
+Hard time budget enforced via TimeBudgetCallback (default 165 min = 2h45m,
+leaves 15 min buffer pre-3h cap). Triggered via SFT_ONLY=1 env var routed
+through scripts/text_trainer.py. Direct download fallback if
+MINER_DATASETS_DIR not mounted (production-ready before PR #1082 merges).
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import os
-import sys
+import random
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import torch
 import transformers
-from transformers import AutoTokenizer, BitsAndBytesConfig
+from datasets import Dataset, concatenate_datasets, load_dataset
+from peft import PeftModelForCausalLM, get_peft_model
+from transformers import AutoTokenizer, TrainerCallback
+from transformers.modeling_utils import is_deepspeed_zero3_enabled
 from transformers.trainer_utils import is_main_process
-from peft import LoraConfig
+from trl import (
+    ModelConfig,
+    SFTConfig,
+    SFTTrainer,
+    get_kbit_device_map,
+    get_peft_config,
+    get_quantization_config,
+)
+
+from utility import log_info
+
 
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
 
+ENV_TRAINING_DATASET_REPO = "gradients-io-tournaments/env_training_gradients"
+ENV_TRAINING_DATASET_DIR = "gradients-io-tournaments__env_training_gradients"
+BOARDGAME_QA_REPO = "tasksource/Boardgame-QA"
+BOARDGAME_QA_DIR = "tasksource__Boardgame-QA"
+FALLBACK_CACHE_DIR = "/tmp/sft_dataset_cache"
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Local path helper — fix HFValidationError di HuggingFace Hub versi baru
-# ──────────────────────────────────────────────────────────────────────────────
-def _is_local_path(path: str) -> bool:
-    """Cek apakah path adalah local filesystem path (bukan HF repo ID)."""
-    return path.startswith("/") or path.startswith("./") or os.path.isdir(path)
-
-
-def _resolve_model_path(path: str) -> str:
-    """Resolve symlink dan kembalikan absolute path untuk local models.
-
-    HuggingFace Hub baru (>=0.24) strict validate repo ID — path lokal
-    dengan banyak '/' akan ditolak. Solusi: deteksi local path dan
-    gunakan os.path.realpath() untuk normalisasi.
-    """
-    if _is_local_path(path):
-        real = os.path.realpath(path)
-        if os.path.isdir(real):
-            return real
-    return path
+DEFAULT_BUDGET_MIN = 165
+TARGET_GAMES = ("liars_dice", "leduc_poker", "gin_rummy")
+TARGET_OUTCOMES = ("win", "draw")
+OUTCOME_WEIGHTS = {"win": 5, "draw": 3, "loss": 1}
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Custom exception — ditangkap text_trainer.py untuk skip SFT → langsung GRPO
-# ──────────────────────────────────────────────────────────────────────────────
-class DatasetNotAvailableError(RuntimeError):
-    """Raised when SFT dataset tidak bisa diload atau kosong setelah filtering."""
+# === Game-specific system prompts (verbatim from scripts/envs/<game>_opponent_modeling.py) ===
+# CRITICAL: validator routes via _VARIANT_OVERRIDES in scripts/envs/env_configs.py
+#   "liars_dice" -> "liars_dice_opponent_modeling"
+#   "leduc_poker" -> "leduc_poker_opponent_modeling"
+#   "gin_rummy" -> "gin_rummy_opponent_modeling"
+# So inference uses *_opponent_modeling.py prompts, NOT the base *_env.py prompts.
+# Differences (NOT cosmetic):
+#   - LD: opponent_modeling has NO leading/trailing '"' wrapping (base does)
+#   - LP: examples differ ("Fold"/"Raise" vs generic "roll"/"a3")
+#   - GR: opponent_modeling has "EACH TURN" section + card notation example
+# === Game-specific HINT prompts (verbatim from scripts/envs/<game>_opponent_modeling.py) ===
+# Validator's env may add these conditionally via use_hints flag at inference.
+# For SFT, randomly include 50% of training samples → model robust to both
+# conditions (hint/no-hint), mirrors GRPO's curriculum hint_prob mechanism.
+LIARS_DICE_HINT_PROMPT = (
+    '\n# Strategy Tips\n'
+    '- Count your dice that match the bid (including 6s as wild)\n'
+    '- Call "Liar" when the bid is more likely false than any available bid is true.\n'
+    '- Make conservative bids early, aggressive when opponent seems weak\n'
+)
 
+LEDUC_POKER_HINT_PROMPT = (
+    "\n\n# Strategy Tips\n"
+    "Round 1:\n"
+    "- Hold K or Q → call a raise; raise first if unchallenged.\n"
+    "- Hold J → fold against a raise; check if unchallenged.\n\n"
+    "Round 2 (public card revealed):\n"
+    "- You have a PAIR → raise; never fold.\n"
+    "- You have K (no pair) → raise first; call if opponent raises.\n"
+    "- You have Q (no pair), public card is K → raise first; call if opponent raises.\n"
+    "- You have Q (no pair), public card is J → check; fold if opponent raises.\n"
+    "- You have J (no pair) → check; fold if opponent raises.\n"
+)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# CLI arguments
-# ──────────────────────────────────────────────────────────────────────────────
-@dataclass
-class SftEnvArguments(transformers.TrainingArguments):
-    request_path:       Optional[str]  = field(default=None)
-    use_lora:           Optional[bool] = field(default=True)
-    disable_fa:         Optional[bool] = field(default=False)
-    sft_dataset_id:     Optional[str]  = field(default=None,
-                            metadata={"help": "HuggingFace dataset repo ID untuk SFT warm-start"})
-    sft_dataset_split:  Optional[str]  = field(default="train",
-                            metadata={"help": "Split yang dipakai (train/test/validation)"})
-    max_sft_samples:    Optional[int]  = field(default=5000,
-                            metadata={"help": "Max jumlah sample SFT (cukup kecil utk warm-start)"})
+GIN_RUMMY_HINT_PROMPT = (
+    "\n\n# Strategy Tips\n"
+    "- Early game: Draw from deck to see more cards\n"
+    "- Build runs and sets to reduce deadwood\n"
+    "- Track opponent's discards to guess their hand\n"
+    "- Knock when you have ≤10 deadwood points and think you're ahead\n"
+    "- Go for Gin (0 deadwood) when close for bonus points\n"
+    "- In Layoff phase: use 'Dead cards' hint to find extension opportunities\n"
+    "- IMPORTANT: YOU MUST PICK THE ACTION ID FROM THE LEGAL ACTIONS."
+)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Game-aware field mapping
-# Format: dataset_id → fungsi yang mengkonversi satu row ke dict {system, user, assistant}
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _map_gin_rummy(row: dict) -> dict | None:
-    """Gin Rummy: GoodStartLabs/gin-rummy-trajectories-32k, ArkadiumGinrummy."""
-    # Coba beberapa kemungkinan field schema dari dataset HF
-    obs   = row.get("observation") or row.get("state") or row.get("prompt") or row.get("input") or ""
-    act   = row.get("action") or row.get("response") or row.get("output") or row.get("completion") or ""
-    reason = row.get("reasoning") or row.get("rationale") or ""
-
-    if not obs or not act:
-        return None
-
-    user_text = f"You are playing Gin Rummy.\n\nGame state:\n{obs}"
-    assistant_text = f"{reason}\n\nAction: {act}".strip() if reason else f"Action: {act}"
-    return {
-        "system":    "You are an expert Gin Rummy player. Analyze the game state carefully and choose the best action.",
-        "user":      user_text,
-        "assistant": assistant_text,
-    }
-
-
-def _map_poker(row: dict) -> dict | None:
-    """Poker: SoelMgd/Poker_Dataset, RZ412/PokerBench."""
-    obs   = row.get("prompt") or row.get("question") or row.get("observation") or row.get("input") or ""
-    act   = row.get("completion") or row.get("answer") or row.get("action") or row.get("output") or ""
-
-    if not obs or not act:
-        return None
-
-    return {
-        "system":    "You are an expert poker player. Analyze the hand and betting situation, then decide the optimal action.",
-        "user":      obs,
-        "assistant": act,
-    }
-
-
-def _map_textarena(row: dict) -> dict | None:
-    """TextArena multi-game: the-acorn-ai/textarena-player-game-traces."""
-    game   = row.get("game_name") or row.get("game") or "unknown game"
-    obs    = row.get("observation") or row.get("state") or row.get("prompt") or ""
-    act    = row.get("action") or row.get("response") or row.get("output") or ""
-
-    if not obs or not act:
-        return None
-
-    return {
-        "system":    f"You are an expert {game} player. Choose actions that maximize your chance of winning.",
-        "user":      obs,
-        "assistant": act,
-    }
-
-
-def _map_boardgame_qa(row: dict) -> dict | None:
-    """Boardgame QA: tasksource/Boardgame-QA."""
-    q = row.get("question") or row.get("input") or ""
-    a = row.get("answer") or row.get("output") or ""
-    if not q or not a:
-        return None
-    return {
-        "system":    "You are an expert in board games. Answer the question accurately.",
-        "user":      q,
-        "assistant": a,
-    }
-
-
-def _map_generic(row: dict) -> dict | None:
-    """Generic fallback — coba semua field umum."""
-    # Prioritas: messages (chat format) → instruction/output → prompt/completion → question/answer
-    if "messages" in row and isinstance(row["messages"], list):
-        msgs = row["messages"]
-        user_msg = next((m.get("content", "") for m in msgs if m.get("role") == "user"), "")
-        asst_msg = next((m.get("content", "") for m in msgs if m.get("role") == "assistant"), "")
-        sys_msg  = next((m.get("content", "") for m in msgs if m.get("role") == "system"),
-                        "You are a helpful strategic game-playing assistant.")
-        if user_msg and asst_msg:
-            return {"system": sys_msg, "user": user_msg, "assistant": asst_msg}
-
-    pairs = [
-        ("instruction", "output"),
-        ("prompt",       "completion"),
-        ("question",     "answer"),
-        ("input",        "output"),
-        ("observation",  "action"),
-    ]
-    for user_key, asst_key in pairs:
-        u = row.get(user_key, "")
-        a = row.get(asst_key, "")
-        if u and a:
-            return {
-                "system":    "You are a helpful strategic game-playing assistant.",
-                "user":      u,
-                "assistant": a,
-            }
-    return None
-
-
-GAME_MAPPERS = {
-    "gin_rummy":    _map_gin_rummy,
-    "poker":        _map_poker,
-    "textarena":    _map_textarena,
-    "boardgame_qa": _map_boardgame_qa,
-    "generic":      _map_generic,
-    "env_generic":  _map_generic,
+GAME_HINT_PROMPTS = {
+    "liars_dice": LIARS_DICE_HINT_PROMPT,
+    "leduc_poker": LEDUC_POKER_HINT_PROMPT,
+    "gin_rummy": GIN_RUMMY_HINT_PROMPT,
 }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Dataset loading & tokenization
-# ──────────────────────────────────────────────────────────────────────────────
+LIARS_DICE_SYSTEM_PROMPT = (
+    'You are playing liars_dice.\n\n# Game Rules\nLIAR\'S DICE RULES:\n\n'
+    'Setup: Each player has N dice (1-5 depending on variant). All players roll their dice secretly.\n\n'
+    'Goal: Make bids about total dice across ALL players, or call "Liar" on opponent\'s bid.\n\n'
+    'Actions:\n- Bid (quantity, face): Claim there are at least \'quantity\' dice showing \'face\' among all dice.\n'
+    '- Call Liar: Challenge the previous bid.\n\n'
+    'Bidding rules: Each bid must be higher than the previous bid. "Higher" means:\n'
+    '  - Same face value but higher quantity (e.g., "2 fours" beats "1 four")\n'
+    '  - Same quantity but higher face value (e.g., "2 fives" beats "2 fours")\n\n'
+    'Wild dice: 6s are WILD and count as ANY face value.\n'
+    '- When counting dice for a bid, include 6s in the count\n'
+    '- Example: Bid "3 fours" means at least 3 dice showing EITHER 4 OR 6\n\n'
+    'Winning: If you call Liar and previous bid was false, opponent loses. If bid was true or exact, you lose.\n\n\n\n'
+    '# Output Format\nYou must respond with ONLY the action ID (a single number).\n'
+    'Do NOT include descriptions or explanations.\n\n'
+    'Examples:\n- For action "0 -> roll": respond "0"\n- For action "89 -> a3": respond "89"'
+)
 
-def _load_hf_dataset(dataset_id: str, split: str, max_samples: int):
-    """Load dataset dari HuggingFace. Raise DatasetNotAvailableError jika gagal."""
-    try:
-        from datasets import load_dataset
-    except ImportError as e:
-        raise DatasetNotAvailableError(f"Package 'datasets' tidak tersedia: {e}") from e
+LEDUC_POKER_SYSTEM_PROMPT = (
+    "You are playing leduc_poker.\n\n"
+    "# Game Rules\n"
+    "LEDUC POKER RULES:\n\n"
+    "Deck: 2 suits × (num_players + 1) ranks. For 2 players: 6 cards (J♠ J♥ Q♠ Q♥ K♠ K♥).\n\n"
+    "Setup: Each player starts with 100 chips, pays 1 ante. Two rounds of betting.\n\n"
+    "Round 1: Each player receives one private card. Actions: Fold (lose ante), Call/Check "
+    "(match current bet), Raise (add 2 chips to bet). Maximum 2 raises per round.\n"
+    "Round 2: One public card is revealed. Same actions, but Raise adds 4 chips.\n\n"
+    "Winning: Player with best hand wins pot (or last remaining if others fold).\n"
+    "Hand ranking (high to low): Pair (private + public match) > High card value (K > Q > J).\n\n\n\n"
+    "# Output Format\n"
+    "You must respond with ONLY the action ID (a single number).\n"
+    "Do NOT include descriptions or explanations.\n\n"
+    "Examples:\n"
+    '- For action "0 -> Fold": respond "0"\n'
+    '- For action "2 -> Raise": respond "2"'
+)
 
-    print(f"[SFT] Loading dataset: {dataset_id} (split={split})", flush=True)
+GIN_RUMMY_SYSTEM_PROMPT = (
+    "You are playing gin_rummy.\n\n# Game Rules\nGIN RUMMY RULES:\n\n"
+    "SETUP:\n- 52-card deck, each player receives 7-10 cards (variant dependent)\n"
+    "- Goal: Form MELDS to minimize DEADWOOD (unmelded cards)\n\n"
+    "MELDS (Valid Combinations):\n"
+    "1. SET: 3+ cards of SAME RANK (e.g., 7♠ 7♥ 7♣)\n"
+    "2. RUN: 3+ CONSECUTIVE cards of SAME SUIT (e.g., 5♦ 6♦ 7♦)\n"
+    "Examples:\n- Valid runs: A♠-2♠-3♠, 9♥-10♥-J♥-Q♥, 10♣-J♣-Q♣-K♣\n"
+    "- Invalid: K♠-A♠-2♠ (Ace is LOW only, not wraparound)\n\n"
+    "CARD NOTATION:\n- Ranks: A(Ace), 2-9, T(10), J(Jack), Q(Queen), K(King)\n"
+    "- Suits: s(♠), h(♥), d(♦), c(♣)\n"
+    "- Example: 7c = 7 of clubs, Th = 10 of hearts, As = Ace of spades\n\n"
+    "GAME PHASES:\n"
+    "1. FirstUpcard: 52=Draw upcard, 54=Pass\n"
+    "2. Draw: 52=Draw upcard, 53=Draw stock\n"
+    "3. Discard: action ID = card index (shown in Legal Actions)\n"
+    "4. Layoff: card indices or 54=Pass\n"
+    "5. Knock: declare end when deadwood ≤ knock_card\n\n"
+    "EACH TURN:\n1. DRAW: stock (53) or upcard (52)\n"
+    "2. DISCARD: choose a card by action ID\n\n"
+    "KNOCKING:\n- Gin: 0 deadwood = 25-point bonus\n\n"
+    "SCORING: Winner scores difference in deadwood.\n"
+    "Card Values: A=1, 2-10=face value, J=11, Q=12, K=13\n\n"
+    "IMPORTANT: Always respond with the action ID number ONLY, never card names.\n\n"
+    "# Output Format\nYou must respond with ONLY the action ID (a single number).\n"
+    "Do NOT include descriptions or explanations.\n\n"
+    'Examples:\n- For action "0 -> roll": respond "0"\n- For action "89 -> a3": respond "89"'
+)
+
+# All 3 prompts verbatim from scripts/envs/<game>_env.py base prompt (no hints).
+# At inference, env may add _HINT_PROMPT but base is the safe minimum overlap.
+GAME_SYSTEM_PROMPTS = {
+    "liars_dice": LIARS_DICE_SYSTEM_PROMPT,
+    "leduc_poker": LEDUC_POKER_SYSTEM_PROMPT,
+    "gin_rummy": GIN_RUMMY_SYSTEM_PROMPT,
+}
+
+
+# === Chat templates with {% generation %} markers for assistant_only_loss ===
+# Default templates per model family lack generation markers; TRL silently
+# disables AOL. We detect the family and replace with a minimal compatible
+# template that includes markers so AOL works correctly.
+#
+# Coverage of 9-model tournament lineup:
+#   - Qwen2.5/Qwen3 (ChatML): 5 of 9 models
+#   - Mistral-7B / CodeLlama-7B ([INST]): 2 of 9 models
+#   - Llama-3-8B (special header tags): 1 of 9 models
+#   - Other 7B (varies)
+
+CHATML_TEMPLATE_WITH_GENERATION = (
+    "{% for message in messages %}"
+    "{% if message['role'] == 'system' %}"
+    "<|im_start|>system\n{{ message['content'] }}<|im_end|>\n"
+    "{% elif message['role'] == 'user' %}"
+    "<|im_start|>user\n{{ message['content'] }}<|im_end|>\n"
+    "{% elif message['role'] == 'assistant' %}"
+    "<|im_start|>assistant\n{% generation %}{{ message['content'] }}{% endgeneration %}<|im_end|>\n"
+    "{% endif %}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+)
+
+# Mistral [INST]/[/INST] family (Mistral-7B-Instruct, CodeLlama-Instruct).
+# System message prepended as a separate [INST] turn with "Understood." reply
+# to maintain pair structure. Not Mistral's native convention but works for
+# SFT loss computation since generation markers wrap assistant content.
+MISTRAL_INST_TEMPLATE_WITH_GENERATION = (
+    "{{ bos_token }}"
+    "{% for message in messages %}"
+    "{% if message['role'] == 'system' %}"
+    "[INST] {{ message['content'] }} [/INST] Understood.{{ eos_token }}"
+    "{% elif message['role'] == 'user' %}"
+    "[INST] {{ message['content'] }} [/INST]"
+    "{% elif message['role'] == 'assistant' %}"
+    " {% generation %}{{ message['content'] }}{% endgeneration %}{{ eos_token }}"
+    "{% endif %}"
+    "{% endfor %}"
+)
+
+# Llama-3 special header tags (Llama-3-8B-Instruct, Llama-3.1, Llama-3.2).
+LLAMA3_TEMPLATE_WITH_GENERATION = (
+    "<|begin_of_text|>"
+    "{% for message in messages %}"
+    "{% if message['role'] == 'system' %}"
+    "<|start_header_id|>system<|end_header_id|>\n\n{{ message['content'] }}<|eot_id|>"
+    "{% elif message['role'] == 'user' %}"
+    "<|start_header_id|>user<|end_header_id|>\n\n{{ message['content'] }}<|eot_id|>"
+    "{% elif message['role'] == 'assistant' %}"
+    "<|start_header_id|>assistant<|end_header_id|>\n\n"
+    "{% generation %}{{ message['content'] }}{% endgeneration %}<|eot_id|>"
+    "{% endif %}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}<|start_header_id|>assistant<|end_header_id|>\n\n{% endif %}"
+)
+
+
+def _try_patch_chat_template(tokenizer) -> tuple[bool, str]:
+    """Inject {% generation %} markers based on detected template family.
+
+    Returns (supports_aol, family) tuple.
+    family ∈ {"chatml", "mistral", "llama3", "unknown", "preexisting"}
+    """
+    tmpl = tokenizer.chat_template or ""
+
+    # Already has markers? Use existing template as-is.
+    if "{% generation %}" in tmpl or "{%- generation %}" in tmpl:
+        return True, "preexisting"
+
+    # ChatML (Qwen2/Qwen2.5/Qwen3/Yi/etc)
+    if "<|im_start|>" in tmpl and "<|im_end|>" in tmpl:
+        tokenizer.chat_template = CHATML_TEMPLATE_WITH_GENERATION
+        return True, "chatml"
+
+    # Llama-3 (header_id tags) — check before Mistral since Llama-3 may include [INST] strings in some variants
+    if "<|start_header_id|>" in tmpl and "<|end_header_id|>" in tmpl:
+        tokenizer.chat_template = LLAMA3_TEMPLATE_WITH_GENERATION
+        return True, "llama3"
+
+    # Mistral / CodeLlama [INST]/[/INST]
+    if "[INST]" in tmpl and "[/INST]" in tmpl:
+        tokenizer.chat_template = MISTRAL_INST_TEMPLATE_WITH_GENERATION
+        return True, "mistral"
+
+    return False, "unknown"
+
+
+def _strip_thought_prefix(content: str) -> str:
+    """Extract action ID from 'Thought: ... Action: N' format.
+
+    Mirrors env parser at scripts/envs/liar_dice_env.py:455-456:
+    if 'Action:' in completion: completion.split('Action:')[-1].strip()
+
+    Training data format: 'Thought:\\n<reasoning>\\n\\nAction:\\n<id>'
+    Env system prompt: 'respond with ONLY the action ID (a single number)'
+    Strip the Thought prefix so SFT teaches the format the validator expects.
+    """
+    if "Action:" in content:
+        return content.split("Action:")[-1].strip()
+    return content.strip()
+
+
+@dataclass
+class TrainingArguments(SFTConfig):
+    request_path: Optional[str] = field(default=None)
+    use_liger: Optional[bool] = field(default=False)
+    environment_name: Optional[str] = field(default=None)
+
+
+class TimeBudgetCallback(TrainerCallback):
+    """Hard-stop training when wall-clock budget exceeded."""
+
+    def __init__(self, budget_seconds: float):
+        self.budget_seconds = budget_seconds
+        self._start: Optional[float] = None
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self._start = time.time()
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self._start is None:
+            return control
+        if time.time() - self._start > self.budget_seconds:
+            log_info(
+                f"[full_sft] time budget {self.budget_seconds:.0f}s reached at "
+                f"step {state.global_step}; stopping"
+            )
+            control.should_training_stop = True
+        return control
+
+
+def _direct_download(repo: str, target_dir: str, target_root: str) -> bool:
+    target = Path(target_root) / target_dir
+    if target.exists() and any(target.iterdir()):
+        log_info(f"[full_sft] dataset cached at {target}")
+        return True
+    target.mkdir(parents=True, exist_ok=True)
     try:
-        ds = load_dataset(dataset_id, split=split, trust_remote_code=True)
+        from huggingface_hub import snapshot_download
+
+        token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+        snapshot_download(
+            repo_id=repo,
+            repo_type="dataset",
+            local_dir=str(target),
+            token=token,
+        )
+        log_info(f"[full_sft] direct-downloaded {repo} -> {target}")
+        return True
     except Exception as exc:
-        raise DatasetNotAvailableError(
-            f"Gagal load dataset {dataset_id!r}: {exc}"
-        ) from exc
-
-    if ds is None or len(ds) == 0:
-        raise DatasetNotAvailableError(f"Dataset {dataset_id!r} kosong (0 rows).")
-
-    if max_samples > 0 and len(ds) > max_samples:
-        ds = ds.select(range(max_samples))
-
-    print(f"[SFT] Dataset loaded: {len(ds)} rows.", flush=True)
-    return ds
+        log_info(f"[full_sft] download {repo} failed: {exc}")
+        return False
 
 
-def _build_text_field(row: dict, game: str, tokenizer) -> str | None:
-    """Konversi satu row ke string teks siap tokenize (dengan chat template)."""
-    mapper = GAME_MAPPERS.get(game, _map_generic)
-    mapped = mapper(row)
-    if mapped is None:
-        return None
+def _resolve_dataset_root() -> str:
+    miner_dir = os.getenv("MINER_DATASETS_DIR")
+    miner_list = os.getenv("MINER_DATASETS", "")
+    if miner_dir and ENV_TRAINING_DATASET_DIR in miner_list:
+        return miner_dir
+    log_info("[full_sft] MINER_DATASETS_DIR not set; using fallback download")
+    Path(FALLBACK_CACHE_DIR).mkdir(parents=True, exist_ok=True)
+    return FALLBACK_CACHE_DIR
 
-    messages = [
-        {"role": "system",    "content": mapped["system"]},
-        {"role": "user",      "content": mapped["user"]},
-        {"role": "assistant", "content": mapped["assistant"]},
-    ]
-    try:
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=False,
+
+def _load_env_training(root: str, target_game: str) -> Optional[Dataset]:
+    """Load env_training data. Prefer pre-generated CoT-augmented JSONL if present.
+
+    Augmented data path: scripts/data/augmented/env_training_<game>_cot.jsonl
+    Generated by scripts/synthetic_data/generate_rationales.py (offline).
+
+    If augmented file exists AND env var USE_AUGMENTED_DATA != "0", uses that
+    (Phase 1: CoT rationale augmentation per Distilling Step-by-Step). Else
+    falls back to standard HF dataset.
+    """
+    augmented_path = Path(__file__).parent / "data" / "augmented" / f"env_training_{target_game}_cot.jsonl"
+    use_augmented = augmented_path.exists() and os.getenv("USE_AUGMENTED_DATA", "1") != "0"
+
+    if use_augmented:
+        log_info(f"[full_sft] CoT-augmented data found at {augmented_path}, using it (USE_AUGMENTED_DATA=1)")
+        try:
+            ds = load_dataset("json", data_files=str(augmented_path), split="train")
+            log_info(f"[full_sft] augmented dataset loaded: {len(ds)} samples")
+            strip_thought = False
+        except Exception as exc:
+            log_info(f"[full_sft] augmented load failed: {exc}; falling back to standard HF dataset")
+            use_augmented = False
+
+    if not use_augmented:
+        if not _direct_download(ENV_TRAINING_DATASET_REPO, ENV_TRAINING_DATASET_DIR, root):
+            return None
+        try:
+            ds = load_dataset(str(Path(root) / ENV_TRAINING_DATASET_DIR), split="train")
+        except Exception as exc:
+            log_info(f"[full_sft] env_training load failed: {exc}")
+            return None
+        n0 = len(ds)
+        ds = ds.filter(lambda r: r.get("game") == target_game)
+        n1 = len(ds)
+
+        # Point #1 — Outcome-weighted oversampling instead of hard filter.
+        # Previously: filter to win+draw only (drops loss samples entirely).
+        # Now: keep ALL outcomes, oversample by weight to bias training toward
+        # high-quality demonstrations while still extracting state-coverage
+        # signal from loss trajectories.
+        outcome_counts = {}
+        for row in ds:
+            oc = row.get("outcome", "unknown")
+            outcome_counts[oc] = outcome_counts.get(oc, 0) + 1
+        log_info(f"[full_sft] outcome distribution (pre-weighting): {outcome_counts}")
+
+        weighted_parts = []
+        for outcome, weight in OUTCOME_WEIGHTS.items():
+            subset = ds.filter(lambda r, o=outcome: r.get("outcome") == o)
+            if len(subset) == 0:
+                continue
+            for _ in range(weight):
+                weighted_parts.append(subset)
+
+        if not weighted_parts:
+            log_info(f"[full_sft] no samples matched any of {list(OUTCOME_WEIGHTS)}; aborting")
+            return None
+        ds = concatenate_datasets(weighted_parts)
+        n2 = len(ds)
+        log_info(
+            f"[full_sft] env_training: {n0} -> {n1} (game={target_game}) -> "
+            f"{n2} (outcome-weighted oversampling: {OUTCOME_WEIGHTS})"
         )
-        return text
-    except Exception:
-        # Fallback: manual format kalau model tidak punya chat template
-        text = (
-            f"<|system|>{mapped['system']}<|end|>\n"
-            f"<|user|>{mapped['user']}<|end|>\n"
-            f"<|assistant|>{mapped['assistant']}<|end|>"
-        )
-        return text
+        strip_thought = True
 
+    # Tier 1 — Curriculum data ordering: sort by num_turns ascending (easy first).
+    # Mirrors GRPO's max_turn ↑ scheduler, but as static dataset ordering.
+    if "num_turns" in ds.column_names:
+        ds = ds.sort("num_turns")
+        log_info(f"[full_sft] sorted samples by num_turns ascending (curriculum)")
 
-def prepare_sft_dataset(dataset_id: str, game: str, tokenizer, split: str, max_samples: int):
-    """Load + map + tokenize dataset, return HuggingFace Dataset dengan field 'text'."""
-    from datasets import Dataset as HFDataset
+    # Tier 1 — Hint randomization (50%) + multi-prompt diversity (25% concise suffix).
+    # Deterministic per-index for reproducibility. Combined: 4 system-prompt
+    # variants distributed roughly 25% each across the dataset.
+    columns_to_remove = ds.column_names
 
-    raw_ds = _load_hf_dataset(dataset_id, split, max_samples)
-
-    texts = []
-    skipped = 0
-    for row in raw_ds:
-        text = _build_text_field(dict(row), game, tokenizer)
-        if text:
-            texts.append({"text": text})
-        else:
-            skipped += 1
-
-    print(f"[SFT] Mapped: {len(texts)} valid, {skipped} skipped.", flush=True)
-
-    if len(texts) == 0:
-        raise DatasetNotAvailableError(
-            f"Semua {len(raw_ds)} row dari {dataset_id!r} gagal di-map (field tidak dikenali)."
+    def _map_fn(row, idx):
+        add_hint = (idx % 2 == 0)              # 50% with hint
+        add_concise = (idx % 4 < 2)            # 50% with concise suffix
+        return _sharegpt_to_messages(
+            row,
+            target_game=target_game,
+            add_hint=add_hint,
+            add_concise_suffix=add_concise,
+            strip_thought=strip_thought,
         )
 
-    # Split train/dev (90/10)
-    n_dev   = min(200, max(10, len(texts) // 10))
-    dev_ds  = HFDataset.from_list(texts[:n_dev])
-    train_ds = HFDataset.from_list(texts[n_dev:])
-    print(f"[SFT] train={len(train_ds)}, dev={len(dev_ds)}", flush=True)
-    return train_ds, dev_ds
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Model loading
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _load_model(model_path: str, use_lora: bool, disable_fa: bool):
-    attn_impl  = "eager" if disable_fa else "flash_attention_2"
-    local      = _is_local_path(model_path)
-    base = transformers.AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch.bfloat16,
-        attn_implementation=attn_impl,
-        local_files_only=local,
+    log_info(
+        f"[full_sft] applying Tier 1 augmentations: hint randomization (50%), "
+        f"concise-suffix variant (50%) — 4 system-prompt variants total "
+        f"(strip_thought={strip_thought})"
     )
-    base.config.use_cache = False
-
-    if use_lora:
-        from peft import get_peft_model
-        lora_cfg = LoraConfig(
-            r=32,
-            lora_alpha=64,
-            target_modules="all-linear",
-            lora_dropout=0.05,
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-        model = get_peft_model(base, lora_cfg)
-        model.print_trainable_parameters()
-        return model
-
-    return base
+    return ds.map(_map_fn, with_indices=True, remove_columns=columns_to_remove)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Entry point (dipanggil oleh text_trainer.py via subprocess)
-# ──────────────────────────────────────────────────────────────────────────────
+def _load_boardgame_qa(root: str) -> Optional[Dataset]:
+    if not _direct_download(BOARDGAME_QA_REPO, BOARDGAME_QA_DIR, root):
+        return None
+    try:
+        ds = load_dataset(str(Path(root) / BOARDGAME_QA_DIR), split="train")
+    except Exception as exc:
+        log_info(f"[full_sft] Boardgame-QA load failed: {exc}")
+        return None
+    log_info(f"[full_sft] Boardgame-QA loaded: {len(ds)} samples; columns={ds.column_names}")
+    return ds.map(_qa_to_messages, remove_columns=ds.column_names)
+
+
+def _sharegpt_to_messages(
+    row: dict,
+    target_game: str = None,
+    add_hint: bool = False,
+    add_concise_suffix: bool = False,
+    strip_thought: bool = True,
+) -> dict:
+    """Convert ShareGPT format to messages, with alignment + diversity fixes:
+
+    Fix 2: prepend env's system prompt to match validator inference distribution.
+    Fix 3 (conditional): strip 'Thought:' reasoning prefix from assistant turns.
+        - strip_thought=True for original env_training_gradients (default).
+        - strip_thought=False for CoT-augmented data (we WANT the rationale).
+
+    Tier 1 enhancements (port GRPO mechanisms):
+    - add_hint: append _HINT_PROMPT to system (mirrors GRPO use_hints toggle)
+    - add_concise_suffix: append "Be precise..." reminder (multi-prompt diversity)
+    """
+    role_map = {"user": "user", "human": "user", "assistant": "assistant", "gpt": "assistant", "system": "system"}
+    msgs = []
+
+    # Fix 2 + Tier 1 hint randomization: build system prompt with optional hint
+    if target_game and target_game in GAME_SYSTEM_PROMPTS:
+        sys_content = GAME_SYSTEM_PROMPTS[target_game]
+        if add_hint and target_game in GAME_HINT_PROMPTS:
+            sys_content = sys_content + GAME_HINT_PROMPTS[target_game]
+        if add_concise_suffix:
+            sys_content = sys_content + "\n\nBe precise and concise. Output only the action ID."
+        msgs.append({"role": "system", "content": sys_content})
+
+    for turn in row.get("conversations") or []:
+        role = role_map.get(str(turn.get("from", "")).lower(), "user")
+        content = turn.get("value", "")
+        # Fix 3: strip Thought reasoning from assistant — keep action ID only.
+        # Skipped for CoT-augmented data (rationale is the point).
+        if role == "assistant" and strip_thought:
+            content = _strip_thought_prefix(content)
+        msgs.append({"role": role, "content": content})
+
+    return {"messages": msgs}
+
+
+def _qa_to_messages(row: dict) -> dict:
+    """Adapt Boardgame-QA rows to messages format.
+
+    Boardgame-QA schema (verified 2026-05-03):
+      theory, facts, rules, preferences, goal -> prompt
+      proof, label -> response
+    """
+    if "goal" in row and "label" in row:
+        prompt_parts = []
+        if row.get("theory"):
+            prompt_parts.append(f"Theory:\n{row['theory']}")
+        if row.get("facts"):
+            prompt_parts.append(f"Facts:\n{row['facts']}")
+        if row.get("rules"):
+            prompt_parts.append(f"Rules:\n{row['rules']}")
+        if row.get("preferences"):
+            prompt_parts.append(f"Preferences:\n{row['preferences']}")
+        prompt_parts.append(f"Question: {row['goal']}")
+        user_content = "\n\n".join(prompt_parts)
+
+        response_parts = []
+        if row.get("proof"):
+            response_parts.append(f"Proof:\n{row['proof']}")
+        response_parts.append(f"Answer: {row['label']}")
+        assistant_content = "\n\n".join(response_parts)
+
+        return {
+            "messages": [
+                {"role": "user", "content": user_content},
+                {"role": "assistant", "content": assistant_content},
+            ]
+        }
+
+    # Generic fallback for other Q/A schemas
+    question = (
+        row.get("question")
+        or row.get("input")
+        or row.get("prompt")
+        or row.get("instruction")
+        or ""
+    )
+    answer = (
+        row.get("answer")
+        or row.get("output")
+        or row.get("response")
+        or row.get("completion")
+        or ""
+    )
+    return {
+        "messages": [
+            {"role": "user", "content": str(question)},
+            {"role": "assistant", "content": str(answer)},
+        ]
+    }
+
+
+def _interleave_5050(env_ds: Dataset, qa_ds: Dataset, seed: int = 42) -> Dataset:
+    """Interleave env_training and Boardgame-QA roughly 50/50 per batch.
+
+    Uses datasets.interleave_datasets with stopping_strategy='all_exhausted'
+    so model sees full coverage of both. env_training (smaller) gets resampled.
+    """
+    from datasets import interleave_datasets
+
+    return interleave_datasets(
+        [env_ds, qa_ds],
+        probabilities=[0.5, 0.5],
+        seed=seed,
+        stopping_strategy="all_exhausted",
+    )
+
 
 def main():
-    """Run SFT warm-start training."""
-    argument_parser = transformers.HfArgumentParser((SftEnvArguments,))
-    (args,) = argument_parser.parse_args_into_dataclasses()
-
-    # ── Load train_request ──
-    if not args.request_path or not os.path.exists(args.request_path):
-        raise FileNotFoundError(f"request_path tidak ditemukan: {args.request_path!r}")
-
-    with open(args.request_path) as f:
-        train_info_full = json.load(f)
-    train_request = train_info_full.get("train_request", train_info_full)
-
-    model_path     = _resolve_model_path(train_request["model_path"])
-    dataset_id     = args.sft_dataset_id or train_request.get("sft_dataset_id", "")
-    game           = train_request.get("sft_game", "generic")
-
-    if not dataset_id:
-        raise DatasetNotAvailableError("Tidak ada sft_dataset_id di args maupun train_request.")
-
-    # ── Tokenizer ──
-    _local = _is_local_path(model_path)
-    tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=_local)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    print(f"[SFT] Tokenizer: {model_path} (local={_local}), pad={tokenizer.pad_token!r}", flush=True)
-
-    # ── Dataset (akan raise DatasetNotAvailableError jika gagal) ──
-    train_ds, dev_ds = prepare_sft_dataset(
-        dataset_id=dataset_id,
-        game=game,
-        tokenizer=tokenizer,
-        split=args.sft_dataset_split,
-        max_samples=args.max_sft_samples,
-    )
-
-    # ── Model ──
-    model = _load_model(model_path, args.use_lora, args.disable_fa)
-
-    # ── SFTTrainer (TRL) ──
+    print("--------------------------------")
+    print("FULL SFT TRAINING (no GRPO)")
+    print("--------------------------------")
     try:
-        from trl import SFTTrainer, SFTConfig
-        print("[SFT] Using TRL SFTTrainer.", flush=True)
+        argument_parser = transformers.HfArgumentParser((TrainingArguments, ModelConfig))
+        training_args, model_args = argument_parser.parse_args_into_dataclasses()
 
-        sft_config = SFTConfig(
-            output_dir=args.output_dir,
-            num_train_epochs=args.num_train_epochs,
-            per_device_train_batch_size=args.per_device_train_batch_size,
-            per_device_eval_batch_size=1,
-            gradient_accumulation_steps=args.gradient_accumulation_steps,
-            learning_rate=args.learning_rate,
-            lr_scheduler_type="cosine",
-            warmup_steps=20,
-            weight_decay=0.01,
-            bf16=True,
-            tf32=True,
-            logging_steps=10,
-            save_strategy="no",
-            eval_strategy="no",
-            gradient_checkpointing=args.gradient_checkpointing,
-            optim=args.optim if args.optim else "adamw_torch",
-            report_to=args.report_to if args.report_to else "none",
-            dataset_text_field="text",
-            max_seq_length=2048,
-            packing=True,         # SFTTrainer mendukung packing langsung
+        train_info = json.load(open(training_args.request_path, "r"))
+        train_request = train_info["train_request"]
+        budget_min = float(train_request.get("budget_min", DEFAULT_BUDGET_MIN))
+
+        tokenizer = AutoTokenizer.from_pretrained(train_request["model_path"])
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        # Fix 1: patch chat template with {% generation %} markers per-family.
+        # Now supports ChatML (Qwen), Mistral [INST], Llama-3 header_id formats.
+        supports_aol, tmpl_family = _try_patch_chat_template(tokenizer)
+        if not supports_aol and training_args.assistant_only_loss:
+            if is_main_process(LOCAL_RANK):
+                log_info(
+                    f"[full_sft] WARNING: chat_template family unknown ({tmpl_family}); "
+                    "disabling assistant_only_loss to avoid TRL crash. Model will train "
+                    "on user tokens too (suboptimal but functional)."
+                )
+            training_args.assistant_only_loss = False
+        elif supports_aol and is_main_process(LOCAL_RANK):
+            log_info(
+                f"[full_sft] chat_template patched with generation markers (family={tmpl_family}) — "
+                "assistant_only_loss=True will mask user tokens correctly"
+            )
+
+        quantization_config = get_quantization_config(model_args)
+        device_string = "cuda:" + str(LOCAL_RANK)
+        device_map = (
+            get_kbit_device_map()
+            if quantization_config is not None
+            else {"": device_string}
+        )
+        if len(training_args.fsdp) > 0 or is_deepspeed_zero3_enabled():
+            device_map = None
+
+        model_kwargs = dict(
+            revision=model_args.model_revision,
+            attn_implementation="flash_attention_2",
+            torch_dtype=torch.bfloat16,
+            use_cache=False if training_args.gradient_checkpointing else True,
+            device_map=device_map,
+            quantization_config=quantization_config,
         )
 
-        trainer = SFTTrainer(
-            model=model,
-            tokenizer=tokenizer,
-            args=sft_config,
-            train_dataset=train_ds,
-            eval_dataset=dev_ds,
-        )
+        log_info(f"[full_sft] training_args: {training_args}")
 
-    except ImportError:
-        # Fallback ke bare HF Trainer kalau TRL belum terinstall
-        print("[SFT] TRL tidak tersedia, pakai HF Trainer fallback.", flush=True)
-        from transformers import Trainer
-        from torch.nn.utils.rnn import pad_sequence
-        import functools
+        if training_args.use_liger:
+            from liger_kernel.transformers import AutoLigerKernelForCausalLM
+            model_class = AutoLigerKernelForCausalLM
+        else:
+            model_class = transformers.AutoModelForCausalLM
 
-        def _collate(batch, pad_id):
-            from transformers import DataCollatorForSeq2Seq
-            # Tokenize on-the-fly
-            enc_list = [tokenizer(b["text"], truncation=True, max_length=2048) for b in batch]
-            ids = pad_sequence([torch.tensor(e["input_ids"]) for e in enc_list], True, pad_id)
-            mask = pad_sequence([torch.tensor(e["attention_mask"]) for e in enc_list], True, 0)
-            return {"input_ids": ids, "attention_mask": mask, "labels": ids.clone()}
+        model = model_class.from_pretrained(train_request["model_path"], **model_kwargs)
 
-        collate_fn = functools.partial(_collate, pad_id=tokenizer.pad_token_id)
+        peft_config = get_peft_config(model_args)
+        if "lora_model" in train_request:
+            model = PeftModelForCausalLM.from_pretrained(
+                model, train_request["lora_model"], is_trainable=True, **model_kwargs
+            )
+        elif peft_config is not None:
+            # CRITICAL: pre-wrap model so adapter persists across Phase 1 → Phase 2.
+            # Otherwise SFTTrainer wraps internally but outer `model` variable stays
+            # unwrapped, making Phase 2 train the BASE model (full FT) instead of LoRA.
+            model = get_peft_model(model, peft_config)
+            if is_main_process(LOCAL_RANK):
+                log_info("[full_sft] Pre-wrapped model with PEFT (LoRA r=64) — "
+                         "adapter shared across Phase 1 → Phase 2")
 
         if is_main_process(LOCAL_RANK):
-            os.makedirs(args.output_dir, exist_ok=True)
+            os.makedirs(training_args.output_dir, exist_ok=True)
+            log_info(f"[full_sft] Created output directory: {training_args.output_dir}")
 
-        trainer = Trainer(
-            model=model,
-            tokenizer=tokenizer,
-            args=args,
-            train_dataset=train_ds,
-            eval_dataset=dev_ds,
-            data_collator=collate_fn,
+        # Load datasets — single-game env (282 LD/LP/GR win-draw) + QA subset (500 of 15K)
+        root = _resolve_dataset_root()
+        target_game = training_args.environment_name or "liars_dice"
+        env_ds = _load_env_training(root, target_game=target_game)
+        if env_ds is None:
+            raise RuntimeError(f"[full_sft] env_training unavailable for game={target_game}; aborting")
+
+        qa_full = _load_boardgame_qa(root)
+        qa_subset = None
+        if qa_full is not None:
+            phase1_n = min(500, len(qa_full))
+            qa_subset = qa_full.shuffle(seed=42).select(range(phase1_n))
+            log_info(f"[full_sft] Phase 1 QA subset: {phase1_n} from {len(qa_full)}")
+        else:
+            log_info("[full_sft] Boardgame-QA unavailable — skipping Phase 1 warm-up")
+
+        # === PHASE 1: Boardgame-QA warm-up (gentle, brief) ===
+        if qa_subset is not None:
+            phase1_args = copy.deepcopy(training_args)
+            phase1_args.learning_rate = 5e-6
+            phase1_args.num_train_epochs = 1
+            phase1_args.warmup_ratio = 0.1
+            phase1_args.warmup_steps = 0
+            phase1_args.neftune_noise_alpha = None
+            phase1_args.output_dir = os.path.join(training_args.output_dir, "phase1")
+            phase1_args.report_to = []  # avoid duplicate wandb run init
+            # phase1_args.assistant_only_loss inherits from training_args (already detected)
+            if is_main_process(LOCAL_RANK):
+                os.makedirs(phase1_args.output_dir, exist_ok=True)
+
+            log_info(
+                f"[full_sft] Phase 1 START — n={len(qa_subset)} epoch=1 lr=5e-6 "
+                f"(QA warm-up, gentle)"
+            )
+            trainer1 = SFTTrainer(
+                model=model,
+                processing_class=tokenizer,
+                args=phase1_args,
+                train_dataset=qa_subset,
+                peft_config=None,  # model already wrapped with PEFT above
+                callbacks=[TimeBudgetCallback(budget_min * 60.0)],
+            )
+            trainer1.train()
+            log_info("[full_sft] Phase 1 DONE — adapter has QA reasoning warm-up signal")
+
+        # === PHASE 2: env specialize (DOMINANT — same model+adapter, accumulate) ===
+        # training_args.assistant_only_loss already set based on chat template detection
+        log_info(
+            f"[full_sft] Phase 2 START — env={target_game} n={len(env_ds)} "
+            f"epoch={training_args.num_train_epochs} lr={training_args.learning_rate} "
+            f"budget={budget_min}min HARD"
         )
+        trainer2 = SFTTrainer(
+            model=model,
+            processing_class=tokenizer,
+            args=training_args,
+            train_dataset=env_ds,
+            peft_config=None,  # model already wrapped with PEFT above
+            callbacks=[TimeBudgetCallback(budget_min * 60.0)],
+        )
+        trainer2.train()
 
-    # ── Train ──
-    print(f"[SFT] Starting SFT warm-start: dataset={dataset_id}, game={game}", flush=True)
-    trainer.train()
+        if is_main_process(LOCAL_RANK):
+            final_dir = train_request.get("submission_dir", training_args.output_dir)
+            # Save LoRA adapter (NOT merged). Validator eval pipeline detects
+            # adapter_config.json → downloads base from original_model + loads
+            # our adapter via SGLang --enable-lora. Saving merged breaks the
+            # eval volume mount (snapshot symlinks point outside mount root).
+            trainer2.save_model(final_dir)
+            tokenizer.save_pretrained(final_dir)
+            log_info(f"[full_sft] Phase 2 DONE — final LoRA adapter saved to {final_dir}")
 
-    # ── Simpan checkpoint ──
-    if is_main_process(LOCAL_RANK):
-        # Jika LoRA dipakai, merge dulu ke base model sebelum simpan.
-        # Tanpa merge, checkpoint hanya berisi adapter weights dan GRPO
-        # tidak bisa load dengan AutoModelForCausalLM.from_pretrained().
-        _model_to_save = trainer.model
-        if args.use_lora and hasattr(_model_to_save, "merge_and_unload"):
-            print("[SFT] Merging LoRA weights into base model...", flush=True)
-            _model_to_save = _model_to_save.merge_and_unload()
-            print("[SFT] LoRA merge selesai.", flush=True)
+            with open(os.path.join(training_args.output_dir, "success.txt"), "w") as f:
+                f.write("Success")
 
-        print(f"[SFT] Saving checkpoint to: {args.output_dir}", flush=True)
-        _model_to_save.save_pretrained(args.output_dir)
-        tokenizer.save_pretrained(args.output_dir)
-        
-        # Cegah HF Hub fallback (HFValidationError) saat GRPO load checkpoint ini
-        # dengan mencopy SEMUA file penting (terutama tokenizer.model) dari base model
-        import shutil
-        print(f"[DEBUG-SFT] Trying to copy missing files from {model_path} to {args.output_dir}", flush=True)
-        if os.path.isdir(model_path):
-            skip_exts = [".safetensors", ".bin", ".pt", ".msgpack", ".h5"]
-            skip_files = ["config.json", "sft_success.txt"]
-            dir_files = os.listdir(model_path)
-            print(f"[DEBUG-SFT] Found files in source model_path: {dir_files}", flush=True)
-            for fname in dir_files:
-                fpath = os.path.join(model_path, fname)
-                if not os.path.isfile(fpath):
-                    continue
-                if any(fname.endswith(ext) for ext in skip_exts) or fname in skip_files:
-                    continue
-                    
-                dest = os.path.join(args.output_dir, fname)
-                if not os.path.exists(dest):
-                    try:
-                        shutil.copy2(fpath, dest)
-                        print(f"[SFT] Copied {fname} from base model", flush=True)
-                    except Exception as e:
-                        print(f"[SFT] Failed to copy {fname}: {e}", flush=True)
-
-        success_file = os.path.join(args.output_dir, "sft_success.txt")
-        with open(success_file, "w") as f:
-            f.write(f"SFT warm-start completed. dataset={dataset_id}, game={game}")
-        print(f"[SFT] Checkpoint saved to: {args.output_dir}", flush=True)
-
-    print("[SFT] Warm-start training selesai.", flush=True)
+    except Exception as e:
+        import traceback
+        print(f"Error training: {e}")
+        print(traceback.format_exc())
+        raise e
 
 
 if __name__ == "__main__":

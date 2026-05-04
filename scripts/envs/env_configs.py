@@ -80,7 +80,9 @@ from envs.liar_dice_env import (
 )
 
 
+# ---------------------------------------------------------------------------
 # ModeConfig — overrides for a single training mode
+# ---------------------------------------------------------------------------
 
 @dataclass
 class ModeConfig:
@@ -103,7 +105,9 @@ class ModeConfig:
     max_completion_length: int | None = None
 
 
+# ---------------------------------------------------------------------------
 # EnvTrainingConfig — full config for one environment
+# ---------------------------------------------------------------------------
 
 @dataclass
 class EnvTrainingConfig:
@@ -132,7 +136,9 @@ class EnvTrainingConfig:
     full_prompt: ModeConfig = field(default_factory=ModeConfig)
 
 
+# ---------------------------------------------------------------------------
 # Registry
+# ---------------------------------------------------------------------------
 
 _REGISTRY: dict[str, EnvTrainingConfig] = {
     "goof_spiel": EnvTrainingConfig(
@@ -148,9 +154,6 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         rollout_last=_gin_rollout_last,
         reward_func=_gin_reward,
         curriculum_factory=_gin_curriculum,
-        num_generations=8,
-        temperature=2.0,
-        top_k=5,
         reasoning=ModeConfig(initial_max_turn=8),
         no_mask=ModeConfig(initial_max_turn=4, rollouts_per_stage=512),
         full_prompt=ModeConfig(initial_max_turn=8),
@@ -160,16 +163,11 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         rollout_last=_gin_opp_rollout_last,
         reward_func=_gin_opp_reward,
         curriculum_factory=_gin_opp_curriculum,
+        vllm_max_model_length=8192,
         num_generations=8,
-        temperature=2.0,
-        top_k=5,
-        vllm_max_model_length=16384,   # match _MAX_PROMPT_LEN=16128 + buffer
-        # Aggressive curriculum: skip useless early stages, advance every 128 rollouts
-        # With warmup_rollouts=0 (curriculum_factory), max_turn naik dari rollout 128
-        # Reach max_turn=30 in ~1920 rollouts (~30-50 min) instead of NEVER
-        reasoning=ModeConfig(initial_max_turn=15, rollouts_per_stage=128),
-        no_mask=ModeConfig(initial_max_turn=15, rollouts_per_stage=128),
-        full_prompt=ModeConfig(initial_max_turn=15, rollouts_per_stage=128),
+        reasoning=ModeConfig(initial_max_turn=12, rollouts_per_stage=100),
+        no_mask=ModeConfig(initial_max_turn=12, rollouts_per_stage=100),
+        full_prompt=ModeConfig(initial_max_turn=12, rollouts_per_stage=100),
     ),
     "liars_dice": EnvTrainingConfig(
         rollout_full=_liar_rollout_full,
@@ -188,9 +186,9 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         rollout_last=_liar_opp_rollout_last,
         reward_func=_liar_opp_reward,
         curriculum_factory=_liar_opp_curriculum,
-        reasoning=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
-        no_mask=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
-        full_prompt=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
+        reasoning=ModeConfig(rollouts_per_stage=2048, initial_max_turn=2),
+        no_mask=ModeConfig(rollouts_per_stage=2048, initial_max_turn=2),
+        full_prompt=ModeConfig(rollouts_per_stage=2048, initial_max_turn=2),
         num_generations=8,
         temperature=2.0,
         top_k=5,
@@ -209,7 +207,7 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         rollout_last=_leduc_opp_rollout_last,
         reward_func=_leduc_opp_reward,
         curriculum_factory=_leduc_opp_curriculum,
-        num_generations=8,
+        num_generations=4,
         temperature=2.0,
         top_k=5,
     ),
@@ -220,13 +218,16 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
     ),
 }
 
+
+# ---------------------------------------------------------------------------
 # Variant routing
+# ---------------------------------------------------------------------------
 
 # Change this to select a non-default variant for a base environment name.
 _VARIANT_OVERRIDES: dict[str, str] = {
-    "gin_rummy":   "gin_rummy_opponent_modeling",
-    "liars_dice":  "liars_dice_opponent_modeling",
-    "leduc_poker": "leduc_poker_opponent_modeling",
+     "gin_rummy":   "gin_rummy_opponent_modeling",
+     "liars_dice":  "liars_dice_opponent_modeling",
+     "leduc_poker": "leduc_poker_opponent_modeling",
 }
 
 
