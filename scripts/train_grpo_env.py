@@ -698,7 +698,9 @@ def main():
         task_id = train_request["task_id"]
         
         output_dir = training_args.output_dir
-        tokenizer = AutoTokenizer.from_pretrained(train_request["model_path"])
+        _mp = train_request["model_path"]
+        _local_mp = _mp.startswith("/") or _mp.startswith("./") or os.path.isdir(_mp)
+        tokenizer = AutoTokenizer.from_pretrained(_mp, local_files_only=_local_mp)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
@@ -732,7 +734,7 @@ def main():
         else:
             model_class = transformers.AutoModelForCausalLM
 
-        model = model_class.from_pretrained(train_request["model_path"], **model_kwargs)
+        model = model_class.from_pretrained(_mp, local_files_only=_local_mp, **model_kwargs)
 
         # some model need to set the generation config or encounter the invalid generation config error
         set_generation_config(train_request["model_name"], model)
