@@ -129,6 +129,9 @@ docker run --rm --gpus all \
   --env WANDB_TOKEN="$WANDB_TOKEN" \
   --env WANDB_INIT_TIMEOUT=300 \
   --env HF_HUB_ENABLE_HF_TRANSFER=0 \
+  --env GLOO_SOCKET_IFNAME=lo \
+  --env NCCL_IB_DISABLE=1 \
+  --env NCCL_SOCKET_IFNAME=lo \
   --name grpo-text-trainer-example \
   standalone-text-trainer \
   --task-id "$TASK_ID" \
