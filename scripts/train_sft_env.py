@@ -432,6 +432,22 @@ def main():
         print(f"[SFT] Saving checkpoint to: {args.output_dir}", flush=True)
         _model_to_save.save_pretrained(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
+        
+        # Cegah HF Hub fallback (HFValidationError) saat GRPO load checkpoint ini
+        # dengan mencopy file config penting seperti generation_config.json dari base model
+        import shutil
+        import glob
+        if os.path.isdir(model_path):
+            for f in glob.glob(os.path.join(model_path, "*.json")):
+                basename = os.path.basename(f)
+                dest = os.path.join(args.output_dir, basename)
+                if not os.path.exists(dest):
+                    try:
+                        shutil.copy2(f, dest)
+                        print(f"[SFT] Copied {basename} from base model", flush=True)
+                    except Exception as e:
+                        print(f"[SFT] Failed to copy {basename}: {e}", flush=True)
+
         success_file = os.path.join(args.output_dir, "sft_success.txt")
         with open(success_file, "w") as f:
             f.write(f"SFT warm-start completed. dataset={dataset_id}, game={game}")
