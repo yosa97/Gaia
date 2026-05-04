@@ -68,25 +68,44 @@ def resolve_model_path(model_path: str, model_name: str = "") -> str:
     if not model_path or not os.path.isdir(model_path):
         return model_path
 
-    # Cek apakah path ini sudah merupakan model dir (ada config.json)
-    if os.path.exists(os.path.join(model_path, "config.json")):
-        return model_path
+    # Helper function to find actual directory containing config.json
+    def _find_config_dir(base_path: str) -> str:
+        if os.path.exists(os.path.join(base_path, "config.json")):
+            return base_path
+        snapshots_dir = os.path.join(base_path, "snapshots")
+        if os.path.isdir(snapshots_dir):
+            # Ambil snapshot terbaru/pertama yang valid
+            for commit_hash in os.listdir(snapshots_dir):
+                snap_path = os.path.join(snapshots_dir, commit_hash)
+                if os.path.isdir(snap_path) and os.path.exists(os.path.join(snap_path, "config.json")):
+                    return snap_path
+        return None
 
-    # Coba cari subdirektori yang match nama model (format: Org--Name)
+    # Cek apakah path ini sudah merupakan model dir (atau parent dari snapshots)
+    res = _find_config_dir(model_path)
+    if res:
+        return res
+
+    # Coba cari subdirektori yang match nama model (format: Org--Name atau models--Org--Name)
     if model_name:
-        dir_name = model_name.replace("/", "--")
-        candidate = os.path.join(model_path, dir_name)
-        if os.path.isdir(candidate) and os.path.exists(os.path.join(candidate, "config.json")):
-            print(f"[model_utility] Resolved model path: {candidate}", flush=True)
-            return candidate
+        for prefix in ["", "models--"]:
+            dir_name = prefix + model_name.replace("/", "--")
+            candidate = os.path.join(model_path, dir_name)
+            if os.path.isdir(candidate):
+                res = _find_config_dir(candidate)
+                if res:
+                    print(f"[model_utility] Resolved model path: {res}", flush=True)
+                    return res
 
-    # Fallback: ambil subdirektori pertama yang berisi config.json
+    # Fallback: ambil subdirektori pertama yang punya config.json
     try:
         for subdir in sorted(os.listdir(model_path)):
             full = os.path.join(model_path, subdir)
-            if os.path.isdir(full) and os.path.exists(os.path.join(full, "config.json")):
-                print(f"[model_utility] Resolved model path (fallback): {full}", flush=True)
-                return full
+            if os.path.isdir(full):
+                res = _find_config_dir(full)
+                if res:
+                    print(f"[model_utility] Resolved model path (fallback): {res}", flush=True)
+                    return res
     except Exception:
         pass
 
