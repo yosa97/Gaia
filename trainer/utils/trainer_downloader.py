@@ -23,41 +23,47 @@ def download_sft_datasets(datasets_csv: str, datasets_dir: str) -> None:
     """Download whitelisted SFT datasets from HuggingFace Hub.
 
     Reads a comma-separated list of HF dataset repo IDs from ``datasets_csv``
-    and downloads each one into ``datasets_dir`` using snapshot_download.
-    This makes the data available to the trainer container via volume mount
-    so that the SFT cold-start stage in train_grpo_env.py can run.
+    and saves each one to ``{datasets_dir}/{repo_id}/`` using save_to_disk.
+
+    Path convention matches ``_load_sft_datasets`` in train_grpo_env.py which
+    does ``os.path.join(datasets_dir, name)`` — so the folder is the full
+    repo_id including the slash, e.g.
+    ``/cache/miner_datasets/gradients-io-tournaments/env_training_gradients``.
 
     Args:
         datasets_csv: Comma-separated HF dataset repo IDs, e.g.
-                      "gradients-io-tournaments/env_training_gradients".
+                      \"gradients-io-tournaments/env_training_gradients\".
         datasets_dir: Local directory to download datasets into.
     """
+    try:
+        from datasets import load_dataset as _load_dataset
+    except ImportError:
+        print("[SFT-Downloader] 'datasets' package not found, skipping SFT download.", flush=True)
+        return
+
     dataset_list = [d.strip() for d in datasets_csv.split(",") if d.strip()]
     if not dataset_list:
         print("[SFT-Downloader] No MINER_DATASETS specified, skipping SFT dataset download.", flush=True)
         return
 
-    os.makedirs(datasets_dir, exist_ok=True)
     print(f"[SFT-Downloader] Downloading {len(dataset_list)} SFT dataset(s) to: {datasets_dir}", flush=True)
 
     for repo_id in dataset_list:
-        # Use repo_id with '/' → '--' as folder name (same convention as model download)
-        local_dir = os.path.join(datasets_dir, repo_id.replace("/", "--"))
-        if os.path.exists(local_dir) and os.listdir(local_dir):
-            print(f"[SFT-Downloader] Dataset already exists, skipping: {repo_id}", flush=True)
+        # Path must match train_grpo_env.py: os.path.join(datasets_dir, name)
+        # e.g. /cache/miner_datasets/gradients-io-tournaments/env_training_gradients
+        local_dir = os.path.join(datasets_dir, repo_id)
+        if os.path.isdir(local_dir) and os.listdir(local_dir):
+            print(f"[SFT-Downloader] Dataset already cached, skipping: {repo_id}", flush=True)
             continue
         try:
             print(f"[SFT-Downloader] Downloading dataset: {repo_id}", flush=True)
-            snapshot_download(
-                repo_id=repo_id,
-                repo_type="dataset",
-                local_dir=local_dir,
-                local_dir_use_symlinks=False,
-            )
-            print(f"[SFT-Downloader] Done: {repo_id} → {local_dir}", flush=True)
+            os.makedirs(local_dir, exist_ok=True)
+            ds = _load_dataset(repo_id, split="train", trust_remote_code=True)
+            ds.save_to_disk(local_dir)
+            print(f"[SFT-Downloader] ✅ Saved {len(ds)} examples → {local_dir}", flush=True)
         except Exception as exc:
-            # Non-fatal: log and continue — SFT will be skipped if folder is empty
-            print(f"[SFT-Downloader] WARNING: Failed to download {repo_id}: {exc}", flush=True)
+            # Non-fatal: log and continue — SFT will be skipped gracefully if folder is empty
+            print(f"[SFT-Downloader] ⚠️ Failed to download {repo_id}: {exc}", flush=True)
 
 
 async def download_text_dataset(task_id, dataset_url, file_format, dataset_dir):
