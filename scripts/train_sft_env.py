@@ -33,6 +33,28 @@ LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Local path helper — fix HFValidationError di HuggingFace Hub versi baru
+# ──────────────────────────────────────────────────────────────────────────────
+def _is_local_path(path: str) -> bool:
+    """Cek apakah path adalah local filesystem path (bukan HF repo ID)."""
+    return path.startswith("/") or path.startswith("./") or os.path.isdir(path)
+
+
+def _resolve_model_path(path: str) -> str:
+    """Resolve symlink dan kembalikan absolute path untuk local models.
+
+    HuggingFace Hub baru (>=0.24) strict validate repo ID — path lokal
+    dengan banyak '/' akan ditolak. Solusi: deteksi local path dan
+    gunakan os.path.realpath() untuk normalisasi.
+    """
+    if _is_local_path(path):
+        real = os.path.realpath(path)
+        if os.path.isdir(real):
+            return real
+    return path
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Custom exception — ditangkap text_trainer.py untuk skip SFT → langsung GRPO
 # ──────────────────────────────────────────────────────────────────────────────
 class DatasetNotAvailableError(RuntimeError):
@@ -257,11 +279,13 @@ def prepare_sft_dataset(dataset_id: str, game: str, tokenizer, split: str, max_s
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _load_model(model_path: str, use_lora: bool, disable_fa: bool):
-    attn_impl = "eager" if disable_fa else "flash_attention_2"
+    attn_impl  = "eager" if disable_fa else "flash_attention_2"
+    local      = _is_local_path(model_path)
     base = transformers.AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch.bfloat16,
         attn_implementation=attn_impl,
+        local_files_only=local,
     )
     base.config.use_cache = False
 
@@ -299,7 +323,7 @@ def main():
         train_info_full = json.load(f)
     train_request = train_info_full.get("train_request", train_info_full)
 
-    model_path     = train_request["model_path"]
+    model_path     = _resolve_model_path(train_request["model_path"])
     dataset_id     = args.sft_dataset_id or train_request.get("sft_dataset_id", "")
     game           = train_request.get("sft_game", "generic")
 
@@ -307,10 +331,11 @@ def main():
         raise DatasetNotAvailableError("Tidak ada sft_dataset_id di args maupun train_request.")
 
     # ── Tokenizer ──
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    _local = _is_local_path(model_path)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=_local)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    print(f"[SFT] Tokenizer: {model_path}, pad={tokenizer.pad_token!r}", flush=True)
+    print(f"[SFT] Tokenizer: {model_path} (local={_local}), pad={tokenizer.pad_token!r}", flush=True)
 
     # ── Dataset (akan raise DatasetNotAvailableError jika gagal) ──
     train_ds, dev_ds = prepare_sft_dataset(
