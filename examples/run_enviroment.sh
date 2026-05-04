@@ -3,6 +3,18 @@
 TASK_ID="1"
 MODEL=""
 DATASET="dummy"
+
+# ── SFT Warm-start Dataset (opsional) ──────────────────────────────────────
+# Isi dengan HF dataset ID dari whitelist G.O.D untuk SFT warm-start.
+# Kosongkan ("") untuk skip SFT dan langsung GRPO.
+# Whitelist: GoodStartLabs/gin-rummy-trajectories-32k
+#            gradients-io-tournaments/ArkadiumGinrummy
+#            SoelMgd/Poker_Dataset
+#            RZ412/PokerBench
+#            the-acorn-ai/textarena-player-game-traces
+#            tasksource/Boardgame-QA
+REQUESTED_DATASETS="GoodStartLabs/gin-rummy-trajectories-32k"
+
 DATASET_TYPE='{
   "environment_name": "gin_rummy"
 }'
@@ -16,7 +28,9 @@ d = json.load(sys.stdin)
 d['requested_datasets'] = ['$REQUESTED_DATASETS']
 print(json.dumps(d))
 ")
+  echo "[SFT] DATASET_TYPE with requested_datasets: $DATASET_TYPE"
 fi
+
 FILE_FORMAT="s3"
 HOURS_TO_COMPLETE=3
 
@@ -26,17 +40,6 @@ HOURS_TO_COMPLETE=3
 #   liars_dice  → 280  (step time ~31s, 3 jam ≈ 280 steps)
 #   leduc_poker → 300  (step time lebih cepat)
 MAX_STEPS=320
-
-# ── SFT Warm-start Dataset (opsional) ──────────────────────────────────────
-# Isi dengan HF dataset ID dari whitelist G.O.D untuk SFT warm-start.
-# Kosongkan ("") untuk skip SFT dan langsung GRPO.
-# Whitelist: GoodStartLabs/gin-rummy-trajectories-32k
-#            gradients-io-tournaments/ArkadiumGinrummy
-#            SoelMgd/Poker_Dataset
-#            RZ412/PokerBench
-#            the-acorn-ai/textarena-player-game-traces
-#            tasksource/Boardgame-QA
-REQUESTED_DATASETS="GoodStartLabs/gin-rummy-trajectories-32k"
 
 # ── Wandb ──────────────────────────────────────────────────────────────────
 # Set WANDB_TOKEN to enable online logging.
