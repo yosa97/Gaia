@@ -240,7 +240,7 @@ def get_run_cmd(config: dict, gpu_nums: int):
     --loss_type dr_grpo \
     --num_iterations 2 \
     --do_eval False \
-    --vllm_max_model_length {vllm_max_model_length} 2> /tmp/grpo_error.txt"""
+    --vllm_max_model_length {vllm_max_model_length} 2> /workspace/data/trained_model/grpo_error.txt"""
     )
 
     if config.get("use_lora", False):
