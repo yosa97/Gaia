@@ -420,7 +420,17 @@ def main():
 
     # ── Simpan checkpoint ──
     if is_main_process(LOCAL_RANK):
-        trainer.save_model(args.output_dir)
+        # Jika LoRA dipakai, merge dulu ke base model sebelum simpan.
+        # Tanpa merge, checkpoint hanya berisi adapter weights dan GRPO
+        # tidak bisa load dengan AutoModelForCausalLM.from_pretrained().
+        _model_to_save = trainer.model
+        if args.use_lora and hasattr(_model_to_save, "merge_and_unload"):
+            print("[SFT] Merging LoRA weights into base model...", flush=True)
+            _model_to_save = _model_to_save.merge_and_unload()
+            print("[SFT] LoRA merge selesai.", flush=True)
+
+        print(f"[SFT] Saving checkpoint to: {args.output_dir}", flush=True)
+        _model_to_save.save_pretrained(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
         success_file = os.path.join(args.output_dir, "sft_success.txt")
         with open(success_file, "w") as f:
