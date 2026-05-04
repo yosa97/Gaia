@@ -89,7 +89,8 @@ def extract_value_from_cmd(cmd: str, arg_name: str):
 
 def get_model_architecture(model_name: str) -> str:
     try:
-        config = AutoConfig.from_pretrained(model_name)
+        _local = model_name.startswith("/") or model_name.startswith("./") or os.path.isdir(model_name)
+        config = AutoConfig.from_pretrained(model_name, local_files_only=_local)
         architectures = config.architectures
         if len(architectures) > 1:
             return "Multiple architectures"

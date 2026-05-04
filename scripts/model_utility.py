@@ -45,9 +45,23 @@ def is_reasoning_tokenizer(tokenizer: AutoTokenizer) -> bool:
         return False
 
 
+def _is_local_path(path: str) -> bool:
+    """True jika path adalah local filesystem path (bukan HF repo ID).
+    
+    HuggingFace Hub >=0.24 strict validate repo ID — path lokal dengan
+    banyak '/' akan ditolak jika tidak di-flag sebagai local.
+    """
+    return (
+        path.startswith("/")
+        or path.startswith("./")
+        or os.path.isdir(path)
+    )
+
+
 def get_model_architecture(model_path: str) -> str:
     try:
-        config = AutoConfig.from_pretrained(model_path)
+        local = _is_local_path(model_path)
+        config = AutoConfig.from_pretrained(model_path, local_files_only=local)
         architectures = config.architectures
         if len(architectures) > 1:
             return "Multiple architectures"
