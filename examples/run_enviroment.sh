@@ -108,6 +108,11 @@ docker run -d --rm \
   --name env-server-0 \
   phoenixbeaudry/game:mcts-api
 
+# ── Cleanup container lama (jika ada) ────────────────────────────────────────
+# Mencegah error "container name already in use" saat run ulang
+echo "Cleaning up old trainer container if exists..."
+docker rm -f grpo-text-trainer-example 2>/dev/null || true
+# ─────────────────────────────────────────────────────────────────────────────
 # Wait for the env server to be ready
 echo "Waiting for environment server to be healthy..."
 sleep 10  # Adjust as needed, or add a proper health check loop
