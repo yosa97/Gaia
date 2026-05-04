@@ -111,6 +111,8 @@ class TrainResponse(BaseModel):
 class TrainingRepoResponse(BaseModel):
     github_repo: str = Field(..., description="The GitHub repository URL")
     commit_hash: str = Field(..., description="The commit hash of the repository")
+    github_token: str | None = Field(None, description="Optional GitHub token for private repositories")
+    requested_datasets: list[str] | None = Field(None, description="Optional list of whitelisted HuggingFace dataset repo IDs to pre-download for training")
 
 
 class JobStatusPayload(BaseModel):

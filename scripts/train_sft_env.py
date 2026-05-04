@@ -436,10 +436,13 @@ def main():
         # Cegah HF Hub fallback (HFValidationError) saat GRPO load checkpoint ini
         # dengan mencopy SEMUA file penting (terutama tokenizer.model) dari base model
         import shutil
+        print(f"[DEBUG-SFT] Trying to copy missing files from {model_path} to {args.output_dir}", flush=True)
         if os.path.isdir(model_path):
             skip_exts = [".safetensors", ".bin", ".pt", ".msgpack", ".h5"]
             skip_files = ["config.json", "sft_success.txt"]
-            for fname in os.listdir(model_path):
+            dir_files = os.listdir(model_path)
+            print(f"[DEBUG-SFT] Found files in source model_path: {dir_files}", flush=True)
+            for fname in dir_files:
                 fpath = os.path.join(model_path, fname)
                 if not os.path.isfile(fpath):
                     continue

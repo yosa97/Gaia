@@ -14,21 +14,68 @@ from envs.shared_env import (
     GAMES_TO_TASK_ID_RANGE,
     CurriculumScheduler,
     init_env_pool,
-    rollout_reward_func,  # re-exported for callers  # noqa: F401
+    rollout_reward_func,  # re-exported for callers
 )
 
 
-# CONSTANTS FOR GIN RUMMY
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-_SELECTED_GAME      = "gin_rummy"
-_MAX_EPISODE_TOKENS = 16384   # max tokens per full-prompt episode (16k context)
-_MAX_PROMPT_LEN     = 16128   # prompt token cap — matches boss (16384 - 256)
-_TIMEOUT            = 2400    # HTTP timeout (seconds) — 40 min covers slow MCTS
-_MCTS_SIMS          = 50      # fixed MCTS simulations
+_SELECTED_GAME = "gin_rummy"
+_MAX_EPISODE_TOKENS = 16384
+_TIMEOUT = 2400
+_MCTS_SIMS = 50
+
+# ---------------------------------------------------------------------------
+# Model-aware tier configs (hybrid approach: auto-detect + config dict)
+# ---------------------------------------------------------------------------
+
+_MODEL_CONFIGS = {
+    "small": {   # 3B models: clean prompt, no Bayesian injection
+        "inject_bayesian_context": False,
+        "max_prompt_len": 5000,
+    },
+    "medium": {  # 4B models: clean prompt, slightly more context
+        "inject_bayesian_context": False,
+        "max_prompt_len": 6000,
+    },
+    "large": {   # 7B models: Bayesian injection ON, more context
+        "inject_bayesian_context": True,
+        "max_prompt_len": 8000,
+    },
+}
+
+
+def _detect_tier(trainer) -> tuple[str, str]:
+    """Auto-detect model size tier from trainer's loaded model.
+
+    Checks multiple sources for the model name (model config, tokenizer,
+    trainer args) to ensure robust detection across all HuggingFace models.
+
+    Returns (tier, model_name) tuple.
+    """
+    model_name = ""
+    # Source 1: model config (most reliable — always set by from_pretrained)
+    if hasattr(trainer, "model") and hasattr(trainer.model, "config"):
+        model_name = getattr(trainer.model.config, "_name_or_path", "")
+    # Source 2: tokenizer (also reliable)
+    if not model_name and hasattr(trainer, "processing_class"):
+        model_name = getattr(trainer.processing_class, "name_or_path", "")
+    # Source 3: trainer args (fallback)
+    if not model_name:
+        model_name = getattr(trainer.args, "model", "")
+
+    name_lower = model_name.lower()
+    if "7b" in name_lower:
+        return "large", model_name or "unknown"
+    if "4b" in name_lower:
+        return "medium", model_name or "unknown"
+    return "small", model_name or "unknown"
 
 CARD_VALUES = {
     'A': 1, '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9,
-    'T': 10, 'J': 10, 'Q': 10, 'K': 10,   # GR rule: all face cards = 10 deadwood pts
+    'T': 10, 'J': 11, 'Q': 12, 'K': 13,
 }
 RANK_ORDER = ['A', '2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K']
 
@@ -37,117 +84,17 @@ REASONING_TAG_PAIRS = [
     ("thought", "thought"), ("reflection", "reflection"),
 ]
 
-# Terminal reward constants (ported from boss)
-TERMINAL_WIN_REWARD          = 1.0
-TERMINAL_LOSS_REWARD         = -1.0
-GIN_BONUS                    = 0.25   # deadwood == 0
-KNOCK_BONUS                  = 0.1
-
-# Step bonus signals (ported from boss M5/L3/L4)
-NEAR_KNOCK_DISCARD_BONUS        = 0.08
-OPP_CONFIRMED_DISCARD_PENALTY   = 0.08
-SIGNAL_AWARE_DISCARD_BONUS      = 0.04
-RAG_ALIGNMENT_BONUS             = 0.05
-
 # Bayesian-informed bonus/penalty (supplements existing step rewards)
-BAYES_SAFE_DISCARD_BONUS        = 0.02
-BAYES_DANGEROUS_DISCARD_PENALTY = 0.02
-BAYES_DRAW_UPCARD_BONUS         = 0.03
-BAYES_DRAW_UPCARD_PENALTY       = 0.02
+# Scaled 10x from original (0.02-0.03) to be meaningful vs base rewards (2-20)
+BAYES_SAFE_DISCARD_BONUS       = 0.3
+BAYES_DANGEROUS_DISCARD_PENALTY = 0.5
+BAYES_DRAW_UPCARD_BONUS        = 0.3
+BAYES_DRAW_UPCARD_PENALTY      = 0.2
 
 
-# RUMMY RAG — lightweight knowledge base (ported from boss)
-
-class RummyRAG:
-    """Lightweight knowledge base for Gin Rummy. Fills blind spots for early game/CFR."""
-
-    def retrieve(self, state: 'GameState', max_entries: int = 2) -> tuple[str, str]:
-        """Return (advice_text, recommended_action: 'knock'|'discard_high'|'draw'|'')."""
-        matches = []
-        if state.can_knock():
-            if state.deadwood == 0:
-                matches.append((5, "[RAG] GIN! Deadwood=0. Knock immediately for 25-point bonus!", "knock"))
-            else:
-                matches.append((5, f"[RAG] KNOCK available (dw={state.deadwood}). End the hand now!", "knock"))
-        if state.stock_size <= 5 and state.stock_size > 0:
-            if state.can_knock():
-                matches.append((4, f"[RAG] Stock={state.stock_size}. URGENT: Knock now before forced draw.", "knock"))
-            else:
-                gap = state.deadwood - state.knock_card
-                matches.append((3, f"[RAG] Stock={state.stock_size}, need {gap} more dw reduction. Discard highest unmelded.", "discard_high"))
-        if state.deadwood > 30 and state.stock_size > 20:
-            matches.append((2, "[RAG] High deadwood early game. Discard face cards (K/Q/J/T=10pts) first.", "discard_high"))
-        if not state.can_knock() and state.deadwood <= state.knock_card + 3:
-            matches.append((3, f"[RAG] Almost knockable! Dw={state.deadwood}, need {state.knock_card}. One good draw away.", "draw"))
-        if not matches:
-            return "", ""
-        matches.sort(key=lambda x: -x[0])
-        return "\n".join(m[1] for m in matches[:max_entries]), matches[0][2]
-
-_RUMMY_RAG = RummyRAG()
-
-
-# DEAD CARD TRACKER (ported from boss)
-
-class DeadCardTracker:
-    """Tracks dead cards (discarded) and layoff candidates."""
-
-    ALL_RANKS = list("A23456789TJQK")
-    ALL_SUITS = list("shdc")
-
-    def __init__(self) -> None:
-        self.seen_discards: set[str] = set()
-
-    def update_from_discard_pile(self, discard_pile: list[str]) -> None:
-        for card in discard_pile:
-            if len(card) == 2:
-                self.seen_discards.add(card.lower())
-
-    def update_from_observation(self, obs: str) -> None:
-        self.update_from_discard_pile(parse_discard_pile(obs))
-
-    def get_layoff_candidates(self, hand: list[str], discard_pile: list[str]) -> list[str]:
-        if not discard_pile or not hand:
-            return []
-        candidates: set[str] = set()
-        suit_groups: dict[str, list[str]] = {}
-        for card in discard_pile:
-            if len(card) != 2:
-                continue
-            suit_groups.setdefault(card[1].lower(), []).append(card.lower())
-        for suit, cards in suit_groups.items():
-            sorted_cards = sorted(cards, key=lambda c: self.ALL_RANKS.index(c[0].upper()) if c[0].upper() in self.ALL_RANKS else 99)
-            for i in range(len(sorted_cards) - 1):
-                r1, r2 = sorted_cards[i][0].upper(), sorted_cards[i+1][0].upper()
-                if r1 not in self.ALL_RANKS or r2 not in self.ALL_RANKS:
-                    continue
-                if abs(self.ALL_RANKS.index(r1) - self.ALL_RANKS.index(r2)) == 1:
-                    idx1, idx2 = self.ALL_RANKS.index(r1), self.ALL_RANKS.index(r2)
-                    for adj in [idx1 - 1, idx2 + 1]:
-                        if 0 <= adj < len(self.ALL_RANKS):
-                            target = self.ALL_RANKS[adj] + suit
-                            candidates.update(h for h in hand if h.lower() == target)
-        rank_groups: dict[str, int] = {}
-        for card in discard_pile:
-            if len(card) == 2:
-                rank_groups[card[0].upper()] = rank_groups.get(card[0].upper(), 0) + 1
-        for rank, count in rank_groups.items():
-            if count >= 2:
-                candidates.update(h for h in hand if h[0].upper() == rank)
-        return sorted(candidates)
-
-    def summary(self, hand: list[str]) -> str:
-        dead   = sorted(self.seen_discards)
-        layoff = self.get_layoff_candidates(hand, list(self.seen_discards))
-        lines  = []
-        if dead:
-            lines.append(f"Dead cards (discarded): {' '.join(dead[:15])}")
-        if layoff:
-            lines.append(f"Layoff candidates (extend opp melds): {' '.join(layoff)}")
-        return "\n".join(lines)
-
-
-# CARD UTILITIES FOR GIN RUMMY
+# ---------------------------------------------------------------------------
+# Card utilities
+# ---------------------------------------------------------------------------
 
 def get_rank(card: str) -> str:
     return card[0]
@@ -196,7 +143,7 @@ def would_complete_run(hand: list[str], card: str) -> bool:
 
 def would_improve_run(hand: list[str], card: str) -> bool:
     rank_idx = RANK_ORDER.index(get_rank(card))
-    suit     = get_suit(card)
+    suit = get_suit(card)
     for existing in hand:
         if get_suit(existing) != suit:
             continue
@@ -262,45 +209,19 @@ def remove_reasoning_tags(text: str) -> str:
     return cleaned.strip()
 
 
-# Text-based action → numeric ID mapping for Gin Rummy
-_TEXT_ACTION_MAP = {
-    "draw stock": "53",
-    "draw from stock": "53",
-    "stock": "53",
-    "pass": "54",
-    "skip": "54",
-    "knock": "55",
-    "gin": "55",   # GIN = KNOCK with deadwood=0 (same action ID in OpenSpiel GR)
-}
-
 def extract_action_id(completion_text: str) -> str:
     cleaned = remove_reasoning_tags(completion_text)
-    # Strip markdown code blocks (```json ... ```) — Qwen3 sok formal output
-    cleaned = re.sub(r"```[^`]*```", " ", cleaned, flags=re.DOTALL)
-    # Strip JSON/quote/bracket noise
-    cleaned = re.sub(r'[\{\}\[\]"\'`]', " ", cleaned)
     if cleaned.endswith("</s>"):
         cleaned = cleaned[:-4].strip()
     if "Action:" in cleaned:
         cleaned = cleaned.split("Action:")[-1].strip()
-    # Try numeric extraction from cleaned text
     match = re.search(r"-?\d+", cleaned)
-    if match:
-        return match.group(0)
-    # Try text-to-ID mapping (case-insensitive)
-    cleaned_lower = cleaned.lower().strip()
-    for text, action_id in _TEXT_ACTION_MAP.items():
-        if text in cleaned_lower:
-            return action_id
-    # Last resort: search for any 1-3 digit number in ORIGINAL text
-    # Catches cases where number is inside <think> or model forgot to put it after
-    orig_match = re.search(r"\b(\d{1,3})\b", completion_text)
-    if orig_match:
-        return orig_match.group(1)
-    return cleaned.strip()
+    return match.group(0) if match else cleaned.strip()
 
 
-# GAME STATE FOR GIN RUMMY
+# ---------------------------------------------------------------------------
+# Game state
+# ---------------------------------------------------------------------------
 
 @dataclass
 class GameState:
@@ -313,9 +234,11 @@ class GameState:
     discard_pile: list[str]
     player_id:    int
 
+    def total_hand_value(self) -> int:
+        return sum(get_value(c) for c in self.hand)
 
     def num_high_cards(self) -> int:
-        return sum(1 for c in self.hand if get_value(c) >= 10)
+        return sum(1 for c in self.hand if get_value(c) == 10)
 
     def can_knock(self) -> bool:
         return self.deadwood <= self.knock_card
@@ -333,7 +256,9 @@ class GameState:
         return sum(1 for r in find_potential_runs(self.hand) if len(r) == 2)
 
 
-# OBSERVATION HELPERS FOR GIN RUMMY
+# ---------------------------------------------------------------------------
+# Observation helpers
+# ---------------------------------------------------------------------------
 
 def extract_and_format_observation(obs_text: str) -> str:
     if 'Invalid action:' in obs_text and 'Legal Actions:' in obs_text:
@@ -341,19 +266,17 @@ def extract_and_format_observation(obs_text: str) -> str:
     state_match = re.search(r'Current State:\n(.*)', obs_text, re.DOTALL)
     if not state_match:
         return obs_text
-    state_text   = state_match.group(0)
+    state_text = state_match.group(0)
     player_match = re.search(r'You are Player (\d+)', obs_text)
-    player_id    = int(player_match.group(1)) if player_match else 0
-    if 'Legal Actions:' not in state_text:   # guard: avoid ValueError on split
-        return state_text
-    current_state_text, legal_action_text = state_text.split('Legal Actions:', 1)
+    player_id = int(player_match.group(1)) if player_match else 0
+    current_state_text, legal_action_text = state_text.split('Legal Actions:')
     return current_state_text + f"You are Player {player_id}.\nLegal Actions:" + legal_action_text
 
 
 def parse_hand_from_observation(observation: str) -> list[str]:
     player_match = re.search(r'You are Player (\d+)', observation)
-    player_id    = int(player_match.group(1)) if player_match else 0
-    section      = re.search(
+    player_id = int(player_match.group(1)) if player_match else 0
+    section = re.search(
         rf'Player{player_id}: Deadwood=\d+\n\+-+\+\n(.*?)\n\+-+\+', observation, re.DOTALL
     )
     hand = []
@@ -379,18 +302,18 @@ def parse_game_state(observation: str) -> GameState:
     if 'Invalid' in observation and 'Legal Actions:' not in observation:
         raise ValueError("Invalid action response — not a game state")
     player_match = re.search(r'You are Player (\d+)', observation)
-    player_id    = int(player_match.group(1)) if player_match else 0
-    hand         = parse_hand_from_observation(observation)
-    dw_match     = re.search(r'Deadwood=(\d+)', observation)
-    deadwood     = int(dw_match.group(1)) if dw_match else 0
-    phase_match  = re.search(r'Phase: (\w+)', observation)
-    phase        = phase_match.group(1) if phase_match else 'Draw'
-    knock_match  = re.search(r'Knock card: (\d+)', observation)
-    knock_card   = int(knock_match.group(1)) if knock_match else 10
+    player_id = int(player_match.group(1)) if player_match else 0
+    hand = parse_hand_from_observation(observation)
+    dw_match = re.search(r'Deadwood=(\d+)', observation)
+    deadwood = int(dw_match.group(1)) if dw_match else 0
+    phase_match = re.search(r'Phase: (\w+)', observation)
+    phase = phase_match.group(1) if phase_match else 'Draw'
+    knock_match = re.search(r'Knock card: (\d+)', observation)
+    knock_card = int(knock_match.group(1)) if knock_match else 10
     upcard_match = re.search(r'Stock size: \d+\s+Upcard: (\w+)', observation)
-    upcard       = upcard_match.group(1) if upcard_match else 'XX'
-    stock_match  = re.search(r'Stock size: (\d+)', observation)
-    stock_size   = int(stock_match.group(1)) if stock_match else 0
+    upcard = upcard_match.group(1) if upcard_match else 'XX'
+    stock_match = re.search(r'Stock size: (\d+)', observation)
+    stock_size = int(stock_match.group(1)) if stock_match else 0
     return GameState(
         hand=hand, deadwood=deadwood, phase=phase, knock_card=knock_card,
         upcard=upcard, stock_size=stock_size,
@@ -398,10 +321,19 @@ def parse_game_state(observation: str) -> GameState:
     )
 
 
-# BAYESIAN OPPONENT MODELS FOR GIN RUMMY
+# ---------------------------------------------------------------------------
+# Bayesian opponent models (new — compensates 3B model's limited reasoning)
+# ---------------------------------------------------------------------------
 
 class BayesianOpponentModel:
-    """Track which ranks/suits opponent is collecting based on discard pile deltas."""
+    """Track which ranks/suits opponent is collecting based on discard pile deltas.
+
+    When the upcard disappears → opponent drew it → boost heat for that rank/suit.
+    When a new card appears on the pile → opponent discarded it → cool that rank/suit.
+
+    Integration: instantiated per-episode in _run_episode(), context
+    injected into observations via summary() in last-prompt mode only.
+    """
 
     ALL_RANKS = list("A23456789TJQK")
     ALL_SUITS = list("shdc")
@@ -409,6 +341,8 @@ class BayesianOpponentModel:
     def __init__(self) -> None:
         self.rank_heat: dict[str, float] = {r: 0.0 for r in self.ALL_RANKS}
         self.suit_heat: dict[str, float] = {s: 0.0 for s in self.ALL_SUITS}
+        self.opp_draws:    list[str] = []
+        self.opp_discards: list[str] = []
 
     def _update_heat(self, card: str, weight: float) -> None:
         if len(card) != 2:
@@ -422,7 +356,9 @@ class BayesianOpponentModel:
 
     def update_on_opponent_draw(self, drawn_card: str) -> None:
         """Opponent drew an upcard → they want that rank/suit."""
+        self.opp_draws.append(drawn_card)
         self._update_heat(drawn_card, weight=1.0)
+        # Also boost adjacent ranks in the same suit (run extension)
         if len(drawn_card) == 2:
             rank, suit = drawn_card[0].upper(), drawn_card[1].lower()
             if rank in self.ALL_RANKS:
@@ -433,6 +369,7 @@ class BayesianOpponentModel:
 
     def update_on_opponent_discard(self, discarded_card: str) -> None:
         """Opponent discarded → they don't want that rank/suit."""
+        self.opp_discards.append(discarded_card)
         self._update_heat(discarded_card, weight=-0.5)
 
     def update_from_discard_pile_delta(
@@ -467,7 +404,11 @@ class BayesianOpponentModel:
         return [c for c in hand if self.is_safe_discard(c)]
 
     def summary(self, hand: list[str]) -> str:
-        """Compact Bayesian context for prompt injection."""
+        """Compact Bayesian context for prompt injection.
+
+        Kept short for the 3B model — highlights dangerous/safe discards
+        and opponent's collection direction.
+        """
         danger    = self.get_danger_cards(hand)
         safe      = self.get_safe_cards(hand)
         hot_suits = [s for s, h in self.suit_heat.items() if h >= 1.5]
@@ -485,7 +426,13 @@ class BayesianOpponentModel:
 
 
 class BayesianOpponentHandModel:
-    """Track P(card ∈ opponent_hand | all observations) via Bayesian updates."""
+    """Track P(card ∈ opponent_hand | all observations) via Bayesian updates.
+
+    Maintains per-card probability estimates based on:
+    - Cards confirmed in opponent's hand (drew upcard)
+    - Cards confirmed not in hand (discarded)
+    - Prior from remaining unknown cards
+    """
 
     ALL_RANKS = list("A23456789TJQK")
     ALL_SUITS = list("shdc")
@@ -541,8 +488,8 @@ class BayesianOpponentHandModel:
             and c not in self._confirmed_not_in_hand
             and p > 0
         }
-        confirmed_count = len(self._confirmed_in_hand)
-        remaining_slots = max(self._opp_hand_size - confirmed_count, 0)
+        confirmed_count  = len(self._confirmed_in_hand)
+        remaining_slots  = max(self._opp_hand_size - confirmed_count, 0)
         n = len(uncertain)
         if n == 0 or remaining_slots == 0:
             return
@@ -563,9 +510,9 @@ class BayesianOpponentHandModel:
         top_hand = self.estimated_opponent_hand(10)
         if not top_hand:
             return "Unknown"
-        estimated_dw = sum(get_value(c.upper()) * p for c, p in top_hand)
-        confirmed_dw = sum(get_value(c.upper()) for c in self._confirmed_in_hand if len(c) == 2)
-        total_est    = estimated_dw + confirmed_dw
+        estimated_dw  = sum(get_value(c.upper()) * p for c, p in top_hand)
+        confirmed_dw  = sum(get_value(c.upper()) for c in self._confirmed_in_hand if len(c) == 2)
+        total_est     = estimated_dw + confirmed_dw
         if total_est <= 10:
             return f"HIGH (~{total_est:.0f}pts)"
         elif total_est <= 25:
@@ -575,7 +522,7 @@ class BayesianOpponentHandModel:
 
     def summary(self, our_hand: list[str]) -> str:
         """Compact Bayesian context for prompt injection."""
-        lines    = [f"[BayesHand] Opp knock risk: {self.knock_risk()}"]
+        lines = [f"[BayesHand] Opp knock risk: {self.knock_risk()}"]
         top_held = self.estimated_opponent_hand(5)
         if top_held:
             cards_str = " ".join(f"{c}({p:.0%})" for c, p in top_held if p >= 0.25)
@@ -587,113 +534,40 @@ class BayesianOpponentHandModel:
         return "\n".join(lines)
 
 
-# KNOCK DECISION CFR — sub-game CFR for knock/continue decision (ported + enhanced from boss)
-
-class KnockDecisionCFR:
-    """Sub-game CFR for Gin Rummy knock/continue decision.
-
-    State: (deadwood_bucket 0-10, stock_bucket 0-5, opp_risk 0-2)
-    Actions: 0=continue, 1=knock
-    Total info sets: 11 x 6 x 3 = 198 — memory <3KB, solve() <0.1s.
-
-    Boss defines this class but never injects it into observation context.
-    We inject it — adding stock urgency + opponent-risk dimensions that
-    _build_knock_context_from_obs() alone cannot provide.
-    """
-
-    def __init__(self, iterations: int = 500) -> None:
-        self._regret:       dict[tuple, float] = {}
-        self._strategy_sum: dict[tuple, float] = {}
-        self._iterations = iterations
-        self._solved     = False
-
-    def _key(self, dw_b: int, stock_b: int, opp_r: int, action: int) -> tuple:
-        return (dw_b, stock_b, opp_r, action)
-
-    def _get_strategy(self, dw_b: int, stock_b: int, opp_r: int) -> tuple[float, float]:
-        r_cont  = max(0.0, self._regret.get(self._key(dw_b, stock_b, opp_r, 0), 0.0))
-        r_knock = max(0.0, self._regret.get(self._key(dw_b, stock_b, opp_r, 1), 0.0))
-        total   = r_cont + r_knock
-        return (0.5, 0.5) if total <= 0 else (r_cont / total, r_knock / total)
-
-    def solve(self) -> None:
-        for _ in range(self._iterations):
-            for dw_b in range(11):
-                for stock_b in range(6):
-                    for opp_r in range(3):
-                        p_cont, p_knock = self._get_strategy(dw_b, stock_b, opp_r)
-                        knock_util  = max(0.0, (10 - dw_b) / 10.0)
-                        if opp_r == 2: knock_util += 0.2
-                        if dw_b > 7:   knock_util -= 0.3
-                        improve_prob = min(0.8, (stock_b + 1) / 6.0)
-                        cont_util    = improve_prob * 0.5 - opp_r * 0.15
-                        node_util    = p_cont * cont_util + p_knock * knock_util
-                        for act, util in ((0, cont_util), (1, knock_util)):
-                            k = self._key(dw_b, stock_b, opp_r, act)
-                            self._regret[k] = self._regret.get(k, 0.0) + (util - node_util)
-        self._solved = True
-
-    def should_knock(self, deadwood: int, stock_size: int, opp_risk_str: str) -> float:
-        """Return p(knock is optimal). Args: deadwood, stock_size, opp_risk from BayesHand.knock_risk()."""
-        if not self._solved:
-            self.solve()
-        dw_b   = min(deadwood, 10)
-        stock_b = min(stock_size // 6, 5)
-        opp_r   = 2 if "HIGH" in opp_risk_str else (1 if "MEDIUM" in opp_risk_str else 0)
-        _, p_knock = self._get_strategy(dw_b, stock_b, opp_r)
-        return p_knock
-
-    def context(self, deadwood: int, stock_size: int, opp_risk_str: str, can_knock: bool) -> str:
-        """Generate CFR context string for observation injection."""
-        p_knock = self.should_knock(deadwood, stock_size, opp_risk_str)
-        if can_knock and p_knock >= 0.65:
-            return (
-                f"[CFR] Optimal: KNOCK NOW (p={p_knock:.0%}) "
-                f"— stock={stock_size}, opp_risk={opp_risk_str}"
-            )
-        elif can_knock and p_knock < 0.40:
-            return (
-                f"[CFR] Optimal: Continue drawing (p_knock={p_knock:.0%}) "
-                f"— hand can still improve. Stock={stock_size}."
-            )
-        elif not can_knock and p_knock >= 0.55 and stock_size <= 8:
-            return (
-                f"[CFR] URGENT: Stock={stock_size} almost gone. "
-                f"Reduce deadwood FAST — opponent may knock first! Opp_risk={opp_risk_str}"
-            )
-        return ""
-
-_KNOCK_CFR = KnockDecisionCFR(iterations=500)
-
-
-# REWARD CALCULATOR FOR GIN RUMMY
+# ---------------------------------------------------------------------------
+# Reward calculator
+# ---------------------------------------------------------------------------
 
 class RewardCalculator:
-    """Shaped reward calculator for Gin Rummy with Bayesian opponent awareness."""
+    """Shaped reward calculator for Gin Rummy with Bayesian awareness.
+
+    Inherits the same step-reward architecture as the base gin_rummy_env.py
+    RewardCalculator and adds Bayesian-informed discard/draw shaping.
+    """
 
     def __init__(self, gamma: float = 0.95):
-        self.gamma = gamma  # 0.95 for GR (longer episodes, slower decay needed)
-        # Reward capping (anti reward hacking)
+        self.gamma = gamma
+        # --- Reward capping (Lilianweng audit: anti-reward-hacking) ---
         self.step_reward_cap = 25.0
         self.episode_reward_cap = 100.0
-        # Base signals
-        self.deadwood_weight                 = 0.5
-        self.high_card_penalty               = -0.5    # increased: K=13pts, must discard fast
-        self.pair_bonus                      = 2.0
-        self.set_bonus                       = 10.0
-        self.potential_run_bonus             = 3.0
-        self.run_bonus                       = 12.0
-        self.break_pair_penalty              = -2.0
-        self.break_set_penalty               = -10.0
-        self.break_run_penalty               = -12.0
-        self.knock_ready_bonus               = 20.0
-        self.knock_action_bonus              = 8.0     # NEW: reward choosing to KNOCK
-        self.missed_knock_penalty            = -4.0    # NEW: penalty for not knocking when able
-        self.stock_draw_bonus                = 0.5     # NEW: prefer stock draw (info hiding)
-        self.discard_highest_bonus           = 2.0     # NEW: reward discarding highest non-meld card
-        self.discard_useful_penalty          = -2.0
-        self.missed_opportunity_penalty      = -3.0
-        self.picked_up_useless_upcard_penalty = -3.0
+        # --- Base signals ---
+        self.deadwood_weight = 0.5
+        self.high_card_penalty = -0.5  # Increased: K=13pts, must discard fast
+        self.pair_bonus = 2.0
+        self.set_bonus = 8.0
+        self.potential_run_bonus = 2.0
+        self.run_bonus = 10.0
+        self.break_pair_penalty = -1.0   # Reduced: allow flexibility
+        self.break_set_penalty = -4.0    # Reduced: don't freeze model
+        self.break_run_penalty = -5.0    # Reduced: allow strategic discards
+        self.knock_ready_bonus = 25.0    # Increased: knock ASAP!
+        self.knock_action_bonus = 15.0   # NEW: reward for choosing to KNOCK
+        self.missed_knock_penalty = -8.0 # NEW: penalty for NOT knocking when able
+        self.stock_draw_bonus = 0.5      # NEW: prefer stock (info hiding)
+        self.discard_highest_bonus = 2.0  # NEW: reward discarding highest non-meld card
+        self.discard_useful_penalty = -1.5
+        self.missed_opportunity_penalty = -2.0
+        self.picked_up_useless_upcard_penalty = -2.0
 
     def calculate_step_reward(
         self,
@@ -709,6 +583,7 @@ class RewardCalculator:
         prev, curr = states[-2], states[-1]
         reward = 0.0
 
+        # --- Base signals ---
         reward += self.deadwood_weight * (prev.deadwood - curr.deadwood)
         reward += self.high_card_penalty * curr.num_high_cards()
 
@@ -727,12 +602,6 @@ class RewardCalculator:
 
         if curr.can_knock() and not prev.can_knock():
             reward += self.knock_ready_bonus
-
-        # Knock decision signals — the most important decision in Gin Rummy
-        if action == '55' and prev.can_knock():
-            reward += self.knock_action_bonus     # +8: good knock!
-        elif prev.can_knock() and prev.phase == 'Discard' and action != '55':
-            reward += self.missed_knock_penalty   # -4: should have knocked
 
         if prev.phase == 'Discard' and len(curr.discard_pile) > len(prev.discard_pile):
             newly_discarded = [c for c in curr.discard_pile if c not in prev.discard_pile]
@@ -753,15 +622,25 @@ class RewardCalculator:
         if prev.phase == 'Draw' and prev.upcard != 'XX':
             upcard = prev.upcard
             if action == '53':  # drew from stock
-                reward += self.stock_draw_bonus   # +0.5: info hiding
+                # Bonus for drawing from stock (information hiding — Claude strategy)
+                reward += self.stock_draw_bonus
                 if would_complete_set(prev.hand, upcard) or would_complete_run(prev.hand, upcard):
                     reward += self.missed_opportunity_penalty
             else:
                 if not (would_complete_set(prev.hand, upcard) or would_complete_run(prev.hand, upcard)):
                     reward += self.picked_up_useless_upcard_penalty
 
-        # Bayesian-informed adjustments (opponent modelling layer)
+        # --- Knock decision signals (THE most important decision in Gin Rummy) ---
+        if action == '55' and prev.can_knock():
+            # Model chose to KNOCK — this is almost always correct!
+            reward += self.knock_action_bonus
+        elif prev.can_knock() and prev.phase in ('Discard', 'Draw') and action != '55':
+            # Model COULD knock but chose not to — penalize
+            reward += self.missed_knock_penalty
+
+        # --- Bayesian-informed adjustments (opponent modelling layer) ---
         if bayesian_model is not None:
+            # Discard phase: bonus/penalty based on danger assessment
             if prev.phase == 'Discard' and len(curr.discard_pile) > len(prev.discard_pile):
                 newly_discarded = [c for c in curr.discard_pile if c not in prev.discard_pile]
                 if newly_discarded:
@@ -771,11 +650,12 @@ class RewardCalculator:
                     elif bayesian_model.is_dangerous_discard(dc):
                         reward -= BAYES_DANGEROUS_DISCARD_PENALTY
 
+            # Draw phase: bonus for drawing useful upcard, penalty for ignoring it
             if prev.phase in ('Draw', 'FirstUpcard') and prev.upcard != 'XX':
                 potential = meld_potential(prev.upcard, prev.hand)
                 if action == '52':  # drew upcard
                     if potential > 0:
-                        scale   = min(potential / 4.0, 1.0)
+                        scale = min(potential / 4.0, 1.0)
                         reward += BAYES_DRAW_UPCARD_BONUS * scale
                     else:
                         reward -= BAYES_DRAW_UPCARD_PENALTY
@@ -786,43 +666,17 @@ class RewardCalculator:
         return max(-self.step_reward_cap, min(self.step_reward_cap, reward))
 
     def calculate_discounted_return(self, rewards: list[float]) -> float:
+        """Discounted return G = Σ γ^(T-1-i) * r_i (capped)."""
         if not rewards:
             return 0.0
         T = len(rewards)
         result = sum(self.gamma ** (T - 1 - i) * r for i, r in enumerate(rewards))
         return max(-self.episode_reward_cap, min(self.episode_reward_cap, result))
 
-    def calculate_episode_reward(
-        self,
-        step_rewards: list[float],
-        env_reward: float,
-        done: bool,
-        final_state: "GameState | None",
-    ) -> float:
-        """Proper terminal reward (ported from boss). WIN=+1.25, LOSS=-1.0 × 100."""
-        terminal = 0.0
-        if done:
-            if env_reward > 0.5:
-                terminal = TERMINAL_WIN_REWARD
-                if final_state and final_state.deadwood == 0:
-                    terminal += GIN_BONUS    # +1.25 for GIN
-                else:
-                    terminal += KNOCK_BONUS  # +1.1 for KNOCK
-            else:
-                terminal = TERMINAL_LOSS_REWARD
-        elif final_state:
-            terminal = -final_state.deadwood / 100.0   # partial signal
 
-        step_rewards_with_terminal = list(step_rewards)
-        if step_rewards_with_terminal:
-            step_rewards_with_terminal[-1] += terminal * 100.0
-        else:
-            step_rewards_with_terminal = [terminal * 100.0]
-
-        return self.calculate_discounted_return(step_rewards_with_terminal)
-
-
-# MODULE STATE AND INITIALIZATION FOR GIN RUMMY
+# ---------------------------------------------------------------------------
+# Module-level state
+# ---------------------------------------------------------------------------
 
 _state: dict = {}
 
@@ -833,9 +687,9 @@ def _curriculum_factory(args) -> CurriculumScheduler:
         initial_max_turn=args.initial_max_turn,
         final_max_turn=30,
         rollouts_per_stage=args.rollouts_per_stage,
-        initial_hint_prob=0.0,
+        initial_hint_prob=0.5,
         final_hint_prob=0.0,
-        warmup_rollouts=0,
+        warmup_rollouts=args.rollouts_per_stage,
     )
 
 
@@ -843,11 +697,17 @@ def _ensure_initialized(trainer) -> None:
     if _state.get("initialized"):
         return
 
+    # Auto-detect model tier
+    tier, model_name = _detect_tier(trainer)
+    model_config = _MODEL_CONFIGS[tier]
+    print(f"[MODEL] Detected tier={tier!r} for model={model_name!r}")
+    print(f"[MODEL] Config: inject_bayesian={model_config['inject_bayesian_context']}, max_prompt_len={model_config['max_prompt_len']}")
+
     reset_payload = {
         "task_id": GAMES_TO_TASK_ID_RANGE[_SELECTED_GAME][0],
         "seed": 42,
         "opponent": "mcts",
-        "mcts_max_simulations": _MCTS_SIMS,  # 50 fixed
+        "mcts_max_simulations": _MCTS_SIMS,
         "mcts_num_rollouts": 1,
     }
     rank, env_pool, num_servers, thread_pool, generation_semaphore = init_env_pool(reset_payload)
@@ -866,10 +726,13 @@ def _ensure_initialized(trainer) -> None:
         thread_pool=thread_pool,
         generation_semaphore=generation_semaphore,
         curriculum=curriculum,
+        model_config=model_config,
     )
 
 
-# SYSTEM PROMPTS FOR GIN RUMMY
+# ---------------------------------------------------------------------------
+# Prompts (concise — optimised for Llama-3.2-3B context window)
+# ---------------------------------------------------------------------------
 
 _SYSTEM_PROMPT = (
     "You are playing gin_rummy.\n\n# Game Rules\nGIN RUMMY RULES:\n\n"
@@ -890,71 +753,27 @@ _SYSTEM_PROMPT = (
     "5. Knock: declare end when deadwood ≤ knock_card\n\n"
     "KNOCKING:\n- Gin: 0 deadwood = 25-point bonus\n\n"
     "SCORING: Winner scores difference in deadwood.\n"
-    "Card Values: A=1, 2-9=face value, T/J/Q/K=10 (all face cards = 10 deadwood pts)\n\n"
-    "IMPORTANT: Always respond with the action ID number ONLY.\n\n"
-    "# Output Format\nYou must respond with ONLY the action ID (a single number).\n"
-    "Do NOT include descriptions or explanations.\n\n"
-    'Examples:\n- For action "0 -> roll": respond "0"\n- For action "89 -> a3": respond "89"'
+    "Card Values: A=1, 2-10=face value, J=11, Q=12, K=13\n\n"
+    "IMPORTANT: Always respond with the action ID number ONLY, never card names.\n\n"
+    '# Output Format\nYour output must strictly follow this format: "Thought:\nyour thoughts ONLY in text.\n\nAction:\nONLY your action ID (a single number)."\n'
 )
 
 _HINT_PROMPT = (
     "\n\n**Think short and act quickly!**\n\n# Strategy Tips\n"
-    "- Early game: Draw from deck to see more cards\n"
+    "- KNOCK IMMEDIATELY when your deadwood is at or below the knock card value!\n"
+    "- Prefer drawing from STOCK (action 53) to keep your hand hidden\n"
+    "- Only draw the upcard (action 52) if it completes a meld\n"
+    "- Discard your HIGHEST deadwood card first (K=13, Q=12, J=11)\n"
     "- Build runs and sets to reduce deadwood\n"
     "- Track opponent's discards to guess their hand\n"
-    "- Knock when you have ≤10 deadwood points and think you're ahead\n"
-    "- Go for Gin (0 deadwood) when close for bonus points\n"
-    "- In Layoff phase: use 'Dead cards' hint to find extension opportunities\n"
+    "- Go for Gin (0 deadwood) ONLY when very close, otherwise knock!\n"
     "- IMPORTANT: YOU MUST PICK THE ACTION ID FROM THE LEGAL ACTIONS."
 )
 
 
-# KNOCK CONTEXT BUILDER (ported from boss — critical for Done rate)
-
-def _build_knock_context_from_obs(observation: str) -> str:
-    """Inject explicit knock awareness into every observation.
-
-    Without this, models never knock → game never ends → Done:0 always → no terminal reward.
-    Boss uses this in every turn (always injected, no hint_prob decay).
-    """
-    dw_match = re.search(r'Deadwood=(\d+)', observation)
-    kc_match = re.search(r'Knock card: (\d+)', observation)
-    if not dw_match or not kc_match:
-        return ""
-    dw = int(dw_match.group(1))
-    kc = int(kc_match.group(1))
-    lines = []
-    if dw <= kc:
-        if dw == 0:
-            lines.append(
-                "[GIN AVAILABLE] Your deadwood is 0! You can declare GIN "
-                "for a 25-point bonus! Select the Knock action from Legal Actions!"
-            )
-        else:
-            lines.append(
-                f"[KNOCK AVAILABLE] Your deadwood ({dw}) <= knock card ({kc}). "
-                f"You CAN KNOCK NOW to end the hand and likely win! "
-                f"Look for the Knock action in Legal Actions!"
-            )
-            lines.append(
-                "GOOD: Knock NOW -> Win before opponent can knock. "
-                "BAD: Keep drawing -> Risk opponent knocking first or reaching Gin."
-            )
-    elif dw <= kc + 5:
-        gap = dw - kc
-        lines.append(
-            f"[NEAR KNOCK] Deadwood={dw}, need {kc} or less to knock "
-            f"(reduce {gap} more points). Prioritize discarding high-value unmelded cards!"
-        )
-        lines.append(
-            "GOOD: Discard highest unmelded card -> Reach knock fastest. "
-            "BAD: Hold high cards hoping for set -> Deadwood stays high."
-        )
-    lines.append(f"[DEADWOOD] Current: {dw} | Knock threshold: {kc}")
-    return "\n".join(lines)
-
-
-# CORE EPISODE RUNNER FOR GIN RUMMY
+# ---------------------------------------------------------------------------
+# Core episode runner
+# ---------------------------------------------------------------------------
 
 def _run_episode(
     index: int,
@@ -969,18 +788,29 @@ def _run_episode(
     generation_semaphore: Semaphore,
     current_max_turn: int,
     current_hint_prob: float,
+    model_config: dict,
 ) -> tuple[int, "dict | None"]:
-    """Run one Gin Rummy episode with Bayesian opponent modelling."""
+    """
+    Run one Gin Rummy episode with Bayesian opponent modelling.
+
+    Follows the same episode runner pattern as gin_rummy_env.py:
+    - Parse GameState per turn
+    - Track Bayesian models (BayesianOpponentModel + BayesianOpponentHandModel)
+    - Inject Bayesian context into observations (last-prompt mode)
+    - Collect step rewards → γ-discounted return
+    """
     game_id      = int(prompt)
     server_idx   = (index + rank) % num_servers
     env_endpoint = env_pool[server_idx]["base_url"]
 
-    episode_prompt_ids:     list[int]   = []
-    episode_completion_ids: list[int]   = []
-    episode_logprobs:       list[float] = []
-    episode_action_mask:    list[int]   = []
-    prev_full_ids: "list[int] | None"   = None
+    # Full-prompt accumulation state
+    episode_prompt_ids:    list[int]   = []
+    episode_completion_ids: list[int]  = []
+    episode_logprobs:      list[float] = []
+    episode_action_mask:   list[int]   = []
+    prev_full_ids: "list[int] | None"  = None
 
+    # Last-prompt fallback (updated every loop iteration)
     prompt_ids:     list[int]   = []
     completion_ids: list[int]   = []
     logprobs:       list[float] = []
@@ -995,38 +825,40 @@ def _run_episode(
     calculator          = RewardCalculator()
     prev_discard_pile:  list[str]       = []
 
-    # Opponent modelling — only in last-prompt mode
+    # Opponent modelling — Bayesian models for reward shaping (all tiers)
+    # Context injection only for 7B+ (model_config['inject_bayesian_context'])
     bayesian_model: "BayesianOpponentModel | None"     = None
     bayes_hand:     "BayesianOpponentHandModel | None" = None
-    dead_tracker:   DeadCardTracker                    = DeadCardTracker()
+    inject_context = model_config.get("inject_bayesian_context", False)
     if not use_full_prompt:
         bayesian_model = BayesianOpponentModel()
         bayes_hand     = BayesianOpponentHandModel()
 
-    use_hints = random.random() < current_hint_prob
+    # Easy replay: 5% episodes always use hints to prevent forgetting (Lilianweng audit)
+    EASY_REPLAY_PROB = 0.05
+    use_hints = random.random() < max(current_hint_prob, EASY_REPLAY_PROB)
 
     # --- Reset environment ---
     reset_payload = {
         "task_id": game_id,
-        "seed":    random.randint(0, 2 ** 31 - 1),
+        "seed":    game_id,
         "opponent": "mcts",
-        "mcts_max_simulations": _MCTS_SIMS,  # 50 fixed
+        "mcts_max_simulations": _MCTS_SIMS,
         "mcts_num_rollouts": 1,
     }
     try:
         reset_res = requests.post(f"{env_endpoint}/reset", json=reset_payload, timeout=_TIMEOUT)
         reset_res.raise_for_status()
-        result_block          = reset_res.json()["result"]
-        episode_id            = result_block.get("episode_id", "")
-        raw_observation       = result_block.get("observation", "")
+        result_block        = reset_res.json()["result"]
+        episode_id          = result_block.get("episode_id", "")
+        raw_observation     = result_block.get("observation", "")
         formatted_observation = extract_and_format_observation(raw_observation)
-        initial_game_state    = parse_game_state(formatted_observation)
+        initial_game_state  = parse_game_state(formatted_observation)
         game_state_history.append(initial_game_state)
         prev_discard_pile = list(initial_game_state.discard_pile)
-        dead_tracker.update_from_discard_pile(initial_game_state.discard_pile)
         if not use_full_prompt and bayes_hand is not None:
-            actual_hand_size           = len(initial_game_state.hand)
-            bayes_hand._opp_hand_size  = actual_hand_size if actual_hand_size > 0 else 7
+            actual_hand_size = len(initial_game_state.hand)
+            bayes_hand._opp_hand_size = actual_hand_size if actual_hand_size > 0 else 7
             bayes_hand.initialize(
                 our_hand=initial_game_state.hand,
                 discard_pile=initial_game_state.discard_pile,
@@ -1042,77 +874,23 @@ def _run_episode(
     ]
 
     # --- Interaction loop ---
-    while not done and turn_number < current_max_turn:
-        with generation_semaphore:
-            try:
-                rollout_outputs = generate_rollout_completions(trainer, prompts=[messages], as_chat=True)[0]
-            except Exception as exc:
-                print(
-                    f"Warning: vLLM error at turn {turn_number} "
-                    f"(game {game_id}): {type(exc).__name__}: {exc}"
-                )
-                done = True
-                break
+    effective_max_turn = current_max_turn
 
-        prompt_ids      = rollout_outputs.get("prompt_ids", [])
-        completion_ids  = rollout_outputs.get("completion_ids", [])
-        logprobs        = rollout_outputs.get("logprobs", [])
+    while not done and turn_number < effective_max_turn:
+        with generation_semaphore:
+            rollout_outputs = generate_rollout_completions(trainer, prompts=[messages], as_chat=True)[0]
+
+        prompt_ids     = rollout_outputs.get("prompt_ids", [])
+        completion_ids = rollout_outputs.get("completion_ids", [])
+        logprobs       = rollout_outputs.get("logprobs", [])
         completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
         action_to_send  = extract_action_id(completion_text)
 
-        # Phase-aware fallback: if model output is not a valid legal action ID
-        # ROBUST: never send raw text to env, always default to safe action
-        def _extract_legal_ids(obs_text: str) -> list[int]:
-            """Try multiple regex formats: '0 ->', '[0]:', '(0):', '0.', '0)', '0 word'"""
-            for pattern in [
-                r"^\s*[\[\(]?(\d+)[\]\)]?\s*[->:]+",   # 0->, [0]:, (0):
-                r"^\s*(\d+)[\.\)]\s+",                  # 0., 0)
-                r"^\s*(\d+)\s+\w",                      # 0 word
-            ]:
-                ids = [int(m.group(1)) for m in re.finditer(pattern, obs_text, re.MULTILINE)]
-                if ids:
-                    return ids
-            return []
-
-        try:
-            last_obs = messages[-1]["content"] if messages and messages[-1]["role"] == "user" else ""
-            legal_ids = _extract_legal_ids(last_obs)
-            parsed_id = int(action_to_send.strip())
-            if legal_ids and parsed_id not in legal_ids:
-                prev_gs = game_state_history[-1] if game_state_history else None
-                phase   = prev_gs.phase if prev_gs else ""
-                if phase == "Draw" and 53 in legal_ids:
-                    action_to_send = "53"   # draw stock — always safe in Draw phase
-                elif phase in ("FirstUpcard", "Layoff") and 54 in legal_ids:
-                    action_to_send = "54"   # pass — always safe in FirstUpcard/Layoff
-                else:
-                    action_to_send = str(legal_ids[0])  # first legal = safest fallback
-                print(f"[GR-FALLBACK] T{turn_number}: invalid ({parsed_id}) → {action_to_send} (phase={phase})")
-        except Exception as _fb_exc:
-            # GUARANTEE: never send raw text to env (Qwen3 markdown/JSON output crashed parser before)
-            raw_preview = repr(action_to_send)[:60] if isinstance(action_to_send, str) else str(action_to_send)[:60]
-            try:
-                # Search backwards for the last USER observation (contains legal action IDs)
-                last_obs = ""
-                for msg in reversed(messages):
-                    if msg.get("role") == "user":
-                        last_obs = msg["content"]
-                        break
-                legal_ids = _extract_legal_ids(last_obs)
-                if legal_ids:
-                    action_to_send = str(legal_ids[0])
-                    print(f"[GR-FALLBACK] T{turn_number}: parse failed → {action_to_send} (first legal, raw was {raw_preview})")
-                else:
-                    action_to_send = "0"   # ultimate safety: never send raw text
-                    print(f"[GR-FALLBACK] T{turn_number}: NO legal_ids found, default '0' (raw was {raw_preview})")
-            except Exception as _fb2_exc:
-                action_to_send = "0"   # last-resort safety
-                print(f"[GR-FALLBACK] T{turn_number}: double fallback failed ({_fb2_exc}), default '0'")
-
         # --- Full-prompt token accumulation ---
         if use_full_prompt:
-            if len(prompt_ids) > _MAX_PROMPT_LEN:  # 5000 token cap
-                print(f"Warning: Prompt exceeded {_MAX_PROMPT_LEN} tokens at turn {turn_number}, ending early")
+            _max_prompt = model_config.get("max_prompt_len", 5000)
+            if len(prompt_ids) > _max_prompt:
+                print(f"Warning: Prompt exceeded {_max_prompt} tokens at turn {turn_number}, ending early")
                 done = True
                 break
 
@@ -1161,58 +939,43 @@ def _run_episode(
             print(f"Step failed: {exc}")
             step_reward = -0.01
             done        = False
-            is_invalid  = True  # mark invalid so penalty applies via invalid path below
+            invalid_count += 1
 
         if "Nothing happens" in formatted_observation or "Invalid" in formatted_observation:
+            invalid_count += 1
             is_invalid = True
-
-        if is_invalid:
-            invalid_count += 1  # Bug #1 fix: single increment regardless of failure source
 
         immediate_reward = 0.0
         if done:
             final_reward = step_reward
             messages.append({"role": "user", "content": formatted_observation})
         else:
-            # Build augmented observation with full context (boss pattern)
-            current_hand = game_state_history[-1].hand if game_state_history else []
+            # --- Dynamic knock reminder (inject when can_knock is True) ---
+            knock_reminder = ""
+            if game_state_history:
+                latest_gs = game_state_history[-1]
+                if latest_gs.can_knock():
+                    knock_reminder = (
+                        f"\n\n⚡ You CAN knock now! "
+                        f"Deadwood ({latest_gs.deadwood}) ≤ knock card ({latest_gs.knock_card}). "
+                        f"Choose action 55 to KNOCK!"
+                    )
 
-            # P1: Knock context — always injected (not subject to hint decay)
-            knock_context = _build_knock_context_from_obs(formatted_observation)
-
-            if not use_full_prompt and bayesian_model is not None and bayes_hand is not None:
+            # Bayesian context injection: ON for 7B+ (large tier), OFF for 3B-4B
+            if inject_context and not use_full_prompt and bayesian_model is not None and bayes_hand is not None:
+                current_hand = game_state_history[-1].hand if game_state_history else []
                 bayes_summary      = bayesian_model.summary(current_hand)
                 bayes_hand_summary = bayes_hand.summary(current_hand)
-            else:
-                bayes_summary, bayes_hand_summary = "", ""
-
-            # P2: DeadCardTracker context (update AFTER parse below, not here)
-            dead_summary = dead_tracker.summary(current_hand)
-
-            # P2: RAG context — capture BOTH text and action hint from PRE-action state
-            rag_ctx        = ""
-            rag_action_hint = ""
-            if game_state_history:
-                rag_ctx, rag_action_hint = _RUMMY_RAG.retrieve(game_state_history[-1])
-
-            # P1+: CFR knock context (supplements _build_knock_context with stock/opp-risk awareness)
-            cfr_ctx = ""
-            if game_state_history and bayes_hand is not None:
-                last_gs   = game_state_history[-1]
-                opp_risk  = bayes_hand.knock_risk()
-                cfr_ctx   = _KNOCK_CFR.context(
-                    last_gs.deadwood, last_gs.stock_size, opp_risk, last_gs.can_knock()
+                context_parts      = [p for p in [bayes_summary, bayes_hand_summary] if p]
+                obs_augmented = (
+                    formatted_observation + "\n\n" + "\n".join(context_parts)
+                    if context_parts else formatted_observation
                 )
+                messages.append({"role": "user", "content": obs_augmented + knock_reminder})
+            else:
+                messages.append({"role": "user", "content": formatted_observation + knock_reminder})
 
-            context_parts = [p for p in [knock_context, cfr_ctx, dead_summary, bayes_summary, bayes_hand_summary, rag_ctx] if p]
-
-            obs_augmented = (
-                formatted_observation + "\n\n" + "\n".join(context_parts)
-                if context_parts else formatted_observation
-            )
-            messages.append({"role": "user", "content": obs_augmented})
-
-            # Parse game state and update trackers
+            # --- Parse game state and update trackers ---
             if not is_invalid:
                 try:
                     game_state = parse_game_state(formatted_observation)
@@ -1221,8 +984,8 @@ def _run_episode(
                     immediate_reward = -10.0
                 else:
                     game_state_history.append(game_state)
-                    dead_tracker.update_from_discard_pile(game_state.discard_pile)
 
+                    # Update Bayesian models (last-prompt mode)
                     if not use_full_prompt and bayesian_model is not None and bayes_hand is not None:
                         bayesian_model.update_from_discard_pile_delta(prev_discard_pile, game_state.discard_pile)
                         if len(game_state.discard_pile) < len(prev_discard_pile):
@@ -1241,61 +1004,34 @@ def _run_episode(
                         game_state_history, action_to_send, 0.0,
                         bayesian_model=bayesian_model,
                     )
-
-                    # P3-M5: Near Knock Discard Bonus
-                    if len(game_state_history) >= 2 and game_state.phase == 'Discard':
-                        prev_state = game_state_history[-2]
-                        gap = game_state.deadwood - game_state.knock_card
-                        if 0 < gap <= 5 and game_state.deadwood < prev_state.deadwood:
-                            immediate_reward += NEAR_KNOCK_DISCARD_BONUS
-
-                    # P3-L3: Opponent Confirmed Discard Penalty
-                    if game_state.phase == 'Discard' and game_state.discard_pile and bayes_hand is not None:
-                        last_discard = game_state.discard_pile[-1] if game_state.discard_pile else ''
-                        if last_discard and len(last_discard) == 2:
-                            for conf_card in bayes_hand._confirmed_in_hand:
-                                if len(conf_card) == 2 and conf_card[0] == last_discard[0].lower():
-                                    immediate_reward -= OPP_CONFIRMED_DISCARD_PENALTY
-                                    break
-
-                    # P3-L4: Signal-Aware Discard Bonus (ToM alignment)
-                    if game_state.phase == 'Discard' and len(game_state.discard_pile) >= 3:
-                        last_discard = game_state.discard_pile[-1] if game_state.discard_pile else ''
-                        if last_discard and len(last_discard) == 2:
-                            discard_suit = last_discard[1].lower()
-                            suit_count = sum(1 for c in game_state.discard_pile[:-1]
-                                             if len(c) == 2 and c[1].lower() == discard_suit)
-                            if suit_count >= 2:
-                                immediate_reward += SIGNAL_AWARE_DISCARD_BONUS
-
-                    # P2: RAG alignment shaping — compare action against PRE-action state hint
-                    if rag_action_hint:
-                        is_knock_action = action_to_send == "55"
-                        action_matches  = (
-                            (rag_action_hint == "knock" and is_knock_action) or
-                            (rag_action_hint == "discard_high" and action_to_send not in ("52", "53", "54"))
-                        )
-                        if action_matches:
-                            immediate_reward += RAG_ALIGNMENT_BONUS
             else:
                 immediate_reward = -10.0
+
+        if done:
+            # Direct scaling — any win is positive, any loss is negative
+            # No -0.5 offset: small-margin wins should still be rewarded
+            if step_reward > 0.5:
+                immediate_reward = step_reward * 60.0   # Win: 30-60 range
+            elif step_reward > 0.0:
+                immediate_reward = step_reward * 20.0   # Small win: 0-10 range
+            else:
+                immediate_reward = -30.0                # Loss: flat penalty
 
         rewards.append(immediate_reward)
         turn_number += 1
 
-    # --- Episode reward: proper terminal signal (boss pattern) WIN=+1.25, LOSS=-1.0 × 100 ---
-    final_state  = game_state_history[-1] if game_state_history else None
-    train_reward = calculator.calculate_episode_reward(rewards, final_reward, done, final_state)
-    initial_dw   = game_state_history[0].deadwood if game_state_history else 0
-    final_dw     = final_state.deadwood if final_state else 0
+    # --- Episode reward ---
+    train_reward = calculator.calculate_discounted_return(rewards)
+    initial_dw = game_state_history[0].deadwood if game_state_history else 0
+    final_dw   = game_state_history[-1].deadwood if game_state_history else 0
     print(
         f"[ID:{game_id} Hints:{int(use_hints)} Done:{int(done)} T:{turn_number:2d} "
         f"Ret:{train_reward:6.2f} EnvR:{final_reward:5.1f} "
-        f"DW:{initial_dw:2d}\u2192{final_dw:2d} Inv:{invalid_count}"
+        f"DW:{initial_dw:2d}→{final_dw:2d} Inv:{invalid_count}"
     )
 
     if use_full_prompt:
-        if len(episode_completion_ids) > _MAX_EPISODE_TOKENS:  # 16384 hard cap
+        if len(episode_completion_ids) > _MAX_EPISODE_TOKENS:
             episode_completion_ids = episode_completion_ids[:_MAX_EPISODE_TOKENS]
             episode_logprobs       = episode_logprobs[:_MAX_EPISODE_TOKENS]
             episode_action_mask    = episode_action_mask[:_MAX_EPISODE_TOKENS]
@@ -1306,22 +1042,22 @@ def _run_episode(
             "logprobs":       episode_logprobs,
             "reward":         train_reward,
             "final_score":    final_reward,
-            "done":           done,   # Bug fix: explicit done flag for correct finished_rate
         }
-    return index, {
-        "prompt_ids":     prompt_ids,
-        "completion_ids": completion_ids,
-        "logprobs":       logprobs,
-        "reward":         train_reward,
-        "final_score":    final_reward,
-        "done":           done,       # Bug fix: explicit done flag for correct finished_rate
-    }
+    else:
+        return index, {
+            "prompt_ids":     prompt_ids,
+            "completion_ids": completion_ids,
+            "logprobs":       logprobs,
+            "reward":         train_reward,
+            "final_score":    final_reward,
+        }
 
 
-# PUBLIC ROLLOUT FUNCTIONS FOR GIN RUMMY
+# ---------------------------------------------------------------------------
+# Public rollout functions
+# ---------------------------------------------------------------------------
 
 def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
-    """Common dispatch + aggregation logic for both rollout variants."""
     _ensure_initialized(trainer)
 
     curriculum        = _state["curriculum"]
@@ -1340,50 +1076,28 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
         generation_semaphore=_state["generation_semaphore"],
         current_max_turn=current_max_turn,
         current_hint_prob=current_hint_prob,
+        model_config=_state["model_config"],
     )
 
     _fallback = (
-        {"prompt_ids": [1], "completion_ids": [1], "action_mask": [0],
-         "logprobs": [1.0], "reward": 0.0, "final_score": 0.0}
+        {"prompt_ids": [1], "completion_ids": [1], "action_mask": [0], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0}
         if use_full_prompt else
-        {"prompt_ids": [1], "completion_ids": [1], "logprobs": [1.0],
-         "reward": 0.0, "final_score": 0.0}
+        {"prompt_ids": [1], "completion_ids": [1], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0}
     )
 
     results = [None] * len(prompts)
     futures = [_state["thread_pool"].submit(run, i, p) for i, p in enumerate(prompts)]
     for f in as_completed(futures):
-        try:
-            idx, res = f.result()
-        except Exception as exc:
-            print(f"[ERROR] Game thread threw unhandled exception: {type(exc).__name__}: {exc}")
-            continue
+        idx, res = f.result()
         results[idx] = res if res is not None else _fallback
 
     curriculum.step(len(prompts))
 
     list_results = [r for r in results if r is not None]
-    finished  = sum(1 for r in list_results if r.get("done", False))  # Bug fix: use done flag — loss (score=0) was incorrectly counted as "not finished"
-    wins      = sum(1 for r in list_results if r["final_score"] > 0.5)
+    finished = sum(1 for r in list_results if r["final_score"] != 0)
+    wins     = sum(1 for r in list_results if r["final_score"] > 0.5)
     avg_return = sum(r["reward"] for r in list_results) / len(list_results) if list_results else 0
     print(f"[BATCH] Finished:{finished}/{len(list_results)} Wins:{wins} AvgReturn:{avg_return:.3f}")
-
-    # WandB metrics (best-effort — no crash if wandb not active)
-    try:
-        import wandb as _wandb
-        if _wandb.run is not None:
-            _wandb.log(
-                {
-                    "env/gin_rummy/win_rate":    wins / len(list_results) if list_results else 0.0,
-                    "env/gin_rummy/avg_return":  avg_return,
-                    "curriculum/max_turn":       current_max_turn,
-                    "curriculum/hint_prob":      current_hint_prob,
-                    "curriculum/rollouts":       curriculum.total_rollouts,
-                },
-                commit=False,
-            )
-    except Exception:
-        pass
 
     out = {
         "prompt_ids":     [r["prompt_ids"]     for r in list_results],
@@ -1410,5 +1124,10 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
     trainer,
     max_turns: int = 30,
 ) -> dict[str, list]:
-    """Parallelised rollout — returns only the last turn's token IDs (with Bayesian context injection)."""
+    """Parallelised rollout — returns only the last turn's token IDs.
+
+    Enables full Bayesian opponent modelling (BayesianOpponentModel +
+    BayesianOpponentHandModel) with context injection — compensates the
+    3B model's limited opponent tracking.
+    """
     return _dispatch(prompts, trainer, use_full_prompt=False)

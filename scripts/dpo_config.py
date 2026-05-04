@@ -192,7 +192,7 @@ def get_training_json(train_info: dict) -> dict:
     param_nums = get_model_num_params(model_name, model_path)
     config = get_config(param_nums)
     run_config = {
-        "epoch_num": 6,
+        "epoch_num": 3,
         "batch_size": config["batch_size"],
         "learning_rate": config["lr"],
         "min_lr_rate": 0.25,

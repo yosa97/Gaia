@@ -80,9 +80,7 @@ from envs.liar_dice_env import (
 )
 
 
-# ---------------------------------------------------------------------------
 # ModeConfig — overrides for a single training mode
-# ---------------------------------------------------------------------------
 
 @dataclass
 class ModeConfig:
@@ -105,9 +103,7 @@ class ModeConfig:
     max_completion_length: int | None = None
 
 
-# ---------------------------------------------------------------------------
 # EnvTrainingConfig — full config for one environment
-# ---------------------------------------------------------------------------
 
 @dataclass
 class EnvTrainingConfig:
@@ -136,9 +132,7 @@ class EnvTrainingConfig:
     full_prompt: ModeConfig = field(default_factory=ModeConfig)
 
 
-# ---------------------------------------------------------------------------
 # Registry
-# ---------------------------------------------------------------------------
 
 _REGISTRY: dict[str, EnvTrainingConfig] = {
     "goof_spiel": EnvTrainingConfig(
@@ -169,6 +163,7 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         num_generations=8,
         temperature=2.0,
         top_k=5,
+        vllm_max_model_length=16384,   # match _MAX_PROMPT_LEN=16128 + buffer
         # Aggressive curriculum: skip useless early stages, advance every 128 rollouts
         # With warmup_rollouts=0 (curriculum_factory), max_turn naik dari rollout 128
         # Reach max_turn=30 in ~1920 rollouts (~30-50 min) instead of NEVER
@@ -181,15 +176,11 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         rollout_last=_liar_rollout_last,
         reward_func=_liar_reward,
         curriculum_factory=_liar_curriculum,
-        # Liar's Dice has very long episodes (_MAX_EPISODE_TOKENS=16384).
-        # 8192 gives enough headroom for 7B models on 4 GPUs without OOM.
-        # (reasoning mode adds 2048 on top of this at runtime)
-        vllm_max_model_length=8192,
         reasoning=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
         no_mask=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
         full_prompt=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
         num_generations=8,
-        temperature=2.0,   # T=2.0: matches top competitor — higher entropy → stronger GRPO gradient
+        temperature=2.0,
         top_k=5,
     ),
     "liars_dice_opponent_modeling": EnvTrainingConfig(
@@ -197,15 +188,11 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         rollout_last=_liar_opp_rollout_last,
         reward_func=_liar_opp_reward,
         curriculum_factory=_liar_opp_curriculum,
-        # Liar's Dice has very long episodes (_MAX_EPISODE_TOKENS=16384).
-        # 8192 gives enough headroom for 7B models on 4 GPUs without OOM.
-        # (reasoning mode adds 2048 on top of this at runtime)
-        vllm_max_model_length=8192,
         reasoning=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
         no_mask=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
         full_prompt=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
         num_generations=8,
-        temperature=2.0,   # T=2.0: matches top competitor — higher entropy → stronger GRPO gradient
+        temperature=2.0,
         top_k=5,
     ),
     "leduc_poker": EnvTrainingConfig(
@@ -214,13 +201,8 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         reward_func=_leduc_reward,
         curriculum_factory=_leduc_curriculum,
         num_generations=8,
-        temperature=2.0,   # T=2.0: matches top competitor — higher entropy → stronger GRPO gradient
+        temperature=2.0,
         top_k=5,
-        # Leduc Poker episodes pendek (max 10 turns) — rollouts lebih banyak per stage
-        # agar curriculum naik lebih sering, mirip pola Liar's Dice.
-        reasoning=ModeConfig(initial_max_turn=1, rollouts_per_stage=512),
-        no_mask=ModeConfig(initial_max_turn=1, rollouts_per_stage=512),
-        full_prompt=ModeConfig(initial_max_turn=1, rollouts_per_stage=512),
     ),
     "leduc_poker_opponent_modeling": EnvTrainingConfig(
         rollout_full=_leduc_opp_rollout_full,
@@ -230,10 +212,6 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         num_generations=8,
         temperature=2.0,
         top_k=5,
-        # Sama dengan leduc_poker — episodes pendek, curriculum naik lebih sering.
-        reasoning=ModeConfig(initial_max_turn=1, rollouts_per_stage=512),
-        no_mask=ModeConfig(initial_max_turn=1, rollouts_per_stage=512),
-        full_prompt=ModeConfig(initial_max_turn=1, rollouts_per_stage=512),
     ),
     "alfworld": EnvTrainingConfig(
         rollout_full=_alf_rollout_full,
@@ -242,10 +220,7 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
     ),
 }
 
-
-# ---------------------------------------------------------------------------
 # Variant routing
-# ---------------------------------------------------------------------------
 
 # Change this to select a non-default variant for a base environment name.
 _VARIANT_OVERRIDES: dict[str, str] = {

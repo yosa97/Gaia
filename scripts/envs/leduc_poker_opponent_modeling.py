@@ -1,29 +1,9 @@
-"""
-leduc_poker_opponent_modeling.py
-================================
-Leduc Poker episode runner **with Bayesian opponent modelling**.
-
-Extends leduc_poker_env.py by adding:
-  - OpponentRangeModel  : Bayesian posterior over the opponent's hole card
-                          (J/Q/K), updated after each betting action they take.
-  - OpponentTendencyTracker: tracks fold/call/raise ratios to classify the
-                              opponent as Tight-Passive, Loose-Aggressive, etc.
-  - Augmented observation: appends a concise "Opponent Read" block to every
-                           non-terminal observation so the LLM sees live
-                           inference about the opponent before acting.
-
-Architecture mirrors gin_rummy_opponent_modeling.py:
-  - Opponent models are instantiated ONLY in last-prompt mode (use_full_prompt=False).
-  - full-prompt mode runs identically to leduc_poker_env.py.
-  - Public API is identical: rollout_full_prompt_and_completion_parallelized_curriculum
-                              rollout_last_prompt_and_completion_parallelized_curriculum
-"""
-
 import functools
+import math
 import random
 import re
 from concurrent.futures import as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from threading import Semaphore
 
 import requests
@@ -33,32 +13,43 @@ from envs.shared_env import (
     GAMES_TO_TASK_ID_RANGE,
     CurriculumScheduler,
     init_env_pool,
-    rollout_reward_func,  # re-exported for callers
+    rollout_reward_func,  # re-exported for callers  # noqa: F401
 )
 
 
-# ---------------------------------------------------------------------------
-# Constants (inherited from leduc_poker_env.py)
-# ---------------------------------------------------------------------------
+# CONSTANTS FOR LEDUC POKER
 
-_SELECTED_GAME = "leduc_poker"
-_MAX_EPISODE_TOKENS = 16384
-_MAX_PROMPT_LEN = 4096
-_TIMEOUT = 2400
-_INVALID_PENALTY = -0.1
-_MAX_TURNS = 10
+_SELECTED_GAME       = "leduc_poker"
+_MAX_EPISODE_TOKENS  = 16384  # max tokens per full-prompt episode (16k context window)
+_MAX_PROMPT_LEN      = 4096   # prompt token cap — above this end early to prevent OOM
+_TIMEOUT             = 2400   # HTTP timeout (seconds) — 40 min covers slow MCTS reset
+_MCTS_SIMS           = 50     # fixed MCTS simulations — no progressive ramp for Leduc
+_INVALID_PENALTY     = -5.0   # flat penalty per invalid/failed action (aligned with GR)
+_MAX_TURNS           = 10     # max turns per episode (Leduc is 4-8 actions; 10 = safe cap)
+
+# Debug flag — set True for verbose per-step logging during development.
+_DEBUG = False
+
+# ReAct format toggle — forces model to reason before committing to action.
+# _parse_action() already handles "Action:" prefix so enabling this works immediately.
+_USE_REACT_FORMAT = False
+
+
+# SYSTEM PROMPTS FOR LEDUC POKER
 
 _BASE_SYSTEM_PROMPT = (
     "You are playing leduc_poker.\n\n"
     "# Game Rules\n"
     "LEDUC POKER RULES:\n\n"
-    "Deck: 2 suits × (num_players + 1) ranks. For 2 players: 6 cards (J♠ J♥ Q♠ Q♥ K♠ K♥).\n\n"
+    "Deck: 2 suits \u00d7 (num_players + 1) ranks. For 2 players: 6 cards (J\u2660 J\u2665 Q\u2660 Q\u2665 K\u2660 K\u2665).\n\n"
     "Setup: Each player starts with 100 chips, pays 1 ante. Two rounds of betting.\n\n"
-    "Round 1: Each player receives one private card. Actions: Fold (lose ante), Call/Check (match current bet), "
-    "Raise (add 2 chips to bet). Maximum 2 raises per round.\n"
+    "Round 1: Each player receives one private card. Actions: Fold (lose ante), Call/Check "
+    "(match current bet), Raise (add 2 chips to bet). Maximum 2 raises per round.\n"
     "Round 2: One public card is revealed. Same actions, but Raise adds 4 chips.\n\n"
     "Winning: Player with best hand wins pot (or last remaining if others fold).\n"
-    "Hand ranking (high to low): Pair (private + public match) > High card value (K > Q > J).\n\n\n\n"
+    "Hand ranking (high to low): Pair (private + public match) > High card value (K > Q > J).\n\n"
+    "IMPORTANT: Fold is only available when there is a bet to match (opponent raised). "
+    "If no one has raised yet, you CANNOT fold \u2014 you can only Check (Call) or Raise.\n\n\n\n"
     "# Output Format\n"
     "You must respond with ONLY the action ID (a single number).\n"
     "Do NOT include descriptions or explanations.\n\n"
@@ -68,29 +59,52 @@ _BASE_SYSTEM_PROMPT = (
 )
 
 _HINT_PROMPT = (
-    "\n\n# Strategy Tips\n"
-    "Round 1:\n"
-    "- Hold K or Q → call a raise; raise first if unchallenged.\n"
-    "- Hold J → fold against a raise; check if unchallenged.\n\n"
-    "Round 2 (public card revealed):\n"
-    "- You have a PAIR → raise; never fold.\n"
-    "- You have K (no pair) → raise first; call if opponent raises.\n"
-    "- You have Q (no pair), public card is K → raise first; call if opponent raises.\n"
-    "- You have Q (no pair), public card is J → check; fold if opponent raises.\n"
-    "- You have J (no pair) → check; fold if opponent raises.\n"
+    "\n\n# Strategy Guide\n"
+    "ROUND 1:\n"
+    "- K in hand \u2192 Raise (strongest non-pair; builds pot for potential R2 pair)\n"
+    "- Q in hand \u2192 Call (middle hand; wait to see public card)\n"
+    "- J in hand \u2192 Call; fold if opponent raises twice (weakest hand, bad pot odds)\n\n"
+    "ROUND 2 (public card now visible):\n"
+    "- Public card SAME RANK as your card \u2192 PAIR \u2192 always Raise (dominant hand)\n"
+    "- No pair + K \u2192 Call opponent raises (K beats Q and J without pair)\n"
+    "- No pair + Q \u2192 Call if opponent only called; Fold to raises\n"
+    "- No pair + J \u2192 Fold to any Raise (weakest non-pair)\n\n"
+    "READING OPPONENT:\n"
+    "- Opponent raised R1 then checked R2 \u2192 likely missed pair (caught bluffing)\n"
+    "- Opponent raised both rounds \u2192 likely has a pair; be cautious without one\n"
+    "- Opponent folded to your raise \u2192 bet was credible; note their threshold\n\n"
+    "EXPLOITING THE MCTS OPPONENT (50 simulations, 1 random rollout per node):\n"
+    "- Leduc Poker has only 936 total information states; at 50 sims MCTS covers < 10% per decision\n"
+    "- MCTS uses random rollouts (not Nash equilibrium) \u2192 it underestimates bluffing value\n"
+    "- Random rollouts from any position win ~1/3 of the time \u2192 MCTS sees all positions as similar\n"
+    "- Play Nash equilibrium (the strategy guide above) \u2014 it ALWAYS outperforms MCTS pure strategy\n"
+    "- Key exploit: MCTS is overly passive with J \u2014 raise with K/Q more than MCTS expects\n"
+    "- Key exploit: MCTS folds too rarely vs aggressive raises \u2014 raise more with pairs in R2\n"
+    "- MCTS cannot adapt its strategy based on your betting history \u2014 consistent patterns are safe\n"
+)
+
+# ReAct format instruction appended to observations when _USE_REACT_FORMAT=True.
+# Forces the model to articulate reasoning before choosing an action (chain-of-thought).
+_REACT_FORMAT_INSTRUCTIONS = (
+    '\n\nYour output must strictly follow this format:\n'
+    '"Thought:\nyour thoughts ONLY in text.\n\nAction:\nONLY your action ID (a single number)."'
 )
 
 
-# ---------------------------------------------------------------------------
-# Game state dataclass and parser (identical to leduc_poker_env.py)
-# ---------------------------------------------------------------------------
+# GAME STATE FOR LEDUC POKER
 
 _CARD_RANK: dict[str, int] = {"J": 1, "Q": 2, "K": 3}
 
 
 @dataclass
 class GameState:
-    """Structured representation of a Leduc Poker observation."""
+    """
+    Structured representation of a Leduc Poker observation.
+
+    All fields are parsed directly from the observation text.  Derived
+    properties compute common strategy quantities so reward-shaping code
+    can stay readable.
+    """
     player_id:         int
     private_card:      str
     private_card_rank: int
@@ -140,6 +154,7 @@ class GameState:
 
     @property
     def hand_strength(self) -> int:
+        """4=Pair, 3=K, 2=Q, 1=J."""
         if self.has_pair:
             return 4
         return self.private_card_rank
@@ -172,16 +187,14 @@ def parse_game_state(obs: str) -> "GameState | None":
         return None
     private_card_rank = _CARD_RANK.get(private_card[0], 0)
 
-    pub_raw = _find(r"Public card:\s*(\S+)")
+    pub_raw          = _find(r"Public card:\s*(\S+)")
     public_card      = pub_raw
     public_card_rank = _CARD_RANK.get(pub_raw[0], 0) if pub_raw else None
 
-    has_pair = "Hand: Pair" in obs
-
+    has_pair  = "Hand: Pair" in obs
     round_str = _find(r"Current round:\s*(\d+)/\d+", "1")
-    round_ = int(round_str)
-
-    pot      = int(_find(r"Pot size:\s*(\d+)", "0"))
+    round_    = int(round_str)
+    pot       = int(_find(r"Pot size:\s*(\d+)", "0"))
     our_chips = int(_find(r"Your chips:\s*(\d+)", "100"))
     opp_chips = int(_find(r"Opponent chips:\s*(\d+)", "100"))
 
@@ -215,204 +228,37 @@ def parse_game_state(obs: str) -> "GameState | None":
     )
 
 
-# ---------------------------------------------------------------------------
-# *** OPPONENT MODELING LAYER ***
-# ---------------------------------------------------------------------------
 
-class OpponentRangeModel:
-    """
-    Bayesian posterior over the opponent's private card (J / Q / K).
-
-    Prior
-    -----
-    Since the deck has 2 copies of each rank and we know our own card,
-    the prior is P(J) = P(Q) = P(K) = 1/3, adjusted if we hold one copy.
-
-    Update rules (heuristic Bayesian)
-    -----------------------------------
-    Leduc poker is solved → optimal play is well-characterised:
-      R1 Raise  → likely K (0.5×) or Q (0.3×), unlikely J (0.2×)
-      R1 Check  → likely J (0.4×) or Q (0.35×), less likely K (0.25×)
-      R1 Fold   → impossible (would mean folding before round 2)
-      R2 Raise  → very likely Pair (0.6×) or K (0.3×); unlikely J/Q no-pair
-      R2 Check  → likely J-no-pair (0.45×) or Q-no-pair (0.3×)
-      R2 Fold   → very likely J-no-pair (0.55×) or Q-pubK (0.3×)
-
-    After each update the posterior is renormalized.
-    """
-
-    CARDS = ["J", "Q", "K"]
-
-    # Likelihood multipliers for each (round, action) combination
-    # Format: {(round, action): {card: multiplier}}
-    _LIKELIHOODS: dict[tuple, dict[str, float]] = {
-        (1, "Raise"): {"J": 0.20, "Q": 0.35, "K": 0.55},
-        (1, "Call"):  {"J": 0.35, "Q": 0.40, "K": 0.25},
-        (1, "Check"): {"J": 0.40, "Q": 0.35, "K": 0.25},
-        (1, "Fold"):  {"J": 0.70, "Q": 0.25, "K": 0.05},
-        (2, "Raise"): {"J": 0.10, "Q": 0.25, "K": 0.30},   # pair gets extra below
-        (2, "Call"):  {"J": 0.25, "Q": 0.40, "K": 0.35},
-        (2, "Check"): {"J": 0.50, "Q": 0.35, "K": 0.15},
-        (2, "Fold"):  {"J": 0.60, "Q": 0.30, "K": 0.10},
-    }
-
-    def __init__(self, our_card_rank: int) -> None:
-        # Prior: uniform, but if we hold a copy of a rank there's one fewer in deck
-        prior = {c: 1.0 for c in self.CARDS}
-        # Slight adjustment: reduce rank matching our own card (one less in deck)
-        our_rank_str = {1: "J", 2: "Q", 3: "K"}.get(our_card_rank)
-        if our_rank_str:
-            prior[our_rank_str] = 0.5   # one copy taken by us
-        total = sum(prior.values())
-        self._posterior: dict[str, float] = {c: v / total for c, v in prior.items()}
-        self.has_pair_evidence: bool = False
-
-    def update(self, round_: int, action_str: str, public_card_rank: "int | None" = None) -> None:
-        """Update posterior after observing the opponent's action in `round_`."""
-        key = (round_, action_str)
-        likelihoods = self._LIKELIHOODS.get(key)
-        if likelihoods is None:
-            return
-
-        # Pair bonus for R2 Raise: if opp raises in R2 there's a strong chance
-        # they have a pair (private == public).  We can't know for sure, but
-        # we can note "pair evidence" and adjust K upward since K no-pair also raises.
-        if round_ == 2 and action_str == "Raise" and public_card_rank is not None:
-            pub_str = {1: "J", 2: "Q", 3: "K"}.get(public_card_rank, "")
-            if pub_str:
-                # Opponent might have pair with pub card's rank
-                pair_boost = 0.4
-                likelihoods = dict(likelihoods)  # copy to avoid mutating class var
-                likelihoods[pub_str] = min(likelihoods[pub_str] + pair_boost, 1.0)
-
-        # Bayesian update: posterior ∝ prior × likelihood
-        unnorm = {c: self._posterior[c] * likelihoods.get(c, 1.0) for c in self.CARDS}
-        total = sum(unnorm.values())
-        if total > 0:
-            self._posterior = {c: v / total for c, v in unnorm.items()}
-
-    def most_likely_card(self) -> str:
-        return max(self._posterior, key=lambda c: self._posterior[c])
-
-    def probability(self, card: str) -> float:
-        return self._posterior.get(card, 0.0)
-
-    def summary(self) -> str:
-        probs = sorted(self._posterior.items(), key=lambda x: -x[1])
-        prob_str = "  ".join(f"{c}:{p:.0%}" for c, p in probs)
-        ml = probs[0][0]
-        conf = probs[0][1]
-        lines = [f"[RangeModel] Opp card estimate: {prob_str}"]
-        if conf >= 0.55:
-            lines.append(f"[RangeModel] Most likely: {ml} (confidence {conf:.0%})")
-            if ml == "K":
-                lines.append("[RangeModel] Caution: opponent likely has K — be careful raising/calling")
-            elif ml == "J":
-                lines.append("[RangeModel] Opportunity: opponent likely has J — raise/stay in")
-        return "\n".join(lines)
-
-
-class OpponentTendencyTracker:
-    """
-    Tracks fold / call / raise counts for the opponent to classify their
-    playing style: Tight-Passive, Loose-Aggressive, Bluff-Heavy, etc.
-
-    Useful for adjusting our aggression level.
-    """
-
-    def __init__(self) -> None:
-        self.counts: dict[str, int] = {"Fold": 0, "Call": 0, "Check": 0, "Raise": 0}
-        self.total: int = 0
-
-    def record(self, action_str: str) -> None:
-        if action_str in self.counts:
-            self.counts[action_str] += 1
-            self.total += 1
-
-    def raise_rate(self) -> float:
-        return self.counts["Raise"] / self.total if self.total > 0 else 0.0
-
-    def fold_rate(self) -> float:
-        return self.counts["Fold"] / self.total if self.total > 0 else 0.0
-
-    def style(self) -> str:
-        if self.total < 2:
-            return "Unknown"
-        rr = self.raise_rate()
-        fr = self.fold_rate()
-        if rr >= 0.5:
-            return "Loose-Aggressive (LAG)"
-        elif rr >= 0.25 and fr <= 0.15:
-            return "Loose-Passive (LP)"
-        elif rr <= 0.15 and fr >= 0.30:
-            return "Tight-Passive (TP)"
-        elif rr >= 0.25 and fr >= 0.25:
-            return "Tight-Aggressive (TAG)"
-        return "Balanced"
-
-    def summary(self) -> str:
-        if self.total < 2:
-            return ""
-        style = self.style()
-        rr    = self.raise_rate()
-        fr    = self.fold_rate()
-        lines = [
-            f"[TendencyTracker] Opp style: {style}",
-            f"[TendencyTracker] Raise rate: {rr:.0%}  Fold rate: {fr:.0%}",
-        ]
-        if "LAG" in style:
-            lines.append("[TendencyTracker] Tip: opp raises a lot — weight toward calling/folding with weak hand")
-        elif "TP" in style:
-            lines.append("[TendencyTracker] Tip: opp is passive — bluff/raise more freely")
-        return "\n".join(lines)
-
-
-def _build_opponent_read(
-    range_model: "OpponentRangeModel | None",
-    tendency: "OpponentTendencyTracker | None",
-) -> str:
-    """Combine all opponent model summaries into a clean context block."""
-    parts = []
-    if range_model is not None:
-        parts.append(range_model.summary())
-    if tendency is not None:
-        t = tendency.summary()
-        if t:
-            parts.append(t)
-    return "\n".join(parts)
-
-
-def _augment_observation(obs: str, opponent_read: str) -> str:
-    if not opponent_read:
-        return obs
-    return obs + "\n\n--- Opponent Read ---\n" + opponent_read
-
-
-# ---------------------------------------------------------------------------
-# Reward calculator (identical to leduc_poker_env.py)
-# ---------------------------------------------------------------------------
+# REWARD CALCULATOR FOR LEDUC POKER
 
 class RewardCalculator:
-    """Shaped reward calculator for Leduc Poker training."""
+    """Shaped reward calculator for Leduc Poker — aligned with sampling baseline.
+
+    Design: 10 core Nash-informed signals + strong terminal scaling.
+    DeepStack equity and pot-commitment bonuses REMOVED (over-engineering).
+    """
 
     SIGNALS = {
-        "fold_pair":         -2.0,
-        "fold_k":            -1.5,
-        "fold_kq_r1_raise":  -1.5,
-        "fold_q_pubk_raise": -0.5,
-        "fold_j_r1_raise":   +0.3,
-        "fold_j_r2_raise":   +0.2,
-        "fold_q_pubj_raise": +0.2,
-        "raise_pair_r2":     +0.3,
-        "raise_k_r2":        +0.2,
-        "call_kq_r1_raise":  +0.2,
+        "fold_pair":          -2.0,   # folding a pair = surrendering dominant hand
+        "fold_k":             -1.5,   # folding K = surrendering strongest non-pair
+        "fold_kq_r1_raise":   -1.5,   # folding K or Q to R1 raise = wrong fold
+        "fold_q_pubk_raise":  -0.5,   # folding Q when board=K and opp raised = OK
+        "fold_j_r1_raise":    +0.3,   # folding J to R1 raise = correct (bad pot odds)
+        "fold_j_r2_raise":    +0.2,   # folding J to R2 raise = correct (likely beaten)
+        "fold_q_pubj_raise":  +0.2,   # folding Q when board=J and opp raised = careful
+        "raise_pair_r2":      +0.3,   # raising with pair in R2 = dominant hand aggression
+        "raise_k_r2":         +0.2,   # raising with K in R2 = strong non-pair aggression
+        "call_kq_r1_raise":   +0.2,   # calling with K/Q to R1 raise = correct pot odds
     }
 
-    def __init__(self, terminal_weight: float = 1.0, gamma: float = 0.9):
-        self.terminal_weight = terminal_weight
+    def __init__(self, gamma: float = 0.9):
         self.gamma = gamma
+        self.step_reward_cap = 25.0
+        self.episode_reward_cap = 100.0
 
-    def calculate_step_reward(self, gs: "GameState | None", action_str: str, env_reward: float) -> float:
+    def calculate_step_reward(
+        self, gs: "GameState | None", action_str: str, env_reward: float
+    ) -> float:
         reward = 0.0
 
         if gs is not None:
@@ -424,10 +270,11 @@ class RewardCalculator:
                 elif gs.private_card_rank == 3:
                     reward += self.SIGNALS["fold_k"]
                 elif gs.round == 1 and gs.opp_last_action == "Raise":
-                    if gs.private_card_rank >= 2:
-                        reward += self.SIGNALS["fold_kq_r1_raise"]
-                    else:
-                        reward += self.SIGNALS["fold_j_r1_raise"]
+                    reward += (
+                        self.SIGNALS["fold_kq_r1_raise"]
+                        if gs.private_card_rank >= 2
+                        else self.SIGNALS["fold_j_r1_raise"]
+                    )
                 elif gs.round == 2 and gs.opp_last_action == "Raise":
                     if gs.private_card_rank == 1:
                         reward += self.SIGNALS["fold_j_r2_raise"]
@@ -446,80 +293,30 @@ class RewardCalculator:
                 if gs.round == 1 and gs.opp_last_action == "Raise" and gs.private_card_rank >= 2:
                     reward += self.SIGNALS["call_kq_r1_raise"]
 
+        # Terminal: scale ×100, clip ±50 (aligned with GR)
         if env_reward != 0.0:
-            reward += env_reward * self.terminal_weight
+            reward += max(min(env_reward * 100.0, 50.0), -50.0)
 
-        return reward
+        return max(-self.step_reward_cap, min(self.step_reward_cap, reward))
 
     def calculate_discounted_return(self, rewards: list[float]) -> float:
         if not rewards:
             return 0.0
         T = len(rewards)
-        return sum(self.gamma ** (T - 1 - i) * r for i, r in enumerate(rewards))
+        result = sum(self.gamma ** (T - 1 - i) * r for i, r in enumerate(rewards))
+        return max(-self.episode_reward_cap, min(self.episode_reward_cap, result))
 
 
-# ---------------------------------------------------------------------------
-# Module-level state
-# ---------------------------------------------------------------------------
-
-_state: dict = {}
-
-
-def _curriculum_factory(args) -> CurriculumScheduler:
-    """Construct this env's curriculum from training args. Referenced by env_configs registry."""
-    return CurriculumScheduler(
-        initial_max_turn=args.initial_max_turn,
-        final_max_turn=_MAX_TURNS,
-        rollouts_per_stage=args.rollouts_per_stage,
-        initial_hint_prob=0.75,
-        final_hint_prob=0.0,
-        warmup_rollouts=args.rollouts_per_stage,
-    )
-
-
-def _ensure_initialized(trainer) -> None:
-    """Set up server pool and curriculum once per process (no-op afterwards)."""
-    if _state.get("initialized"):
-        return
-
-    reset_payload = {
-        "task_id": GAMES_TO_TASK_ID_RANGE[_SELECTED_GAME][0],
-        "seed": 42,
-        "opponent": "mcts",
-        "mcts_max_simulations": 50,
-        "mcts_num_rollouts": 1,
-    }
-    rank, env_pool, num_servers, thread_pool, generation_semaphore = init_env_pool(reset_payload)
-
-    curriculum = _curriculum_factory(trainer.args)
-    print(
-        f"[CURRICULUM] Initialized: initial_max_turn={trainer.args.initial_max_turn}, "
-        f"final_max_turn={_MAX_TURNS}, rollouts_per_stage={trainer.args.rollouts_per_stage}"
-    )
-
-    _state.update(
-        initialized=True,
-        rank=rank,
-        env_pool=env_pool,
-        num_servers=num_servers,
-        thread_pool=thread_pool,
-        generation_semaphore=generation_semaphore,
-        curriculum=curriculum,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Observation formatter (identical to leduc_poker_env.py)
-# ---------------------------------------------------------------------------
+# OBSERVATION FORMATTER AND ACTION PARSER FOR LEDUC POKER
 
 def _format_observation(raw: str) -> str:
+    """Reformat server observation to match eval framework format."""
     player_match = re.search(r"You are Player (\d+)\.", raw)
     player_line  = f"You are Player {player_match.group(1)}." if player_match else ""
 
     state_start = raw.find("Current State:")
     if state_start == -1:
         return raw
-
     body = raw[state_start:]
 
     legal_start = body.find("Legal Actions:")
@@ -541,60 +338,170 @@ def _format_observation(raw: str) -> str:
     return "\n\n".join(parts)
 
 
-def _parse_action(completion_text: str, legal_map: "dict[int, str] | None" = None) -> str:
+def _parse_action(
+    completion_text: str, legal_action_map: "dict[int, str] | None" = None
+) -> str:
     """
     Extract action ID from model output.
 
-    If ``legal_map`` is provided and the extracted token does not map to a
-    legal action, returns an empty string so the caller can use the fallback.
+    Tries in order:
+    1. Strip Action: prefix (ReAct format)
+    2. Find valid integer in output
+    3. Keyword fallback: fold / call / check / raise  (reduces invalids when model
+       returns words instead of numbers — adopted from user's implementation)
     """
     action = completion_text.strip()
     if action.endswith("</s>"):
         action = action[:-4].strip()
     if "Action:" in action:
         action = action.split("Action:")[-1].strip()
-    # Keep only the first token (model may output "2 Raise" instead of "2")
-    action = action.split()[0] if action.split() else action
-    if legal_map is not None:
-        try:
-            if int(action) not in legal_map:
-                return ""
-        except (ValueError, TypeError):
-            return ""
+
+    # Try to find first number matching a legal action
+    nums = re.findall(r"-?\d+", action)
+    if nums:
+        if legal_action_map is not None:
+            for n in nums:
+                if int(n) in legal_action_map:
+                    return n
+        else:
+            return nums[0]
+
+    # Keyword fallback — handles model outputting "fold", "call", "raise", "check"
+    if legal_action_map is not None:
+        normalized = action.strip().lower()
+        keyword_map: dict[str, int] = {}
+        for aid, label in legal_action_map.items():
+            ll = label.lower()
+            if "fold"  in ll: keyword_map["fold"]  = aid
+            if "call"  in ll: keyword_map["call"]  = aid
+            if "check" in ll: keyword_map["check"] = aid
+            if "raise" in ll: keyword_map["raise"] = aid
+        for kw, aid in keyword_map.items():
+            if kw in normalized:
+                return str(aid)
+
     return action
 
 
 def _select_fallback_action(gs: "GameState | None") -> str:
     """
-    Nash-inspired fallback when the model produces an invalid action.
+    Nash-based fallback when LLM output cannot be parsed.
 
-    Decision hierarchy (Leduc solved strategy):
-      - Pair or K  → Raise > Call
-      - J vs raise → Fold > Call
-      - Otherwise  → Call > Fold
+    Used instead of sending empty/invalid string to env server.
+    Strategy:
+    - Pair             → Call  (never fold a dominant hand)
+    - K without pair   → Call  (strong non-pair, stay in)
+    - J/Q + opp raised → Fold if available  (bad pot odds)
+    - Default          → Call  (conservative, minimize loss)
     """
-    if gs is None:
-        return "1"
-    la = gs.legal_actions
-    if not la:
-        return "1"
+    if gs is None or not gs.legal_actions:
+        return "0"
 
-    def _pick(*preferred: int) -> str:
-        for a in preferred:
-            if a in la:
-                return str(a)
-        return str(next(iter(la)))
+    fold_id  = next((str(k) for k, v in gs.legal_actions.items() if "Fold"  in v), None)
+    call_id  = next((str(k) for k, v in gs.legal_actions.items() if "Call"  in v or "Check" in v), None)
 
-    if gs.has_pair or gs.private_card_rank == 3:
-        return _pick(2, 1)  # Raise > Call
-    if gs.private_card_rank == 1 and gs.opp_raised_this_round:
-        return _pick(0, 1)  # Fold > Call
-    return _pick(1, 0)      # Call > Fold
+    default = call_id or str(min(gs.legal_actions.keys()))
+
+    if gs.has_pair:
+        return call_id or default          # pair: never fold
+
+    if gs.private_card_rank == 3:
+        return call_id or default          # K: strong non-pair, call
+
+    if gs.private_card_rank <= 2 and gs.opp_raised_this_round and fold_id:
+        return fold_id                     # J or Q vs raise: fold (bad pot odds)
+
+    return default
 
 
-# ---------------------------------------------------------------------------
-# Core episode runner
-# ---------------------------------------------------------------------------
+def _extract_terminal_reward(step_block: dict, observation_text: str) -> float:
+    """
+    Robust terminal reward extraction — tries multiple server response formats.
+
+    Attempts in order:
+    1. info.cumulative_reward  (preferred API field)
+    2. 'Your Return:' in observation text
+    3. 'Normalized Score:' + optional 'Result:' qualifier
+    4. step_block['reward']    (basic fallback)
+    """
+    def _clamp(v: float) -> float:
+        return max(-1.0, min(1.0, v))
+
+    info       = step_block.get("info", {}) if isinstance(step_block, dict) else {}
+    cumulative = info.get("cumulative_reward")
+    if isinstance(cumulative, (int, float)) and not math.isnan(float(cumulative)):
+        return _clamp(float(cumulative))
+
+    m = re.search(r"Your Return:\s*([+-]?\d+(?:\.\d+)?)", observation_text or "")
+    if m:
+        return _clamp(float(m.group(1)))
+
+    m_norm   = re.search(r"Normalized Score:\s*([+-]?\d+(?:\.\d+)?)", observation_text or "")
+    m_result = re.search(r"Result:\s*(WIN|LOSS|DRAW)", observation_text or "", re.IGNORECASE)
+    if m_norm:
+        val = float(m_norm.group(1))
+        if m_result:
+            res = m_result.group(1).upper()
+            val = (-abs(val) if val != 0 else -1.0) if res == "LOSS" \
+                  else (abs(val) if val != 0 else 1.0) if res == "WIN" \
+                  else 0.0
+        return _clamp(val)
+
+    return _clamp(float(step_block.get("reward", 0.0)))
+
+
+# MODULE STATE AND INITIALIZATION FOR LEDUC POKER
+
+_state: dict = {}
+
+
+def _curriculum_factory(args) -> CurriculumScheduler:
+    """Construct this env's curriculum from training args. Referenced by env_configs registry."""
+    return CurriculumScheduler(
+        initial_max_turn=args.initial_max_turn,      # from training args (env_configs default)
+        final_max_turn=_MAX_TURNS,                   # 10 = full LP episode upper bound
+        rollouts_per_stage=args.rollouts_per_stage,  # from training args (default: 1280)
+        initial_hint_prob=0.75,  # 75% episodes start with strategy hints (LP needs more guidance)
+        final_hint_prob=0.0,     # decay to 0% — model learns to play without hints
+        warmup_rollouts=args.rollouts_per_stage,     # 1 stage warmup before curriculum progresses
+    )
+
+
+def _ensure_initialized(trainer) -> None:
+    """Set up server pool and curriculum once per process (no-op afterwards)."""
+    if _state.get("initialized"):
+        return
+
+    reset_payload = {
+        "task_id": GAMES_TO_TASK_ID_RANGE[_SELECTED_GAME][0],  # first valid leduc_poker task ID
+        "seed": 42,               # fixed seed for init ping (reproducible health check)
+        "opponent": "mcts",
+        "mcts_max_simulations": _MCTS_SIMS,  # 50 = strong but not too slow for training
+        "mcts_num_rollouts": 1,
+    }
+    rank, env_pool, num_servers, thread_pool, generation_semaphore = init_env_pool(reset_payload)
+
+    curriculum = _curriculum_factory(trainer.args)
+    print(
+        f"[CURRICULUM] Leduc-OPP initialized: "
+        f"initial_max_turn={trainer.args.initial_max_turn}, "
+        f"final_max_turn={_MAX_TURNS}, "
+        f"rollouts_per_stage={trainer.args.rollouts_per_stage}, "
+        f"mcts_sims={_MCTS_SIMS} (fixed)"
+    )
+
+    _state.update(
+        initialized=True,
+        rank=rank,
+        env_pool=env_pool,
+        num_servers=num_servers,
+        thread_pool=thread_pool,
+        generation_semaphore=generation_semaphore,
+        curriculum=curriculum,
+    )
+
+
+# CORE EPISODE RUNNER FOR LEDUC POKER
 
 def _run_episode(
     index: int,
@@ -607,20 +514,32 @@ def _run_episode(
     trainer,
     tokenizer,
     generation_semaphore: Semaphore,
+    current_max_turn: int,
     current_hint_prob: float,
-) -> tuple[int, "dict | None"]:
-    game_id = int(prompt)
-    server_idx = (index + rank) % num_servers
+) -> "tuple[int, dict | None]":
+    """
+    Run one Leduc Poker episode against a fixed MCTS(50, 1) opponent.
+
+    Reward = discounted shaped return (per-step strategy signals + DeepStack
+    equity bonus + inter-turn pot-commitment bonus + terminal env reward ×30)
+    plus episode-level invalid-action penalty (escalating for consecutive invalids).
+
+    When use_full_prompt=True, accumulates token IDs across all turns with
+    action masking (mask=1 for LLM completions, 0 for env tokens).
+    When use_full_prompt=False, only the final turn is kept.
+    """
+    game_id      = int(prompt)
+    server_idx   = (index + rank) % num_servers
     env_endpoint = env_pool[server_idx]["base_url"]
 
-    # Full-prompt accumulation state
-    episode_prompt_ids:    list[int]   = []
-    episode_completion_ids: list[int]  = []
-    episode_logprobs:      list[float] = []
-    episode_action_mask:   list[int]   = []
-    prev_full_ids: "list[int] | None"  = None
+    # Full-prompt accumulation
+    episode_prompt_ids:     list[int]   = []
+    episode_completion_ids: list[int]   = []
+    episode_logprobs:       list[float] = []
+    episode_action_mask:    list[int]   = []
+    prev_full_ids: "list[int] | None"   = None
 
-    # Last-prompt state (overwritten each turn)
+    # Last-prompt state (overwritten every turn)
     prompt_ids:     list[int]   = []
     completion_ids: list[int]   = []
     logprobs:       list[float] = []
@@ -630,60 +549,72 @@ def _run_episode(
     episode_reward       = 0.0
     turn_number          = 0
     invalid_count        = 0
-    consecutive_invalids = 0
-    use_hints            = random.random() < current_hint_prob
+    use_hints            = random.random() < current_hint_prob  # 75%→0% via curriculum
+
     game_state_history: list[GameState] = []
-    calculator           = RewardCalculator()
-    rewards:             list[float] = []
+    calculator = RewardCalculator()
+    rewards:    list[float] = []
 
-    # Opponent models — only active in last-prompt mode
-    range_model: "OpponentRangeModel | None"        = None
-    tendency:    "OpponentTendencyTracker | None"   = None
-
-    # Reset environment
+    # --- Reset environment ---
     reset_payload = {
         "task_id": game_id,
-        "seed": game_id,
+        "seed": game_id,          # deterministic per game_id for reproducibility
         "opponent": "mcts",
-        "mcts_max_simulations": 50,
+        "mcts_max_simulations": _MCTS_SIMS,  # 50 fixed
         "mcts_num_rollouts": 1,
     }
     try:
-        reset_res = requests.post(f"{env_endpoint}/reset", json=reset_payload, timeout=_TIMEOUT)
+        reset_res = requests.post(
+            f"{env_endpoint}/reset", json=reset_payload, timeout=_TIMEOUT
+        )
         reset_res.raise_for_status()
         result_block = reset_res.json()["result"]
-        episode_id  = result_block.get("episode_id", "")
-        observation = _format_observation(result_block.get("observation", ""))
+        episode_id   = result_block.get("episode_id", "")
+        observation  = _format_observation(result_block.get("observation", ""))
         gs = parse_game_state(observation)
         if gs is not None:
             game_state_history.append(gs)
-            # Initialize opponent models once we know our card
-            if not use_full_prompt:
-                range_model = OpponentRangeModel(gs.private_card_rank)
-                tendency    = OpponentTendencyTracker()
     except Exception as exc:
-        import traceback; traceback.print_exc()
         print(f"Failed to reset environment (Game {game_id}): {exc}")
         return index, None
 
     system_prompt = _BASE_SYSTEM_PROMPT + (_HINT_PROMPT if use_hints else "")
+
+    if _USE_REACT_FORMAT:
+        observation = observation + _REACT_FORMAT_INSTRUCTIONS
+
+    if _DEBUG:
+        print(f"[DEBUG] Game {game_id} reset OK. use_hints={use_hints}, "
+              f"react_format={_USE_REACT_FORMAT}, observation_len={len(observation)}")
+
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user",   "content": observation},
     ]
 
-    while not done and turn_number < _MAX_TURNS:
+    # --- Interaction loop ---
+    while not done and turn_number < current_max_turn:
         with generation_semaphore:
-            rollout_outputs = generate_rollout_completions(trainer, prompts=[messages], as_chat=True)[0]
+            try:
+                rollout_outputs = generate_rollout_completions(
+                    trainer, prompts=[messages], as_chat=True
+                )[0]
+            except Exception as exc:
+                print(
+                    f"Warning: vLLM error at turn {turn_number} "
+                    f"(game {game_id}): {type(exc).__name__}: {exc}"
+                )
+                done = True
+                break
 
-        prompt_ids     = rollout_outputs.get("prompt_ids", [])
-        completion_ids = rollout_outputs.get("completion_ids", [])
-        logprobs       = rollout_outputs.get("logprobs", [])
+        prompt_ids      = rollout_outputs.get("prompt_ids", [])
+        completion_ids  = rollout_outputs.get("completion_ids", [])
+        logprobs        = rollout_outputs.get("logprobs", [])
         completion_text = tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
 
         # --- Token accumulation (full-prompt mode) ---
         if use_full_prompt:
-            if len(prompt_ids) > _MAX_PROMPT_LEN:
+            if len(prompt_ids) > _MAX_PROMPT_LEN:  # 4096 token safety cap
                 print(
                     f"Warning: Prompt exceeded {_MAX_PROMPT_LEN} tokens "
                     f"({len(prompt_ids)}) at turn {turn_number}, ending episode early"
@@ -721,23 +652,24 @@ def _run_episode(
 
         messages.append({"role": "assistant", "content": completion_text})
 
-        # --- Parse and send action ---
-        prev_gs   = game_state_history[-1] if game_state_history else None
-        legal_map = prev_gs.legal_actions if prev_gs else None
+        # --- Parse action with keyword fallback ---
+        prev_gs        = game_state_history[-1] if game_state_history else None
+        legal_map      = prev_gs.legal_actions if prev_gs else None
         action_to_send = _parse_action(completion_text, legal_map)
 
-        # Fallback: Nash-based selection when model output is invalid
-        if not action_to_send:
-            action_to_send   = _select_fallback_action(prev_gs)
-            consecutive_invalids += 1
+        # Fallback: if parse produced invalid/missing action, use Nash-based selection
+        parse_ok = (
+            action_to_send
+            and legal_map is not None
+            and any(action_to_send == str(k) for k in legal_map)
+        )
+        if not parse_ok:
+            action_to_send    = _select_fallback_action(prev_gs)
             invalid_count    += 1
-            # Escalating penalty: -0.10, -0.15, -0.20, ...
-            penalty = _INVALID_PENALTY + 0.05 * max(0, consecutive_invalids - 1)
-            episode_reward   += penalty
-            already_penalized = True   # Fix #3: flag to prevent double-penalty below
+            episode_reward   += _INVALID_PENALTY  # flat -5.0
+            already_penalized = True
         else:
-            consecutive_invalids = 0   # reset on valid action
-            already_penalized    = False
+            already_penalized = False
 
         try:
             step_res = requests.post(
@@ -765,43 +697,24 @@ def _run_episode(
                 episode_reward += _INVALID_PENALTY
 
         if "Nothing happens" in observation or "Invalid" in observation:
-            invalid_count += 1
-            episode_reward += _INVALID_PENALTY
+            if not already_penalized:   # Fix #3: single penalty per turn regardless of failure source
+                invalid_count  += 1
+                episode_reward += _INVALID_PENALTY
 
         if done:
-            final_reward = step_reward
-
-        # --- Update opponent models (last-prompt only) ---
-        if not use_full_prompt and not done and prev_gs is not None:
-            curr_gs = game_state_history[-1] if game_state_history else None
-            if curr_gs is not None:
-                # Detect opponent's last action by comparing betting histories
-                prev_betting = prev_gs.r1_betting if curr_gs.round == 1 else prev_gs.r2_betting
-                curr_betting = curr_gs.r1_betting if curr_gs.round == 1 else curr_gs.r2_betting
-                if len(curr_betting) > len(prev_betting):
-                    opp_action = curr_betting[-1]
-                    if range_model is not None:
-                        range_model.update(
-                            curr_gs.round, opp_action,
-                            public_card_rank=curr_gs.public_card_rank
-                        )
-                    if tendency is not None:
-                        tendency.record(opp_action)
-
-        # Augment observation with opponent read (last-prompt only, non-terminal)
-        if not use_full_prompt and not done:
-            curr_gs2 = game_state_history[-1] if game_state_history else None
-            opp_read = _build_opponent_read(range_model, tendency)
-            observation = _augment_observation(observation, opp_read)
+            # Robust terminal reward extraction (tries multiple server formats)
+            final_reward = _extract_terminal_reward(step_block, observation)
 
         try:
-            action_str = prev_gs.legal_actions.get(int(action_to_send.strip()), "") if prev_gs else ""
+            action_str = (
+                prev_gs.legal_actions.get(int(action_to_send.strip()), "")
+                if prev_gs else ""
+            )
         except (ValueError, AttributeError):
             action_str = ""
-        # Fix #2: use final_reward instead of raw step_reward for terminal scaling
-        # (calculate_pot_commitment_bonus tidak ada di RewardCalculator — dihapus)
+
         terminal_for_scale = final_reward if done else 0.0
-        step_shaped  = calculator.calculate_step_reward(prev_gs, action_str, terminal_for_scale)
+        step_shaped = calculator.calculate_step_reward(prev_gs, action_str, terminal_for_scale)
         rewards.append(step_shaped)
 
         messages.append({"role": "user", "content": observation})
@@ -809,14 +722,15 @@ def _run_episode(
 
     train_reward = calculator.calculate_discounted_return(rewards) + episode_reward
     print(
-        "[ID:{:<6} Done:{} T:{:>2d} | Hints:{:<2} | EnvR:{:>6.2f} | TrainR:{:>6.2f} | Inv:{:<2}]".format(
-            str(game_id)[:6], int(done), turn_number, int(use_hints), final_reward, train_reward, invalid_count,
+        "[ID:{:<6} Done:{} T:{:>2d} | Hints:{:<2} | EnvR:{:>6.2f} | "
+        "TrainR:{:>6.2f} | Inv:{:<2} | MCTS:{}]".format(
+            str(game_id)[:6], int(done), turn_number, int(use_hints),
+            final_reward, train_reward, invalid_count, _MCTS_SIMS,
         )
     )
 
-    # --- Build result ---
     if use_full_prompt:
-        if len(episode_completion_ids) > _MAX_EPISODE_TOKENS:
+        if len(episode_completion_ids) > _MAX_EPISODE_TOKENS:  # 16384 hard cap
             episode_completion_ids = episode_completion_ids[:_MAX_EPISODE_TOKENS]
             episode_logprobs       = episode_logprobs[:_MAX_EPISODE_TOKENS]
             episode_action_mask    = episode_action_mask[:_MAX_EPISODE_TOKENS]
@@ -828,27 +742,29 @@ def _run_episode(
             "reward":         train_reward,
             "final_score":    final_reward,
         }
-    else:
-        return index, {
-            "prompt_ids":     prompt_ids,
-            "completion_ids": completion_ids,
-            "logprobs":       logprobs,
-            "reward":         train_reward,
-            "final_score":    final_reward,
-        }
+    return index, {
+        "prompt_ids":     prompt_ids,
+        "completion_ids": completion_ids,
+        "logprobs":       logprobs,
+        "reward":         train_reward,
+        "final_score":    final_reward,
+    }
 
 
-# ---------------------------------------------------------------------------
-# Public rollout functions
-# ---------------------------------------------------------------------------
+# PUBLIC ROLLOUT FUNCTIONS FOR LEDUC POKER
 
 def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
     """Common dispatch + aggregation logic for both rollout variants."""
     _ensure_initialized(trainer)
 
     curriculum        = _state["curriculum"]
+    current_max_turn  = curriculum.get_max_turn()
     current_hint_prob = curriculum.get_hint_prob()
-    print(f"[CURRICULUM] Rollout {curriculum.total_rollouts}: hint_prob={current_hint_prob:.2f}")
+    print(
+        f"[CURRICULUM] Rollout {curriculum.total_rollouts}: "
+        f"max_turn={current_max_turn}, hint_prob={current_hint_prob:.2f}, "
+        f"mcts_sims={_MCTS_SIMS} (fixed)"
+    )
 
     run = functools.partial(
         _run_episode,
@@ -859,19 +775,26 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
         trainer=trainer,
         tokenizer=trainer.processing_class,
         generation_semaphore=_state["generation_semaphore"],
+        current_max_turn=current_max_turn,
         current_hint_prob=current_hint_prob,
     )
 
     _fallback = (
-        {"prompt_ids": [1], "completion_ids": [1], "action_mask": [0], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0}
+        {"prompt_ids": [1], "completion_ids": [1], "action_mask": [0],
+         "logprobs": [1.0], "reward": 0.0, "final_score": 0.0}
         if use_full_prompt else
-        {"prompt_ids": [1], "completion_ids": [1], "logprobs": [1.0], "reward": 0.0, "final_score": 0.0}
+        {"prompt_ids": [1], "completion_ids": [1], "logprobs": [1.0],
+         "reward": 0.0, "final_score": 0.0}
     )
 
     results = [None] * len(prompts)
     futures = [_state["thread_pool"].submit(run, i, p) for i, p in enumerate(prompts)]
     for f in as_completed(futures):
-        idx, res = f.result()
+        try:
+            idx, res = f.result()
+        except Exception as exc:
+            print(f"[ERROR] Game thread threw unhandled exception: {type(exc).__name__}: {exc}")
+            continue
         results[idx] = res if res is not None else _fallback
 
     curriculum.step(len(prompts))
@@ -883,9 +806,31 @@ def _dispatch(prompts, trainer, *, use_full_prompt: bool) -> dict[str, list]:
     n             = len(list_results)
     finished_rate = finished / n if n > 0 else 0.0
     print(
-        f"[BATCH] Finished: {finished}/{len(list_results)}, AvgReturn: {avg_return:.2f}")
+        f"[BATCH] Finished: {finished}/{n} ({finished_rate:.1%}), "
+        f"Wins: {wins}/{n}, "
+        f"AvgReturn: {avg_return:.3f}"
+    )
 
-    out = {
+    # WandB metrics (best-effort — no crash if wandb not active)
+    try:
+        import wandb as _wandb
+        if _wandb.run is not None:
+            _wandb.log(
+                {
+                    "env/win_rate":         wins / n if n > 0 else 0.0,
+                    "env/avg_return":       avg_return,
+                    "env/finished_rate":    finished_rate,          # Fix #5: % episodes reaching done=True
+                    "curriculum/max_turn":  current_max_turn,
+                    "curriculum/mcts_sims": _MCTS_SIMS,
+                    "curriculum/hint_prob": current_hint_prob,
+                    "curriculum/rollouts":  curriculum.total_rollouts,
+                },
+                commit=False,
+            )
+    except Exception:
+        pass
+
+    out: dict = {
         "prompt_ids":     [r["prompt_ids"]     for r in list_results],
         "completion_ids": [r["completion_ids"] for r in list_results],
         "logprobs":       [r["logprobs"]       for r in list_results],
@@ -910,10 +855,5 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
     trainer,
     max_turns: int = _MAX_TURNS,
 ) -> dict[str, list]:
-    """Parallelised rollout — returns only the last turn's token IDs.
-
-    Enables full Bayesian opponent modelling (OpponentRangeModel +
-    OpponentTendencyTracker).  The LLM sees an 'Opponent Read' block appended
-    to each observation.
-    """
+    """Parallelised rollout — returns only the last turn's token IDs."""
     return _dispatch(prompts, trainer, use_full_prompt=False)

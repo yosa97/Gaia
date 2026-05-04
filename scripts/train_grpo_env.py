@@ -15,7 +15,7 @@ from customized_trainer import (
 )
 from datasets import Dataset
 from peft import PeftModelForCausalLM
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, TrainerCallback
 from transformers.modeling_utils import is_deepspeed_zero3_enabled
 from transformers.trainer_utils import is_main_process
 from trl import (
@@ -46,6 +46,240 @@ from envs.env_configs import EnvTrainingConfig, get_env_config
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
 STANDARD_GRPO_EXTRA_COLUMN = "extra_data"
 STANDARD_GRPO_PROMPT_COLUMN = "prompt"
+
+
+# ============================================================================
+# SFT Cold-Start Stage
+# ============================================================================
+
+def _load_sft_datasets(datasets_dir: str, dataset_list: list[str], env_name: str | None):
+    """Load whitelisted SFT datasets from the pre-downloaded cache.
+
+    Returns a HuggingFace Dataset ready for SFT, or None if no data found.
+    The datasets are expected at ``{datasets_dir}/{org--name}/``.
+
+    **Game-aware filtering**: If ``env_name`` is provided, only examples
+    containing the game name are kept. This gives a genuine edge over miners
+    who blindly feed all data — our SFT is pure signal, not noise from
+    unrelated games.
+    """
+    try:
+        from datasets import load_from_disk, concatenate_datasets
+    except ImportError:
+        log_info("[SFT] 'datasets' package not available, skipping SFT stage.")
+        return None
+
+    # Game name variants for robust filtering
+    _GAME_KEYWORDS: dict[str, list[str]] = {
+        "gin_rummy":   ["gin_rummy", "gin rummy", "ginrummy"],
+        "liars_dice":  ["liars_dice", "liar's dice", "liars dice", "liarsdice"],
+        "leduc_poker": ["leduc_poker", "leduc poker", "leducpoker"],
+        "goof_spiel":  ["goof_spiel", "goofspiel", "goof spiel"],
+    }
+
+    loaded = []
+    for name in dataset_list:
+        ds_path = os.path.join(datasets_dir, name)
+        if not os.path.isdir(ds_path):
+            # Auto-download from HuggingFace if not cached locally
+            log_info(f"[SFT] Dataset not found locally: {ds_path}, attempting HuggingFace download...")
+            try:
+                # huggingface_hub reads HF_HUB_ENABLE_HF_TRANSFER at import time and caches it.
+                # We must reset both the env var AND the module-level constant.
+                _prev_hf_transfer = os.environ.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
+                try:
+                    from huggingface_hub import constants as _hf_const
+                    _hf_const.HF_HUB_ENABLE_HF_TRANSFER = False
+                except Exception:
+                    pass
+                from datasets import load_dataset
+                ds = load_dataset(name, split="train")
+                os.makedirs(ds_path, exist_ok=True)
+                ds.save_to_disk(ds_path)
+                log_info(f"[SFT] ✅ Downloaded & cached {len(ds)} examples from HF: {name}")
+                if _prev_hf_transfer is not None:
+                    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = _prev_hf_transfer
+            except Exception as dl_err:
+                log_info(f"[SFT] ⚠️ Auto-download failed for {name}: {dl_err}, skipping.")
+                continue
+        else:
+            try:
+                ds = load_from_disk(ds_path)
+                log_info(f"[SFT] Loaded {len(ds)} examples from {ds_path}")
+            except Exception as e:
+                log_info(f"[SFT] Failed to load {ds_path}: {e}")
+                continue
+
+        # Game-aware filtering — only keep examples relevant to current game
+        if env_name and env_name in _GAME_KEYWORDS:
+            pre_filter_len = len(ds)
+
+            has_game_col = "game" in ds.column_names
+
+            if has_game_col:
+                keywords = _GAME_KEYWORDS[env_name]
+
+                def _matches_game(example):
+                    return example.get("game", "").lower() in keywords
+
+            else:
+                keywords = _GAME_KEYWORDS[env_name]
+
+                def _matches_game(example):
+                    text = str(example).lower()
+                    return any(kw in text for kw in keywords)
+
+            try:
+                filtered = ds.filter(_matches_game, desc=f"Filtering for {env_name}")
+                if len(filtered) > 0:
+                    log_info(
+                        f"[SFT] 🎯 Game-filtered {env_name} "
+                        f"(via {'column' if has_game_col else 'text'}): "
+                        f"{pre_filter_len} → {len(filtered)} examples "
+                        f"({len(filtered)/max(pre_filter_len,1)*100:.0f}% relevant)"
+                    )
+                    ds = filtered
+                else:
+                    log_info(
+                        f"[SFT] ⚠️ Game filter for {env_name} returned 0 results, "
+                        f"using all {pre_filter_len} examples as fallback"
+                    )
+            except Exception as fe:
+                log_info(f"[SFT] Filter failed ({fe}), using unfiltered dataset")
+
+        loaded.append(ds)
+
+    if not loaded:
+        return None
+
+    combined = concatenate_datasets(loaded) if len(loaded) > 1 else loaded[0]
+    log_info(f"[SFT] Total SFT examples (post-filter): {len(combined)}")
+
+    # ── Format conversion: ShareGPT → OpenAI chat format ──────────────
+    # Dataset uses: {"from": "user/assistant", "value": "..."}  (ShareGPT)
+    # SFTTrainer expects: {"role": "user/assistant", "content": "..."}  (OpenAI)
+    if "conversations" in combined.column_names:
+        _ROLE_MAP = {"user": "user", "assistant": "assistant", "system": "system",
+                     "human": "user", "gpt": "assistant"}
+
+        def _convert_sharegpt(example):
+            messages = []
+            for msg in example.get("conversations", []):
+                role = _ROLE_MAP.get(msg.get("from", ""), msg.get("from", "user"))
+                content = msg.get("value", "")
+                messages.append({"role": role, "content": content})
+            return {"messages": messages}
+
+        combined = combined.map(_convert_sharegpt, desc="Converting ShareGPT → OpenAI format")
+        # Drop columns SFTTrainer doesn't need
+        drop_cols = [c for c in combined.column_names if c not in ("messages",)]
+        if drop_cols:
+            combined = combined.remove_columns(drop_cols)
+        log_info(f"[SFT] ✅ Converted {len(combined)} examples to OpenAI chat format")
+
+    return combined
+
+
+def run_sft_cold_start(model, tokenizer, training_args, peft_config):
+    """Run a short SFT stage using whitelisted datasets before GRPO.
+
+    This stabilises model output format (numeric action IDs) and reduces
+    variance from cold-start randomness.  Only runs if the validator has
+    pre-downloaded datasets (env vars ``MINER_DATASETS_DIR`` / ``MINER_DATASETS``).
+    """
+    datasets_dir = os.environ.get("MINER_DATASETS_DIR")
+    datasets_csv = os.environ.get("MINER_DATASETS", "")
+    dataset_list = [d.strip() for d in datasets_csv.split(",") if d.strip()]
+    env_name = training_args.environment_name
+
+    if not datasets_dir or not dataset_list:
+        log_info("[SFT] No miner datasets available (MINER_DATASETS_DIR / MINER_DATASETS not set). Skipping SFT.")
+        return model
+
+    log_info(f"[SFT] Datasets dir: {datasets_dir}")
+    log_info(f"[SFT] Requested datasets: {dataset_list}")
+
+    sft_dataset = _load_sft_datasets(datasets_dir, dataset_list, env_name)
+    if sft_dataset is None or len(sft_dataset) == 0:
+        log_info("[SFT] No SFT data loaded, skipping SFT stage.")
+        return model
+
+    try:
+        from trl import SFTTrainer, SFTConfig
+
+        # Scale SFT LR proportionally to GRPO LR.
+        # Hardcoded 2e-5 is fine for small models (GRPO LR=3e-5),
+        # but for 6B+ models (GRPO LR=6-8e-6), 2e-5 is 2.5-3x higher
+        # which causes over-fitting → GRPO wastes early steps undoing it.
+        grpo_lr = training_args.learning_rate
+        sft_lr = min(2e-5, grpo_lr * 2.5) if grpo_lr > 0 else 2e-5
+
+        sft_args = SFTConfig(
+            output_dir="/tmp/sft_checkpoint",
+            num_train_epochs=1,
+            per_device_train_batch_size=min(4, training_args.per_device_train_batch_size),
+            learning_rate=sft_lr,
+            warmup_steps=10,
+            max_grad_norm=1.0,
+            save_strategy="no",
+            logging_steps=5,
+            bf16=True,
+            report_to="wandb",
+            gradient_checkpointing=training_args.gradient_checkpointing,
+            gradient_checkpointing_kwargs=training_args.gradient_checkpointing_kwargs
+            if training_args.gradient_checkpointing
+            else None,
+        )
+
+        sft_trainer = SFTTrainer(
+            model=model,
+            args=sft_args,
+            train_dataset=sft_dataset,
+            processing_class=tokenizer,
+            peft_config=peft_config if not isinstance(model, PeftModelForCausalLM) else None,
+        )
+
+        log_info("[SFT] Starting SFT cold-start training...")
+        sft_trainer.train()
+        log_info(f"[SFT] ✅ SFT stage complete. Trained on {len(sft_dataset)} examples.")
+
+        # Signal to curriculum schedulers that SFT was completed successfully.
+        # This allows them to skip warmup and start at higher complexity.
+        os.environ["SFT_COMPLETED"] = "1"
+
+        # Merge LoRA back into base model so GRPO can attach its own LoRA adapter.
+        # GRPOTrainer crashes if it receives a PeftModel + peft_config simultaneously.
+        sft_model = sft_trainer.model
+        if hasattr(sft_model, "merge_and_unload"):
+            log_info("[SFT] Merging SFT LoRA adapter into base model...")
+            sft_model = sft_model.merge_and_unload()
+            log_info("[SFT] ✅ LoRA merged — base model ready for GRPO.")
+        return sft_model
+
+    except ImportError:
+        log_info("[SFT] SFTTrainer not available (trl version too old?). Skipping SFT.")
+        return model
+    except Exception as e:
+        log_info(f"[SFT] ⚠️ SFT stage failed: {e}. Continuing with GRPO only.")
+        return model
+
+
+# ============================================================================
+# Gradient Monitoring Callback
+# ============================================================================
+
+class GradientMonitorCallback(TrainerCallback):
+    """Log warnings when gradient norms spike, helping diagnose instability."""
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not logs or "grad_norm" not in logs:
+            return
+        grad_norm = logs["grad_norm"]
+        step = state.global_step
+        if grad_norm > 10.0:
+            log_info(f"🔴 [GradMonitor] CRITICAL grad_norm={grad_norm:.4f} at step {step} — training may diverge")
+        elif grad_norm > 5.0:
+            log_info(f"⚠️ [GradMonitor] HIGH grad_norm={grad_norm:.4f} at step {step}")
 
 
 @dataclass
@@ -698,9 +932,7 @@ def main():
         task_id = train_request["task_id"]
         
         output_dir = training_args.output_dir
-        _mp = train_request["model_path"]
-        _local_mp = _mp.startswith("/") or _mp.startswith("./") or os.path.isdir(_mp)
-        tokenizer = AutoTokenizer.from_pretrained(_mp, local_files_only=_local_mp)
+        tokenizer = AutoTokenizer.from_pretrained(train_request["model_path"])
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
@@ -734,7 +966,16 @@ def main():
         else:
             model_class = transformers.AutoModelForCausalLM
 
-        model = model_class.from_pretrained(_mp, local_files_only=_local_mp, **model_kwargs)
+        model = model_class.from_pretrained(train_request["model_path"], **model_kwargs)
+
+        # ── SFT Cold-Start Stage ──────────────────────────────────────────
+        # Run a short SFT phase using whitelisted datasets before GRPO.
+        # This stabilises output format and reduces cold-start variance.
+        # Only runs when MINER_DATASETS_DIR / MINER_DATASETS env vars are set
+        # (i.e. when the validator has pre-downloaded whitelisted datasets).
+        if is_main_process(LOCAL_RANK):
+            log_info("[Main] Checking for SFT cold-start datasets...")
+        model = run_sft_cold_start(model, tokenizer, training_args, peft_config=get_peft_config(model_args))
 
         # some model need to set the generation config or encounter the invalid generation config error
         set_generation_config(train_request["model_name"], model)
@@ -852,7 +1093,7 @@ def main():
             train_dataset=train_ds,
             processing_class=tokenizer,
             peft_config=peft_config,
-            callbacks=[_callback],
+            callbacks=[_callback, GradientMonitorCallback()],
         )
         if use_eval_dataset:
             trainer = trainer_class(**common_trainer_kwargs, eval_dataset=dev_ds)

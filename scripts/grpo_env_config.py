@@ -7,7 +7,6 @@ from model_utility import (
     get_use_vllm,
     get_gradient_checkpointing,
     get_gpu_count,
-    resolve_model_path,
 )
 from copy import deepcopy
 from lrs_lookup import get_grpo_lr
@@ -24,9 +23,9 @@ GRPO_CONFIG = {
         "vllm_gpu_memory_utilization": 0.4,
         "use_lora": True,
         "beta": 0.02,
-
+        "max_grad_norm": 1.0,
         "initial_max_turn": 1,
-        "rollouts_per_stage": 1280,  # Reduced for more frequent curriculum progression
+        "rollouts_per_stage": 1280,
     },
     "1_2_b": {
         "lr": 1e-5,
@@ -36,6 +35,7 @@ GRPO_CONFIG = {
         "gradient_accumulation_steps": 12,
         "vllm_gpu_memory_utilization": 0.4,
         "beta": 0.04,
+        "max_grad_norm": 1.0,
 
         "rollouts_per_stage": 1280,
     },
@@ -48,7 +48,8 @@ GRPO_CONFIG = {
         "vllm_gpu_memory_utilization": 0.3,
         "use_lora": True,
         "beta": 0.01,
-
+        "max_grad_norm": 1.0,
+        "num_generations": 4,
         "rollouts_per_stage": 1280,
     },
     "4_5_b": {
@@ -58,9 +59,9 @@ GRPO_CONFIG = {
         "batch_size": 2,
         "gradient_accumulation_steps": 8,
         "use_lora": True,
-        "vllm_gpu_memory_utilization": 0.35,  # Reduced for Gin Rummy
+        "vllm_gpu_memory_utilization": 0.35,
         "beta": 0.01,
-
+        "max_grad_norm": 1.0,
         "rollouts_per_stage": 1280,
     },
     "5_6_b": {
@@ -70,8 +71,9 @@ GRPO_CONFIG = {
         "batch_size": 2,
         "gradient_accumulation_steps": 8,
         "use_lora": True,
-        "vllm_gpu_memory_utilization": 0.35,  # Reduced for Gin Rummy
+        "vllm_gpu_memory_utilization": 0.35,
         "beta": 0.01,
+        "max_grad_norm": 1.0,
 
         "rollouts_per_stage": 1280,
     },
@@ -82,10 +84,10 @@ GRPO_CONFIG = {
         "batch_size": 2,
         "gradient_accumulation_steps": 4,
         "use_lora": True,
-        "vllm_gpu_memory_utilization": 0.35,  # Reduced for Gin Rummy (longer episodes = more KV cache)
+        "vllm_gpu_memory_utilization": 0.35,
         "beta": 0.01,
-
-        "rollouts_per_stage": 1024,  # Increased from 768 for better curriculum
+        "max_grad_norm": 1.0,
+        "rollouts_per_stage": 1024,  
     },
     "9_12_b": {
         "lr": 6e-6,
@@ -95,6 +97,7 @@ GRPO_CONFIG = {
         "batch_size": 16,
         "vllm_gpu_memory_utilization": 0.6,
         "beta": 0.01,
+        "max_grad_norm": 1.0,
     },
     "12_15_b": {
         "lr": 5e-6,
@@ -104,6 +107,7 @@ GRPO_CONFIG = {
         "batch_size": 2,
         "vllm_gpu_memory_utilization": 0.8,
         "beta": 0.01,
+        "max_grad_norm": 1.0,
     },
     "15_20_b": {
         "lr": 5e-6,
@@ -114,6 +118,7 @@ GRPO_CONFIG = {
         "vllm_gpu_memory_utilization": 0.6,
         "use_vllm": False,
         "beta": 0.01,
+        "max_grad_norm": 1.0,
     },
     "20_40_b": {
         "lr": 4e-6,
@@ -125,6 +130,7 @@ GRPO_CONFIG = {
         "use_vllm": False,
         "use_4bit": True,
         "beta": 0.01,
+        "max_grad_norm": 1.0,
     },
     "40_80_b": {
         "lr": 3e-6,
@@ -136,6 +142,7 @@ GRPO_CONFIG = {
         "use_vllm": False,
         "use_4bit": True,
         "beta": 0.01,
+        "max_grad_norm": 1.0,
     },
 }
 
@@ -192,6 +199,7 @@ def get_run_cmd(config: dict, gpu_nums: int):
         "disable_fa",
         "disable_action_mask",
         "beta",
+        "max_grad_norm",
         "environment_name",
     ]
     for key in required_keys:
@@ -236,11 +244,11 @@ def get_run_cmd(config: dict, gpu_nums: int):
     --disable_fa {disable_fa} \
     --disable_action_mask {disable_action_mask} \
     --beta {beta} \
-    --num_generations {num_generations} \
+    --max_grad_norm {max_grad_norm} \
     --loss_type dr_grpo \
     --num_iterations 2 \
     --do_eval False \
-    --vllm_max_model_length {vllm_max_model_length} 2> /app/checkpoints/grpo_error.txt"""
+    --vllm_max_model_length {vllm_max_model_length}"""
     )
 
     if config.get("use_lora", False):
@@ -280,8 +288,6 @@ def get_run_cmd(config: dict, gpu_nums: int):
 def get_training_json(train_info: dict) -> dict:
     model_name = train_info["model_name"]
     model_path = train_info["model_path"]
-    # Resolve actual model directory (bisa saja model_path = /cache/models parent dir)
-    model_path = resolve_model_path(model_path, model_name)
     model_architecture = get_model_architecture(model_path)
     param_nums = get_model_num_params(model_name, model_path)
     config = get_grpo_config(param_nums)
@@ -289,7 +295,7 @@ def get_training_json(train_info: dict) -> dict:
         config = GRPO_CONFIG["6_9_b"]
     print(f"config: {config}")
     run_config = {
-        "epoch_num": 5,
+        "epoch_num": 4,
         "batch_size": config["batch_size"],
         "learning_rate": config["lr"],
         "min_lr_rate": 0.25,
@@ -316,10 +322,18 @@ def get_training_json(train_info: dict) -> dict:
 
     env_name = train_info.get("dataset_type", {}).get("environment_name")
     env_cfg = get_env_config(env_name) if env_name else None
-    run_config["num_generations"]      = env_cfg.num_generations      if env_cfg else 4
-    run_config["temperature"]          = env_cfg.temperature          if env_cfg else 1.0
-    run_config["top_k"]                = env_cfg.top_k                if env_cfg else 0
-    run_config["vllm_max_model_length"] = env_cfg.vllm_max_model_length if env_cfg else 5248
+    # Bucket config overrides env_config for these parameters.
+    # If bucket defines num_generations/temperature/top_k, use that;
+    # otherwise fall back to env_config, then hardcoded defaults.
+    run_config["num_generations"]       = config.get("num_generations",
+        env_cfg.num_generations if env_cfg else 4)
+    run_config["temperature"]           = config.get("temperature",
+        env_cfg.temperature if env_cfg else 1.0)
+    run_config["top_k"]                 = config.get("top_k",
+        env_cfg.top_k if env_cfg else 0)
+    run_config["vllm_max_model_length"]  = config.get("vllm_max_model_length",
+        env_cfg.vllm_max_model_length if env_cfg else 5248)
+    run_config["max_grad_norm"]           = config.get("max_grad_norm", 1.0)
 
     if model_name == "OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5":
         run_config["use_lora"] = True
@@ -344,14 +358,6 @@ def get_training_json(train_info: dict) -> dict:
 
     run_config["learning_rate"] *= train_info["reg_ratio"]
 
-    # ── Inject max_steps ke training command ─────────────────────────────────
-    # max_steps dari train_info (berasal dari --max-steps CLI flag di job_handler / run_environment_task.sh)
-    # HARUS di-pass ke GRPOConfig via --max_steps agar trainer benar-benar berhenti
-    # di step yang ditentukan. Tanpa ini, trainer jalan sampai epoch selesai.
     run_cmd = get_run_cmd(run_config, run_config["gpu_nums"])
-    max_steps = train_info.get("max_steps", -1)
-    if max_steps and max_steps > 0:
-        run_cmd = run_cmd + f" --max_steps {max_steps}"
-        print(f"[grpo_env_config] max_steps={max_steps} → ditambahkan ke training command")
-    
+
     return {"train_request": train_request, "run_cmd": run_cmd}

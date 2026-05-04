@@ -3,43 +3,17 @@
 TASK_ID="1"
 MODEL=""
 DATASET="dummy"
-
-# ── SFT Warm-start Dataset (opsional) ──────────────────────────────────────
-# Isi dengan HF dataset ID dari whitelist G.O.D untuk SFT warm-start.
-# Kosongkan ("") untuk skip SFT dan langsung GRPO.
-# Whitelist: GoodStartLabs/gin-rummy-trajectories-32k
-#            gradients-io-tournaments/ArkadiumGinrummy
-#            SoelMgd/Poker_Dataset
-#            RZ412/PokerBench
-#            the-acorn-ai/textarena-player-game-traces
-#            tasksource/Boardgame-QA
-REQUESTED_DATASETS="GoodStartLabs/gin-rummy-trajectories-32k"
-
 DATASET_TYPE='{
   "environment_name": "gin_rummy"
 }'
-
-# Inject requested_datasets ke DATASET_TYPE jika diset
-# text_trainer.py akan membaca field ini untuk memilih SFT warm-start
-if [ -n "$REQUESTED_DATASETS" ]; then
-  DATASET_TYPE=$(echo "$DATASET_TYPE" | python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-d['requested_datasets'] = ['$REQUESTED_DATASETS']
-print(json.dumps(d))
-")
-  echo "[SFT] DATASET_TYPE with requested_datasets: $DATASET_TYPE"
-fi
-
 FILE_FORMAT="s3"
 HOURS_TO_COMPLETE=3
 
-# ── Max training steps ─────────────────────────────────────────────────────
-# Berdasarkan observasi aktual step time:
-#   gin_rummy   → 250  (step time 47-57s setelah curriculum max_turn naik ke 11-12)
-#   liars_dice  → 280  (step time ~31s, 3 jam ≈ 280 steps)
-#   leduc_poker → 300  (step time lebih cepat)
-MAX_STEPS=320
+# ── SFT Dataset (whitelist) ────────────────────────────────────────────────
+# Comma-separated list of whitelisted HuggingFace dataset repo IDs.
+# Set to empty string to skip SFT cold-start stage.
+MINER_DATASETS="gradients-io-tournaments/env_training_gradients"
+MINER_DATASETS_DIR="$(pwd)/sft_datasets"
 
 # ── Wandb ──────────────────────────────────────────────────────────────────
 # Set WANDB_TOKEN to enable online logging.
@@ -75,6 +49,14 @@ chmod 777 "$CHECKPOINTS_DIR"
 mkdir -p "$OUTPUTS_DIR"
 chmod 777 "$OUTPUTS_DIR"
 
+# Prepare SFT dataset directory
+if [ -n "$MINER_DATASETS" ]; then
+  mkdir -p "$MINER_DATASETS_DIR"
+  chmod 777 "$MINER_DATASETS_DIR"
+  echo "[SFT] Dataset dir: $MINER_DATASETS_DIR"
+  echo "[SFT] Datasets: $MINER_DATASETS"
+fi
+
 # Create a shared Docker network for trainer <-> env server communication
 NETWORK_NAME="env_training_net"
 docker network create "$NETWORK_NAME" 2>/dev/null || true
@@ -83,12 +65,7 @@ docker network create "$NETWORK_NAME" 2>/dev/null || true
 docker build -t trainer-downloader -f dockerfiles/trainer-downloader.dockerfile .
 
 # Build the trainer image
-# --build-arg SCRIPTS_CACHE_BUST: memaksa Docker rebuild layer COPY scripts
-# agar code terbaru selalu dipakai. Layer pip install tetap cached (cepat).
-docker build \
-  --build-arg SCRIPTS_CACHE_BUST="$(date +%s)" \
-  -t standalone-text-trainer \
-  -f dockerfiles/standalone-text-trainer.dockerfile .
+docker build -t standalone-text-trainer -f dockerfiles/standalone-text-trainer.dockerfile .
 
 # Build the hf-uploader image
 docker build -t hf-uploader -f dockerfiles/hf-uploader.dockerfile .
@@ -113,11 +90,6 @@ docker run -d --rm \
   --name env-server-0 \
   phoenixbeaudry/game:mcts-api
 
-# ── Cleanup container lama (jika ada) ────────────────────────────────────────
-# Mencegah error "container name already in use" saat run ulang
-echo "Cleaning up old trainer container if exists..."
-docker rm -f grpo-text-trainer-example 2>/dev/null || true
-# ─────────────────────────────────────────────────────────────────────────────
 # Wait for the env server to be ready
 echo "Waiting for environment server to be healthy..."
 sleep 10  # Adjust as needed, or add a proper health check loop
@@ -146,10 +118,14 @@ docker run --rm --gpus all \
   --network "$NETWORK_NAME" \
   --volume "$CHECKPOINTS_DIR:/cache:rw" \
   --volume "$OUTPUTS_DIR:/app/checkpoints/:rw" \
+  --volume "$MINER_DATASETS_DIR:/cache/miner_datasets:rw" \
   --env ENVIRONMENT_SERVER_URLS="$ENV_SERVER_URLS" \
+  --env MINER_DATASETS_DIR="/cache/miner_datasets" \
+  --env MINER_DATASETS="$MINER_DATASETS" \
   --env WANDB_API_KEY="$WANDB_TOKEN" \
   --env WANDB_TOKEN="$WANDB_TOKEN" \
   --env WANDB_INIT_TIMEOUT=300 \
+  --env HF_HUB_ENABLE_HF_TRANSFER=0 \
   --name grpo-text-trainer-example \
   standalone-text-trainer \
   --task-id "$TASK_ID" \
@@ -161,9 +137,7 @@ docker run --rm --gpus all \
   --hours-to-complete "$HOURS_TO_COMPLETE" \
   --expected-repo-name "$EXPECTED_REPO_NAME" \
   --wandb-mode "$WANDB_MODE" \
-  --wandb-project "$WANDB_PROJECT" \
-  --max-steps "$MAX_STEPS" \
-  --dataset-type "$DATASET_TYPE" || true
+  --wandb-project "$WANDB_PROJECT" || true
 
 # Batalkan Watchdog jika proses trainer selesai lebih cepat secara natural
 kill $TIMER_PID 2>/dev/null || true

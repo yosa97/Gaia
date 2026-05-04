@@ -45,77 +45,9 @@ def is_reasoning_tokenizer(tokenizer: AutoTokenizer) -> bool:
         return False
 
 
-def _is_local_path(path: str) -> bool:
-    """True jika path adalah local filesystem path (bukan HF repo ID).
-    
-    HuggingFace Hub >=0.24 strict validate repo ID — path lokal dengan
-    banyak '/' akan ditolak jika tidak di-flag sebagai local.
-    """
-    return (
-        path.startswith("/")
-        or path.startswith("./")
-        or os.path.isdir(path)
-    )
-
-
-def resolve_model_path(model_path: str, model_name: str = "") -> str:
-    """Resolve path model yang sebenarnya dari cache directory.
-
-    Downloader menyimpan model di /cache/models/Org--Name/,
-    tapi train_info['model_path'] kadang hanya /cache/models (parent dir).
-    Fungsi ini menemukan subdirektori yang tepat.
-    """
-    if not model_path or not os.path.isdir(model_path):
-        return model_path
-
-    # Helper function to find actual directory containing config.json
-    def _find_config_dir(base_path: str) -> str:
-        if os.path.exists(os.path.join(base_path, "config.json")):
-            return base_path
-        snapshots_dir = os.path.join(base_path, "snapshots")
-        if os.path.isdir(snapshots_dir):
-            # Ambil snapshot terbaru/pertama yang valid
-            for commit_hash in os.listdir(snapshots_dir):
-                snap_path = os.path.join(snapshots_dir, commit_hash)
-                if os.path.isdir(snap_path) and os.path.exists(os.path.join(snap_path, "config.json")):
-                    return snap_path
-        return None
-
-    # Cek apakah path ini sudah merupakan model dir (atau parent dari snapshots)
-    res = _find_config_dir(model_path)
-    if res:
-        return res
-
-    # Coba cari subdirektori yang match nama model (format: Org--Name atau models--Org--Name)
-    if model_name:
-        for prefix in ["", "models--"]:
-            dir_name = prefix + model_name.replace("/", "--")
-            candidate = os.path.join(model_path, dir_name)
-            if os.path.isdir(candidate):
-                res = _find_config_dir(candidate)
-                if res:
-                    print(f"[model_utility] Resolved model path: {res}", flush=True)
-                    return res
-
-    # Fallback: ambil subdirektori pertama yang punya config.json
-    try:
-        for subdir in sorted(os.listdir(model_path)):
-            full = os.path.join(model_path, subdir)
-            if os.path.isdir(full):
-                res = _find_config_dir(full)
-                if res:
-                    print(f"[model_utility] Resolved model path (fallback): {res}", flush=True)
-                    return res
-    except Exception:
-        pass
-
-    return model_path
-
-
 def get_model_architecture(model_path: str) -> str:
     try:
-        local = _is_local_path(model_path)
-        config = AutoConfig.from_pretrained(model_path, local_files_only=local)
+        config = AutoConfig.from_pretrained(model_path)
         architectures = config.architectures
         if len(architectures) > 1:
             return "Multiple architectures"
@@ -189,32 +121,26 @@ def get_gpu_count():
 
 
 def get_model_num_params(model_id: str, model_path: str) -> int:
-    # Coba resolve actual model directory dulu
-    resolved_path = resolve_model_path(model_path, model_id)
-
     if model_id in MODEL_CONFIG:
         return MODEL_CONFIG[model_id]["model_size"]
     try:
-        size = get_model_size_from_local_path(resolved_path)
+        size = get_model_size_from_local_path(model_path)
         if size is not None:
             return size
-        raise Exception(f"Cannot get model size from {resolved_path}")
+        raise Exception(f"Cannot get model size from {model_path}")
 
     except Exception as e:
         print(f"Error getting model size from safetensors: {e}")
         try:
-            model_size = re.search(r"(\d+(?:\.\d+)?)(?=[bB])", model_id or "")
-            if model_size:
-                val = float(model_size.group(1))
-                result = int(val * 1_000_000_000)
-                print(f"Model size from regex: {result}")
-                return result
-        except Exception as e2:
-            print(f"Error getting model size from regex: {e2}")
-
-    # Safe default: anggap 3B kalau semua cara gagal
-    print("[model_utility] WARNING: Cannot determine model size. Defaulting to 3B.", flush=True)
-    return 3_000_000_000
+            model_size = re.search(r"(\d+)(?=[bB])", model_id)
+            model_size = (
+                int(model_size.group(1)) * 1_000_000_000 if model_size else None
+            )
+            print(f"Model size from regex: {model_size}")
+            return model_size
+        except Exception as e:
+            print(f"Error getting model size from regex: {e}")
+            return None
 
 
 def disable_flash_attention(architecture: str, model: str) -> str:
