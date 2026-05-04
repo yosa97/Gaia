@@ -40,6 +40,9 @@ RUN bash -c "source /workspace/.grpo_env/bin/activate && \
     deactivate"
 
 # Copy current folder to /workspace/auto_ml
+# SCRIPTS_CACHE_BUST: pass --build-arg SCRIPTS_CACHE_BUST=$(date +%s) to force refresh scripts
+# tanpa harus rebuild seluruh image (layer pip install tetap cached)
+ARG SCRIPTS_CACHE_BUST=1
 COPY scripts /workspace/scripts
 # # Make entrypoint script executable
 # RUN chmod +x /workspace/scripts/alfworld_run.sh

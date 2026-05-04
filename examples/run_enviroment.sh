@@ -83,7 +83,12 @@ docker network create "$NETWORK_NAME" 2>/dev/null || true
 docker build -t trainer-downloader -f dockerfiles/trainer-downloader.dockerfile .
 
 # Build the trainer image
-docker build -t standalone-text-trainer -f dockerfiles/standalone-text-trainer.dockerfile .
+# --build-arg SCRIPTS_CACHE_BUST: memaksa Docker rebuild layer COPY scripts
+# agar code terbaru selalu dipakai. Layer pip install tetap cached (cepat).
+docker build \
+  --build-arg SCRIPTS_CACHE_BUST="$(date +%s)" \
+  -t standalone-text-trainer \
+  -f dockerfiles/standalone-text-trainer.dockerfile .
 
 # Build the hf-uploader image
 docker build -t hf-uploader -f dockerfiles/hf-uploader.dockerfile .
