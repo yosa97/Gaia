@@ -442,10 +442,15 @@ def main():
         _sft_info     = None
         _sft_output   = None
 
+        # ── DEBUG: print dataset_type_dict untuk verifikasi injeksi ─────────────
+        print(f"[EnvTask] dataset_type_dict = {dataset_type_dict}", flush=True)
+        # ─────────────────────────────────────────────────────────────────────────
+
         # requested_datasets dikirim dari G.O.D server via dataset_type field
         # Format: dataset_type_dict["requested_datasets"] = ["org/dataset-name"]
         _requested_ds = dataset_type_dict.get("requested_datasets") or []
         _valid_ds     = validate_requested_datasets(_requested_ds)
+        print(f"[EnvTask] requested_ds={_requested_ds}, valid_ds={_valid_ds}", flush=True)
 
         if _valid_ds:
             print(
