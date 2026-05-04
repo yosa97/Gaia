@@ -63,8 +63,7 @@ def get_run_cmd(config: dict, gpu_nums: int) -> str:
     run_type  = config.get("distributed", "ddp")
 
     if gpu_nums > 1 and run_type == "ddp":
-        # --error_file agar traceback dari setiap rank terlihat jelas
-        start_cmd = f"torchrun --nproc_per_node={gpu_nums} --error_file /tmp/sft_error.txt"
+        start_cmd = f"torchrun --nproc_per_node={gpu_nums}"
     else:
         start_cmd = "python"
 
