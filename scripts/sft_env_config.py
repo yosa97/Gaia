@@ -171,7 +171,7 @@ def get_run_cmd(config: dict, gpu_nums: int) -> str:
 
     template = (
         start_cmd
-        + """ train_full_sft.py \
+        + """ train_sft_env.py \
     --request_path {request_path} \
     --environment_name {environment_name} \
     --bf16 True \
