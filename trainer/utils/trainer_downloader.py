@@ -19,6 +19,47 @@ from trainer import constants as cst
 hf_api = HfApi()
 
 
+def download_sft_datasets(datasets_csv: str, datasets_dir: str) -> None:
+    """Download whitelisted SFT datasets from HuggingFace Hub.
+
+    Reads a comma-separated list of HF dataset repo IDs from ``datasets_csv``
+    and downloads each one into ``datasets_dir`` using snapshot_download.
+    This makes the data available to the trainer container via volume mount
+    so that the SFT cold-start stage in train_grpo_env.py can run.
+
+    Args:
+        datasets_csv: Comma-separated HF dataset repo IDs, e.g.
+                      "gradients-io-tournaments/env_training_gradients".
+        datasets_dir: Local directory to download datasets into.
+    """
+    dataset_list = [d.strip() for d in datasets_csv.split(",") if d.strip()]
+    if not dataset_list:
+        print("[SFT-Downloader] No MINER_DATASETS specified, skipping SFT dataset download.", flush=True)
+        return
+
+    os.makedirs(datasets_dir, exist_ok=True)
+    print(f"[SFT-Downloader] Downloading {len(dataset_list)} SFT dataset(s) to: {datasets_dir}", flush=True)
+
+    for repo_id in dataset_list:
+        # Use repo_id with '/' → '--' as folder name (same convention as model download)
+        local_dir = os.path.join(datasets_dir, repo_id.replace("/", "--"))
+        if os.path.exists(local_dir) and os.listdir(local_dir):
+            print(f"[SFT-Downloader] Dataset already exists, skipping: {repo_id}", flush=True)
+            continue
+        try:
+            print(f"[SFT-Downloader] Downloading dataset: {repo_id}", flush=True)
+            snapshot_download(
+                repo_id=repo_id,
+                repo_type="dataset",
+                local_dir=local_dir,
+                local_dir_use_symlinks=False,
+            )
+            print(f"[SFT-Downloader] Done: {repo_id} → {local_dir}", flush=True)
+        except Exception as exc:
+            # Non-fatal: log and continue — SFT will be skipped if folder is empty
+            print(f"[SFT-Downloader] WARNING: Failed to download {repo_id}: {exc}", flush=True)
+
+
 async def download_text_dataset(task_id, dataset_url, file_format, dataset_dir):
     os.makedirs(dataset_dir, exist_ok=True)
 
@@ -119,6 +160,16 @@ async def main():
             prompt_text="Interact with this environment.",
             prompt_field="prompt",
         )
+
+        # ── Download SFT cold-start datasets ──────────────────────────────
+        # MINER_DATASETS and MINER_DATASETS_DIR are injected by run_enviroment.sh.
+        # If not set, this step is silently skipped and SFT won't run.
+        miner_datasets_csv = os.environ.get("MINER_DATASETS", "")
+        miner_datasets_dir = os.environ.get("MINER_DATASETS_DIR", "")
+        if miner_datasets_csv and miner_datasets_dir:
+            download_sft_datasets(miner_datasets_csv, miner_datasets_dir)
+        else:
+            print("[SFT-Downloader] MINER_DATASETS / MINER_DATASETS_DIR not set — skipping SFT dataset download.", flush=True)
     else:
         dataset_path, _ = await download_text_dataset(args.task_id, args.dataset, args.file_format, dataset_dir)
         model_path = await download_axolotl_base_model(args.model, model_dir)

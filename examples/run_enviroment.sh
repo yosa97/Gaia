@@ -74,6 +74,9 @@ docker build -t hf-uploader -f dockerfiles/hf-uploader.dockerfile .
 echo "Downloading model..."
 docker run --rm \
   --volume "$CHECKPOINTS_DIR:/cache:rw" \
+  --volume "$MINER_DATASETS_DIR:/cache/miner_datasets:rw" \
+  --env MINER_DATASETS="$MINER_DATASETS" \
+  --env MINER_DATASETS_DIR="/cache/miner_datasets" \
   --name downloader-image \
   trainer-downloader \
   --task-id "$TASK_ID" \
