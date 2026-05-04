@@ -32,6 +32,7 @@ from dpo_config import get_training_json as get_dpo_training_json
 from grpo_config import get_training_json as get_grpo_training_json
 from instruct_config import get_training_json as get_instruct_training_json
 from grpo_env_config import get_training_json as get_env_training_json
+from sft_env_config import get_training_json as get_full_sft_training_json
 from transformers import AutoConfig
 
 
@@ -429,7 +430,12 @@ def main():
         train_cmd = train_info["run_cmd"]
 
     elif args.task_type == TaskType.ENVIRONMENTTASK.value:
-        train_info = get_env_training_json(train_info)
+        sft_only = os.environ.get("SFT_ONLY", "0") == "1"
+        if sft_only:
+            print("[text_trainer] SFT_ONLY=1 detected — routing to full SFT (train_sft_env.py)", flush=True)
+            train_info = get_full_sft_training_json(train_info)
+        else:
+            train_info = get_env_training_json(train_info)
         tokenize_cmd = ""
         train_cmd = train_info["run_cmd"]
     else:
