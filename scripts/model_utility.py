@@ -58,6 +58,41 @@ def _is_local_path(path: str) -> bool:
     )
 
 
+def resolve_model_path(model_path: str, model_name: str = "") -> str:
+    """Resolve path model yang sebenarnya dari cache directory.
+
+    Downloader menyimpan model di /cache/models/Org--Name/,
+    tapi train_info['model_path'] kadang hanya /cache/models (parent dir).
+    Fungsi ini menemukan subdirektori yang tepat.
+    """
+    if not model_path or not os.path.isdir(model_path):
+        return model_path
+
+    # Cek apakah path ini sudah merupakan model dir (ada config.json)
+    if os.path.exists(os.path.join(model_path, "config.json")):
+        return model_path
+
+    # Coba cari subdirektori yang match nama model (format: Org--Name)
+    if model_name:
+        dir_name = model_name.replace("/", "--")
+        candidate = os.path.join(model_path, dir_name)
+        if os.path.isdir(candidate) and os.path.exists(os.path.join(candidate, "config.json")):
+            print(f"[model_utility] Resolved model path: {candidate}", flush=True)
+            return candidate
+
+    # Fallback: ambil subdirektori pertama yang berisi config.json
+    try:
+        for subdir in sorted(os.listdir(model_path)):
+            full = os.path.join(model_path, subdir)
+            if os.path.isdir(full) and os.path.exists(os.path.join(full, "config.json")):
+                print(f"[model_utility] Resolved model path (fallback): {full}", flush=True)
+                return full
+    except Exception:
+        pass
+
+    return model_path
+
+
 def get_model_architecture(model_path: str) -> str:
     try:
         local = _is_local_path(model_path)
@@ -135,26 +170,32 @@ def get_gpu_count():
 
 
 def get_model_num_params(model_id: str, model_path: str) -> int:
+    # Coba resolve actual model directory dulu
+    resolved_path = resolve_model_path(model_path, model_id)
+
     if model_id in MODEL_CONFIG:
         return MODEL_CONFIG[model_id]["model_size"]
     try:
-        size = get_model_size_from_local_path(model_path)
+        size = get_model_size_from_local_path(resolved_path)
         if size is not None:
             return size
-        raise Exception(f"Cannot get model size from {model_path}")
+        raise Exception(f"Cannot get model size from {resolved_path}")
 
     except Exception as e:
         print(f"Error getting model size from safetensors: {e}")
         try:
-            model_size = re.search(r"(\d+)(?=[bB])", model_id)
-            model_size = (
-                int(model_size.group(1)) * 1_000_000_000 if model_size else None
-            )
-            print(f"Model size from regex: {model_size}")
-            return model_size
-        except Exception as e:
-            print(f"Error getting model size from regex: {e}")
-            return None
+            model_size = re.search(r"(\d+(?:\.\d+)?)(?=[bB])", model_id or "")
+            if model_size:
+                val = float(model_size.group(1))
+                result = int(val * 1_000_000_000)
+                print(f"Model size from regex: {result}")
+                return result
+        except Exception as e2:
+            print(f"Error getting model size from regex: {e2}")
+
+    # Safe default: anggap 3B kalau semua cara gagal
+    print("[model_utility] WARNING: Cannot determine model size. Defaulting to 3B.", flush=True)
+    return 3_000_000_000
 
 
 def disable_flash_attention(architecture: str, model: str) -> str:

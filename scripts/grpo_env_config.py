@@ -7,6 +7,7 @@ from model_utility import (
     get_use_vllm,
     get_gradient_checkpointing,
     get_gpu_count,
+    resolve_model_path,
 )
 from copy import deepcopy
 from lrs_lookup import get_grpo_lr
@@ -279,6 +280,8 @@ def get_run_cmd(config: dict, gpu_nums: int):
 def get_training_json(train_info: dict) -> dict:
     model_name = train_info["model_name"]
     model_path = train_info["model_path"]
+    # Resolve actual model directory (bisa saja model_path = /cache/models parent dir)
+    model_path = resolve_model_path(model_path, model_name)
     model_architecture = get_model_architecture(model_path)
     param_nums = get_model_num_params(model_name, model_path)
     config = get_grpo_config(param_nums)
