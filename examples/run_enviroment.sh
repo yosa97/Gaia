@@ -5,6 +5,9 @@
 # scripts/train_full_sft.py (which uses Boardgame-QA + env_training_gradients
 # mixed 50/50). Datasets pre-downloaded to host then mounted into trainer.
 
+# Always run from the repo root so relative paths (dockerfiles/, etc.) resolve correctly.
+cd "$(dirname "$0")/.." || exit 1
+
 TASK_ID="1"
 MODEL=""
 DATASET="dummy"

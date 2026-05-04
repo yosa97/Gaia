@@ -69,7 +69,7 @@ def run_cmd_with_log(cmd: str, log_file_path: str, env_vars: dict = None):
 
 
 def replace_args_in_cmd(cmd: str, arg_name: str, arg_value: str):
-    match = re.search(f"(?P<p>--{arg_name}(\s+)([^\s]+))(\s+)", cmd)
+    match = re.search(rf"(?P<p>--{arg_name}(\s+)([^\s]+))(\s+)", cmd)
     if match:
         left_index = match.start("p")
         right_index = match.end("p")
@@ -79,7 +79,7 @@ def replace_args_in_cmd(cmd: str, arg_name: str, arg_value: str):
 
 
 def extract_value_from_cmd(cmd: str, arg_name: str):
-    match = re.search(f"(?P<p>--{arg_name}(\s+)(?P<value>[^\s]+))(\s+)", cmd)
+    match = re.search(rf"(?P<p>--{arg_name}(\s+)(?P<value>[^\s]+))(\s+)", cmd)
     if match:
         return match.group("value")
     else:
