@@ -1,7 +1,7 @@
 #!/bin/bash
 
 TASK_ID="1"
-MODEL=""
+MODEL="Qwen/Qwen2.5-7B-Instruct"
 DATASET="dummy"
 DATASET_TYPE='{
   "environment_name": "gin_rummy"
