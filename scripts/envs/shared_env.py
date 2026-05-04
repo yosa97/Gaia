@@ -1,4 +1,5 @@
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock, Semaphore
 
@@ -142,3 +143,10 @@ def rollout_reward_func(completions, **kwargs):
     """Generic reward passthrough used by all game environments."""
     rewards = kwargs.get("env_rewards") if kwargs else None
     return [float(r) for r in rewards] if rewards is not None else [0.0] * len(completions)
+
+
+def remove_reasoning_tags(text: str) -> str:
+    """Remove <thought>...</thought> tags and content for clean reward parsing."""
+    if text is None:
+        return ""
+    return re.sub(r"<thought>.*?</thought>", "", text, flags=re.DOTALL).strip()
