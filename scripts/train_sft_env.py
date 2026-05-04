@@ -370,7 +370,7 @@ def main():
             save_strategy="no",
             eval_strategy="no",
             gradient_checkpointing=args.gradient_checkpointing,
-            optim=args.optim if args.optim else "paged_adamw_8bit",
+            optim=args.optim if args.optim else "adamw_torch",
             report_to=args.report_to if args.report_to else "none",
             dataset_text_field="text",
             max_seq_length=2048,

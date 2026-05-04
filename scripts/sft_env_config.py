@@ -6,14 +6,15 @@ Output: run_cmd string untuk train_sft_env.py + path checkpoint untuk GRPO.
 """
 
 from copy import deepcopy
+from whitelisted_sft_datasets import validate_requested_datasets, get_game_for_dataset
 from model_utility import (
     get_model_architecture,
     get_model_num_params,
     disable_flash_attention,
     get_gradient_checkpointing,
     get_gpu_count,
+    resolve_model_path,
 )
-from whitelisted_sft_datasets import validate_requested_datasets, get_game_for_dataset
 
 # ── Config per ukuran model ────────────────────────────────────────────────────
 # Batch size kecil karena SFT dataset env kecil (few small datasets).
@@ -62,7 +63,8 @@ def get_run_cmd(config: dict, gpu_nums: int) -> str:
     run_type  = config.get("distributed", "ddp")
 
     if gpu_nums > 1 and run_type == "ddp":
-        start_cmd = f"torchrun --nproc_per_node={gpu_nums}"
+        # --error_file agar traceback dari setiap rank terlihat jelas
+        start_cmd = f"torchrun --nproc_per_node={gpu_nums} --error_file /tmp/sft_error.txt"
     else:
         start_cmd = "python"
 
@@ -84,7 +86,7 @@ def get_run_cmd(config: dict, gpu_nums: int) -> str:
     --lr_scheduler_type cosine \\
     --tf32 True \\
     --gradient_checkpointing {gradient_checkpointing} \\
-    --optim paged_adamw_8bit \\
+    --optim adamw_torch \\
     --report_to none \\
     --disable_fa {disable_fa} \\
     --use_lora {use_lora}"""
@@ -114,6 +116,7 @@ def get_training_json(train_info: dict, requested_datasets: list[str]) -> dict |
 
     model_name         = train_info["model_name"]
     model_path         = train_info["model_path"]
+    model_path         = resolve_model_path(model_path, model_name)
     model_arch         = get_model_architecture(model_path)
     param_nums         = get_model_num_params(model_name, model_path)
     config             = deepcopy(_pick_config(param_nums))
