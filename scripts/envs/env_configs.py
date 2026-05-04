@@ -169,9 +169,12 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         num_generations=8,
         temperature=2.0,
         top_k=5,
-        reasoning=ModeConfig(initial_max_turn=8),
-        no_mask=ModeConfig(initial_max_turn=4, rollouts_per_stage=512),
-        full_prompt=ModeConfig(initial_max_turn=8),
+        # Aggressive curriculum: skip useless early stages, advance every 128 rollouts
+        # With warmup_rollouts=0 (curriculum_factory), max_turn naik dari rollout 128
+        # Reach max_turn=30 in ~1920 rollouts (~30-50 min) instead of NEVER
+        reasoning=ModeConfig(initial_max_turn=15, rollouts_per_stage=128),
+        no_mask=ModeConfig(initial_max_turn=15, rollouts_per_stage=128),
+        full_prompt=ModeConfig(initial_max_turn=15, rollouts_per_stage=128),
     ),
     "liars_dice": EnvTrainingConfig(
         rollout_full=_liar_rollout_full,
