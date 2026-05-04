@@ -1,7 +1,7 @@
 #!/bin/bash
 
 TASK_ID="1"
-MODEL="Qwen/Qwen2.5-7B-Instruct"
+MODEL=""           # ← WAJIB DIISI: HuggingFace model repo ID, e.g. Qwen/Qwen2.5-7B-Instruct
 DATASET="dummy"
 DATASET_TYPE='{
   "environment_name": "gin_rummy"
@@ -50,6 +50,12 @@ mkdir -p "$OUTPUTS_DIR"
 chmod 777 "$OUTPUTS_DIR"
 
 # Prepare SFT dataset directory
+if [ -z "$MODEL" ]; then
+  echo "[ERROR] MODEL is not set. Please fill in the MODEL variable before running."
+  echo "        Example: MODEL=\"Qwen/Qwen2.5-7B-Instruct\""
+  exit 1
+fi
+
 if [ -n "$MINER_DATASETS" ]; then
   mkdir -p "$MINER_DATASETS_DIR"
   chmod 777 "$MINER_DATASETS_DIR"
