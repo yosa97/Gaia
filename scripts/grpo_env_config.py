@@ -8,6 +8,7 @@ from model_utility import (
     get_gradient_checkpointing,
     get_gpu_count,
 )
+import os
 from copy import deepcopy
 from lrs_lookup import get_grpo_lr
 from envs.env_configs import get_env_config
@@ -281,6 +282,19 @@ def get_run_cmd(config: dict, gpu_nums: int):
     if config.get("rollouts_per_stage", 1280) != 1280:
         template = template + f" --rollouts_per_stage {config.get('rollouts_per_stage', 1280)}"
         
+    print(f"template: {template}", flush=True)
+    return template
+
+
+    # If SFT warm-start mode is active, pass the checkpoint repo as a CLI arg.
+    # This is purely informational inside train_grpo_env.py (it also reads the
+    # env var directly), but passing it via CLI keeps the run config auditable
+    # in the torchrun logs.
+    sft_warmup = os.environ.get("SFT_WARMUP", "0") == "1"
+    sft_checkpoint_repo = os.environ.get("SFT_CHECKPOINT_REPO", "")
+    if sft_warmup and sft_checkpoint_repo:
+        template += f" --sft_checkpoint {sft_checkpoint_repo}"
+
     print(f"template: {template}", flush=True)
     return template
 

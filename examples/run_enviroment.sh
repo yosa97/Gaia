@@ -1,9 +1,13 @@
 #!/bin/bash
-# Full SFT local runner — pure SFT mode (no GRPO, no env server).
+# Environment training runner — supports three modes:
 #
-# Sets SFT_ONLY=1 env var so scripts/text_trainer.py routes to
-# scripts/train_full_sft.py (which uses Boardgame-QA + env_training_gradients
-# mixed 50/50). Datasets pre-downloaded to host then mounted into trainer.
+#   MODE 1 (SFT_ONLY=1)  : Pure SFT (Boardgame-QA warm-up + env game data).
+#   MODE 2 (SFT_WARMUP=1): Load pre-trained SFT checkpoint, then GRPO.
+#                           Set SFT_CHECKPOINT_REPO to your HF adapter repo.
+#   MODE 3 (default)     : GRPO from cold base model (original behaviour).
+#
+# Current active mode: MODE 1 (SFT_ONLY=1 set below)
+# To switch to MODE 2: comment out SFT_ONLY=1, uncomment SFT_WARMUP lines.
 
 # Always run from the repo root so relative paths (dockerfiles/, etc.) resolve correctly.
 cd "$(dirname "$0")/.." || exit 1
@@ -26,6 +30,9 @@ HUGGINGFACE_USERNAME=""
 HUGGINGFACE_TOKEN=""
 EXPECTED_REPO_NAME=""
 LOCAL_FOLDER="/app/checkpoints/$TASK_ID/$EXPECTED_REPO_NAME"
+# Repo SFT checkpoint dari run sebelumnya — diisi manual jika mau pakai MODE 2.
+# Contoh: "yosa722/yosa-gin006" (repo yang di-upload setelah run SFT terakhir)
+SFT_WARMUP_REPO=""
 DOCKER_BUILDKIT=1
 
 # ── Miner-requested whitelisted datasets (slot 1 + slot 2) ─────────────────
@@ -104,6 +111,16 @@ download_dataset "$MINER_DATASET_REPO_2" "$MINER_DATASET_DIR_2"
 # Run trainer (no env server — full SFT doesn't need rollout)
 echo "Starting full SFT trainer..."
 
+# ── Training mode switch ───────────────────────────────────────────────────
+# MODE 1 (default): Pure SFT
+# MODE 2: SFT checkpoint → GRPO (lebih kompetitif, butuh SFT_WARMUP_REPO diisi)
+#   Isi SFT_WARMUP_REPO di atas dengan repo dari run SFT sebelumnya, lalu:
+#   comment baris TRAINING_MODE_ENVS MODE 1, uncomment baris MODE 2.
+TRAINING_MODE_ENVS="--env SFT_ONLY=1"
+# Uncomment baris berikut (dan comment baris di atas) untuk aktifkan MODE 2:
+# TRAINING_MODE_ENVS="--env SFT_WARMUP=1 --env SFT_CHECKPOINT_REPO=${SFT_WARMUP_REPO}"
+# ─────────────────────────────────────────────────────────────────────────────
+
 TIMEOUT_SECONDS=$(echo "$HOURS_TO_COMPLETE * 3600" | bc | cut -d. -f1)
 (sleep $TIMEOUT_SECONDS && echo "[WATCHDOG] TIMEOUT — stopping container..." && docker stop full-sft-trainer 2>/dev/null) &
 TIMER_PID=$!
@@ -123,7 +140,7 @@ docker run --rm --gpus all \
   --env WANDB_INIT_TIMEOUT=300 \
   --env MINER_DATASETS_DIR=/cache/miner_datasets \
   --env MINER_DATASETS="$MINER_DATASET_DIR_1,$MINER_DATASET_DIR_2" \
-  --env SFT_ONLY=1 \
+  $TRAINING_MODE_ENVS \
   --env HF_TOKEN="$HUGGINGFACE_TOKEN" \
   --name full-sft-trainer \
   standalone-text-trainer \

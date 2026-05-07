@@ -265,6 +265,54 @@ def run_sft_cold_start(model, tokenizer, training_args, peft_config):
 
 
 # ============================================================================
+# SFT Warm-Start (SFT → GRPO cold-start from pre-trained LoRA adapter)
+# ============================================================================
+
+def _load_sft_warmup_checkpoint(
+    model,
+    sft_checkpoint: str,
+    model_kwargs: dict,
+) -> Any:
+    """Load a LoRA SFT checkpoint from HuggingFace and merge it into ``model``.
+
+    This provides a warm starting point for GRPO: instead of starting from the
+    cold base model, GRPO continues fine-tuning from a model that already knows
+    the game's action format and basic strategy (from SFT).
+
+    The adapter is merged and unloaded so that GRPOTrainer can attach its own
+    fresh LoRA adapter on top (GRPOTrainer crashes if it receives a PeftModel
+    AND a peft_config simultaneously).
+
+    Args:
+        model:          The base model (AutoModelForCausalLM instance).
+        sft_checkpoint: HuggingFace repo ID of the SFT LoRA adapter.
+        model_kwargs:   Original model kwargs (for device_map / dtype alignment).
+
+    Returns:
+        Merged base model (warmed-up) ready for GRPO LoRA attachment.
+    """
+    try:
+        from peft import PeftModel
+
+        log_info(f"[SFT-Warmup] Loading LoRA adapter from HuggingFace: {sft_checkpoint}")
+        peft_model = PeftModel.from_pretrained(
+            model,
+            sft_checkpoint,
+            is_trainable=False,   # read-only — we just want to merge weights
+        )
+        log_info("[SFT-Warmup] Merging adapter into base model...")
+        merged = peft_model.merge_and_unload()
+        log_info("[SFT-Warmup] ✅ Adapter merged — model warm-started for GRPO.")
+        # Signal downstream callbacks that SFT warm-start was applied
+        os.environ["SFT_WARMUP_APPLIED"] = "1"
+        return merged
+    except Exception as exc:
+        log_info(f"[SFT-Warmup] ⚠️ Failed to load checkpoint {sft_checkpoint!r}: {exc}")
+        log_info("[SFT-Warmup] Continuing with cold base model.")
+        return model
+
+
+# ============================================================================
 # Gradient Monitoring Callback
 # ============================================================================
 
@@ -291,6 +339,12 @@ class TrainingArguments(GRPOConfig):
     initial_max_turn: Optional[int] = field(default=2)
     rollouts_per_stage: Optional[int] = field(default=1280)
     environment_name: Optional[str] = field(default=None)
+    sft_checkpoint: Optional[str] = field(
+        default=None,
+        metadata={"help": "HuggingFace repo ID of a LoRA SFT checkpoint to warm-start GRPO from. "
+                         "Also readable from SFT_CHECKPOINT_REPO env var. "
+                         "If set, adapter is loaded, merged into base model, then GRPO proceeds normally."},
+    )
 
 def print_trainable_parameters(model):
     """
@@ -968,14 +1022,31 @@ def main():
 
         model = model_class.from_pretrained(train_request["model_path"], **model_kwargs)
 
-        # ── SFT Cold-Start Stage ──────────────────────────────────────────
-        # Run a short SFT phase using whitelisted datasets before GRPO.
-        # This stabilises output format and reduces cold-start variance.
-        # Only runs when MINER_DATASETS_DIR / MINER_DATASETS env vars are set
-        # (i.e. when the validator has pre-downloaded whitelisted datasets).
-        if is_main_process(LOCAL_RANK):
-            log_info("[Main] Checking for SFT cold-start datasets...")
-        model = run_sft_cold_start(model, tokenizer, training_args, peft_config=get_peft_config(model_args))
+        # ── SFT Warm-Start (SFT → GRPO) ───────────────────────────────────
+        # If SFT_WARMUP=1, load a pre-trained SFT LoRA adapter from HF and
+        # merge it into the base model before GRPO begins.  This gives GRPO
+        # a much better starting distribution than a cold base model.
+        sft_warmup_repo = (
+            training_args.sft_checkpoint
+            or os.environ.get("SFT_CHECKPOINT_REPO", "")
+        )
+        if os.environ.get("SFT_WARMUP", "0") == "1" and sft_warmup_repo:
+            if is_main_process(LOCAL_RANK):
+                log_info(f"[Main] SFT_WARMUP=1 detected — loading checkpoint: {sft_warmup_repo}")
+            model = _load_sft_warmup_checkpoint(model, sft_warmup_repo, model_kwargs)
+            # Halve the GRPO LR: warm-started model is already close to the
+            # target distribution, so a full LR would over-shoot the SFT weights.
+            original_lr = training_args.learning_rate
+            training_args.learning_rate = original_lr * 0.5
+            if is_main_process(LOCAL_RANK):
+                log_info(f"[SFT-Warmup] LR adjusted: {original_lr:.2e} → {training_args.learning_rate:.2e}")
+        else:
+            # ── SFT Cold-Start Stage ──────────────────────────────────────
+            # Run a short SFT phase using whitelisted datasets before GRPO.
+            # Only runs when MINER_DATASETS_DIR / MINER_DATASETS env vars are set.
+            if is_main_process(LOCAL_RANK):
+                log_info("[Main] Checking for SFT cold-start datasets...")
+            model = run_sft_cold_start(model, tokenizer, training_args, peft_config=get_peft_config(model_args))
 
         # some model need to set the generation config or encounter the invalid generation config error
         set_generation_config(train_request["model_name"], model)
