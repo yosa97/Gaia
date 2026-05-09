@@ -762,10 +762,23 @@ class BayesianOpponentHandModel:
         return [c for c in hand if self.is_safe_discard(c)]
 
     def estimated_opponent_deadwood(self) -> float:
-        """Numeric estimate of opponent's total deadwood, using the posterior."""
-        top_hand = self.estimated_opponent_hand(10)
-        estimated_dw = sum(get_value(c) * p for c, p in top_hand) if top_hand else 0.0
+        """Numeric estimate of opponent's total deadwood, using the posterior.
+
+        Confirmed-in-hand cards contribute their full value once. Remaining
+        hand slots are filled with the highest-probability uncertain cards,
+        weighted by their posterior probability. This avoids the prior bug
+        where confirmed cards were summed twice (once via top_hand at p=1.0
+        and again via confirmed_dw).
+        """
         confirmed_dw = sum(get_value(c) for c in self._confirmed_in_hand if len(c) == 2)
+        confirmed_count = len(self._confirmed_in_hand)
+        remaining_slots = max(self._opp_hand_size - confirmed_count, 0)
+        uncertain = sorted(
+            ((c, p) for c, p in self._prob.items()
+             if p > 0 and c not in self._confirmed_in_hand),
+            key=lambda x: -x[1],
+        )[:remaining_slots]
+        estimated_dw = sum(get_value(c) * p for c, p in uncertain)
         return estimated_dw + confirmed_dw
 
     def is_posterior_confident(self, turn_number: int = 0) -> bool:
@@ -1004,7 +1017,7 @@ def _ensure_initialized(trainer) -> None:
     curriculum = _curriculum_factory(trainer.args)
     print(
         f"[CURRICULUM] Initialized: initial_max_turn={trainer.args.initial_max_turn}, "
-        f"final_max_turn=15, rollouts_per_stage={trainer.args.rollouts_per_stage}"
+        f"final_max_turn={curriculum.final_max_turn}, rollouts_per_stage={trainer.args.rollouts_per_stage}"
     )
 
     _state.update(

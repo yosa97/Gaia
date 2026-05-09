@@ -675,17 +675,16 @@ def _run_episode(
                     step_scores.append(taken_action.score if taken_action else 0.0)
                 else:
                     won              = step_reward > 0.5
+                    # Per-step component: only the action score (terminal payoff
+                    # is applied once via `terminal_reward` to avoid double-counting).
                     immediate_reward = (taken_action.score if taken_action else 0.0)
-                    # EDGE 1: multiply terminal by terminal_weight (was dead code in boss).
-                    # WIN: +2 * terminal_weight = +6 (was +1). LOSS: -2 * terminal_weight = -6 (was -1).
-                    immediate_reward += (step_reward - 0.5) * 2.0 * calculator.terminal_weight
                     step_scores.append(taken_action.score if taken_action else 0.0)
+                    # Terminal payoff: WIN: +1 * terminal_weight = +3.
+                    #                  LOSS: -1 * terminal_weight = -3.
                     terminal_reward  = (step_reward - 0.5) * 2.0 * calculator.terminal_weight
                     if won:
-                        immediate_reward += BLUFF_WIN_BONUS     * min(bluff_count,      RISKY_BONUS_MAX_COUNT)
-                        immediate_reward += RISKY_LIAR_WIN_BONUS * min(risky_liar_count, RISKY_BONUS_MAX_COUNT)
-                        terminal_reward  += BLUFF_WIN_BONUS     * min(bluff_count,      RISKY_BONUS_MAX_COUNT)
-                        terminal_reward  += RISKY_LIAR_WIN_BONUS * min(risky_liar_count, RISKY_BONUS_MAX_COUNT)
+                        terminal_reward += BLUFF_WIN_BONUS      * min(bluff_count,      RISKY_BONUS_MAX_COUNT)
+                        terminal_reward += RISKY_LIAR_WIN_BONUS * min(risky_liar_count, RISKY_BONUS_MAX_COUNT)
         else:
             immediate_reward = -1.0
             step_scores.append(-1.0)

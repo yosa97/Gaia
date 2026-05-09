@@ -305,7 +305,6 @@ def _run_episode(
     action masking (mask=1 for LLM completions, mask=0 for environment turns).
     When ``use_full_prompt=False``, only the final turn's token IDs are kept.
     """
-    current_max_turn = 5
     game_id = int(prompt)
 
     server_idx   = (index + rank) % num_servers

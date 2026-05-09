@@ -20,7 +20,7 @@ from envs.shared_env import (
 # Constants
 # ---------------------------------------------------------------------------
 
-_SELECTED_GAME = "goofspiel"
+_SELECTED_GAME = "goof_spiel"
 _MAX_EPISODE_TOKENS = 16384
 _MAX_PROMPT_LEN = 4225
 _TIMEOUT = 2400
@@ -280,7 +280,7 @@ def _run_episode_last(
 
     action_to_send = remove_reasoning_tags(completion_text)
     if action_to_send.endswith("</s>"):
-        action_to_send = action_to_send[:-5]
+        action_to_send = action_to_send[:-4]
     if "Action:" in action_to_send:
         action_to_send = action_to_send.split("Action:")[-1].strip()
 
@@ -425,7 +425,7 @@ def _run_episode_full(
         # --- Parse action ---
         action_to_send = completion_text
         if action_to_send.endswith("</s>"):
-            action_to_send = action_to_send[:-5]
+            action_to_send = action_to_send[:-4]
         if "Action:" in action_to_send:
             action_to_send = action_to_send.split("Action:")[-1].strip()
 
@@ -492,8 +492,8 @@ def _run_episode_full(
     shaped_reward -= 0.05 * float(invalid_count)
 
     print(
-        "[ID:{:<6} Done:{} T:{:>2d} | EnvR:{:>6.2f} | TrainR:{:>6.2f} | Inv:{:<2}]".format(
-            str(game_id)[:6], int(done), turn_number, final_reward, episode_reward, invalid_count,
+        "[ID:{:<6} Done:{} T:{:>2d} | EnvR:{:>6.2f} | Shaped:{:>6.2f} | Inv:{:<2}]".format(
+            str(game_id)[:6], int(done), turn_number, train_reward, shaped_reward, invalid_count,
         )
     )
 
@@ -579,7 +579,7 @@ def rollout_first_prompt_and_completion(
 
             action_to_send = completion_text
             if action_to_send.endswith("</s>"):
-                action_to_send = action_to_send[:-5]
+                action_to_send = action_to_send[:-4]
             if "Action:" in action_to_send:
                 action_to_send = action_to_send.split("Action:")[-1].strip()
 

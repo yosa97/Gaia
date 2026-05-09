@@ -682,7 +682,13 @@ class RewardCalculator:
             reward += CONFIDENT_RAISE_BONUS * confidence
         return reward
 
-    def episode_reward(self, step_rewards: list[float], env_reward: float, done: bool) -> float:
+    def episode_reward(
+        self,
+        step_rewards: list[float],
+        env_reward: float,
+        done: bool,
+        opp_folded: bool = False,
+    ) -> float:
         """Pure per-step total return: terminal outcome + sum of per-step shaping.
 
         No split clipping on aggregate positive/negative — per-step bounds
@@ -694,16 +700,14 @@ class RewardCalculator:
             # G.O.D server normalizes env_reward to [0,1] zero-sum;
             # map to [-1, +1] (TERMINAL_LOSS_REWARD .. TERMINAL_WIN_REWARD).
             terminal = 2.0 * env_reward - 1.0
-            
-            # Bonus for winning without showdown (bluffing/pressure success)
-            # env_reward > 0.5 means we won. We check if there was a showdown
-            # by looking at the last state: if no showdown occurred, we win via fold.
-            # (In Leduc, showdown happens if last action was Call/Check on R2)
-            if env_reward > 0.5 and step_rewards:
-                 # If env_reward > 0.5 and it's not a showdown win, add bonus.
-                 # Heuristic: showdown wins usually have higher terminal value due to 
-                 # pot build-up, but fold wins are pure strategy.
-                 terminal += POT_WIN_NO_SHOWDOWN_BONUS
+
+            # Bonus for winning by inducing the opponent to fold (bluff/pressure
+            # success). Previously this fired on every win because the only
+            # check was env_reward > 0.5, which conflates showdown wins with
+            # fold wins. We now require opp_folded to be observed in the
+            # actual betting history before granting the bonus.
+            if env_reward > 0.5 and opp_folded:
+                terminal += POT_WIN_NO_SHOWDOWN_BONUS
 
         return terminal + sum(step_rewards)
 
@@ -801,6 +805,13 @@ def _run_episode(
     rewards:      list[float]   = []
     event_counter: dict[str, int] = {}
 
+    # Track whether we last saw the opponent fold — needed to attribute the
+    # POT_WIN_NO_SHOWDOWN_BONUS only to actual fold-induced wins.
+    opp_folded:   bool          = False
+    # Round at which the posterior was last reset_with_known (so we can
+    # re-prime it once the public card is revealed in round 2).
+    last_reset_round: int       = 0
+
     # Opponent modelling — active in both training modes so the full_prompt
     # variant is a meaningful A/B against the base env (Bayes' Bluff posterior
     # + SuspicionAgent ToM + RNR archetype shaping apply in both modes).
@@ -825,6 +836,7 @@ def _run_episode(
         if gs is not None:
             game_state_history.append(gs)
             posterior.reset_with_known(gs.private_card, gs.public_card)
+            last_reset_round = gs.round
     except Exception as exc:
         import traceback; traceback.print_exc()
         print(f"Failed to reset environment (Game {game_id}): {exc}")
@@ -936,6 +948,16 @@ def _run_episode(
 
         if done:
             final_reward = step_reward
+            # When the game terminates we can no longer rely on new_gs (only
+            # parsed for non-terminal states above). Inspect the final betting
+            # text directly so opp_folded is set if the opponent ended the hand
+            # by folding.
+            if not opp_folded and observation:
+                for label in ("Round 1 betting:", "Round 2 betting:"):
+                    m = re.search(rf"{label}\s*(.+)", observation)
+                    if m and "Fold" in m.group(1):
+                        opp_folded = True
+                        break
 
         # Action string for pot-odds logic + archetype update
         action_id: "int | None" = None
@@ -965,6 +987,17 @@ def _run_episode(
                     opp_action = new_actions[-1]  # most recent foreign action
                     posterior.update_on_action(opp_action, new_gs.round, new_gs.public_card_rank)
                     archetype.record(opp_action)
+                    if opp_action == "Fold":
+                        opp_folded = True
+
+            # Re-prime posterior when we transition to round 2 and the public
+            # card is revealed (was previously only reset once per episode,
+            # leaving private uncertainty entangled with new public info).
+            if (new_gs.round != last_reset_round
+                and new_gs.public_card is not None
+                and new_gs.round > last_reset_round):
+                posterior.reset_with_known(new_gs.private_card, new_gs.public_card)
+                last_reset_round = new_gs.round
 
         # Equity after
         curr_equity = None
@@ -1020,7 +1053,7 @@ def _run_episode(
         turn_number += 1
 
     # --- Episode reward ---
-    train_reward = calculator.episode_reward(rewards, final_reward, done)
+    train_reward = calculator.episode_reward(rewards, final_reward, done, opp_folded=opp_folded)
 
     events_str = " ".join(f"{k}:{v}" for k, v in event_counter.items()) if event_counter else "-"
     print(

@@ -485,7 +485,7 @@ def _run_episode(
         # --- Parse action ---
         action_to_send = remove_reasoning_tags(completion_text)
         if action_to_send.endswith("</s>"):
-            action_to_send = action_to_send[:-5]
+            action_to_send = action_to_send[:-4]
         if "Action:" in action_to_send:
             action_to_send = action_to_send.split("Action:")[-1].strip()
 
