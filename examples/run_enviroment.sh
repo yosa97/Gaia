@@ -31,7 +31,6 @@ HUGGINGFACE_TOKEN=""
 EXPECTED_REPO_NAME=""
 LOCAL_FOLDER="/app/checkpoints/$TASK_ID/$EXPECTED_REPO_NAME"
 # Repo SFT checkpoint dari run sebelumnya — diisi manual jika mau pakai MODE 2.
-# Contoh: "yosa722/yosa-gin006" (repo yang di-upload setelah run SFT terakhir)
 SFT_WARMUP_REPO=""
 DOCKER_BUILDKIT=1
 

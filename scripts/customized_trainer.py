@@ -33,8 +33,93 @@ ERROR_GENERATION_CONFIG_MODELS = [
 
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
 
-print(f"LOCAL_RANK: {LOCAL_RANK} in customized_trainer.py", flush=True)
+
+if is_main_process(LOCAL_RANK):
+    print(f"LOCAL_RANK: {LOCAL_RANK} in customized_trainer.py", flush=True)
     
+class SFTPhaseLoggingCallback(TrainerCallback):
+    """Tag SFT-phase metrics so they are distinguishable from GRPO metrics.
+
+    On every ``on_log`` event during SFT this callback:
+      * Prints a single ``[SFT][step=N loss=... grad_norm=... lr=...]`` line
+        to stdout — easy to grep and feed into Grafana.
+      * Re-emits each numeric metric to WandB under the ``sft/`` namespace,
+        keeping the SFT chart separate from GRPO's default-namespace chart.
+    On ``on_train_end`` it prints a one-line post-mortem with peak grad_norm,
+    final loss, runtime, and samples/sec.
+    """
+
+    def __init__(self):
+        self.peak_grad_norm = 0.0
+        self.last_loss = None
+
+    def on_log(self, args, state: TrainerState, control: TrainerControl, logs=None, **kwargs):
+        if not logs or not is_main_process(LOCAL_RANK):
+            return
+        step = state.global_step
+        loss = logs.get("loss")
+        grad_norm = logs.get("grad_norm")
+        lr = logs.get("learning_rate")
+        if loss is not None:
+            try:
+                self.last_loss = float(loss)
+            except (TypeError, ValueError):
+                pass
+        if grad_norm is not None:
+            try:
+                gn = float(grad_norm)
+                if gn > self.peak_grad_norm:
+                    self.peak_grad_norm = gn
+            except (TypeError, ValueError):
+                pass
+
+        parts = [f"step={step}"]
+        if loss is not None:
+            try: parts.append(f"loss={float(loss):.4f}")
+            except (TypeError, ValueError): pass
+        if grad_norm is not None:
+            try: parts.append(f"grad_norm={float(grad_norm):.4f}")
+            except (TypeError, ValueError): pass
+        if lr is not None:
+            try: parts.append(f"lr={float(lr):.2e}")
+            except (TypeError, ValueError): pass
+        if "eval_loss" in logs:
+            try: parts.append(f"eval_loss={float(logs['eval_loss']):.4f}")
+            except (TypeError, ValueError): pass
+        print(f"[SFT][{' '.join(parts)}]", flush=True)
+
+        try:
+            if wandb.run is not None:
+                renamed = {f"sft/{k}": v for k, v in logs.items() if isinstance(v, (int, float))}
+                if renamed:
+                    wandb.log(renamed, commit=False)
+        except Exception:
+            pass
+
+    def on_train_end(self, args, state: TrainerState, control: TrainerControl, **kwargs):
+        if not is_main_process(LOCAL_RANK):
+            return
+        runtime = sps = None
+        for entry in reversed(state.log_history or []):
+            if "train_runtime" in entry and runtime is None:
+                runtime = entry.get("train_runtime")
+            if "train_samples_per_second" in entry and sps is None:
+                sps = entry.get("train_samples_per_second")
+            if runtime is not None and sps is not None:
+                break
+
+        parts = []
+        parts.append(f"final_loss={self.last_loss:.4f}" if self.last_loss is not None else "final_loss=?")
+        parts.append(f"peak_grad_norm={self.peak_grad_norm:.4f}")
+        if runtime is not None:
+            try: parts.append(f"runtime={float(runtime):.1f}s")
+            except (TypeError, ValueError): pass
+        if sps is not None:
+            try: parts.append(f"samples_per_sec={float(sps):.1f}")
+            except (TypeError, ValueError): pass
+        print(f"[SFT] summary: {' '.join(parts)}", flush=True)
+
+
 class CustomEvalSaveCallback(TrainerCallback):
     def __init__(
         self,
@@ -62,7 +147,7 @@ class CustomEvalSaveCallback(TrainerCallback):
         self.total_steps_all_epochs = total_steps_all_epochs
         self.checking_mode = checking_mode
         self.end_time = end_time
-        
+
     def compute_loss(self, state: TrainerState, metrics):
         return metrics.get("eval_loss", None)
 

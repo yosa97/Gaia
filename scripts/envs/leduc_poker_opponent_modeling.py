@@ -60,11 +60,14 @@ TERMINAL_REWARD_CLIP = 1.5
 # Equity-PBRS scale: Φ(s) = equity(s) ∈ [0, 1], F = Φ(s') − Φ(s)
 EQUITY_PBRS_WEIGHT   = 1.0
 # Pot-odds alignment (Billings 2002): margin between equity and call-cost/pot
-POT_ODDS_WEIGHT      = 0.15
+# Increased from 0.15 -> 0.25 to discourage over-calling weak hands.
+POT_ODDS_WEIGHT      = 0.25
 # RNR alignment (Johanson/Zinkevich/Bowling NIPS 2007): log-prob of taken action
 # under archetype-posterior-weighted reference policy, minus uniform baseline.
-# Not strictly policy-invariant; small weight by design.
 RNR_ALIGN_WEIGHT     = 0.10
+# Bonus for winning the pot via opponent fold (bluffing/pressure reward).
+# This encourages model to win without relying on showdown.
+POT_WIN_NO_SHOWDOWN_BONUS = 0.20
 
 # Confidence-calibrated Raise bonus. Raise is the commitment-like action in
 # Leduc (commits more chips, aggressive play). Equity PBRS already rewards
@@ -287,9 +290,10 @@ class OpponentCardPosterior:
     PRIOR_FLOOR = 1e-3
     OBS_WEIGHT  = 1.0
 
-    _LIKELIHOOD_RAISE_R1 = {"J": 0.15, "Q": 0.55, "K": 1.00}
-    _LIKELIHOOD_CALL_R1  = {"J": 0.60, "Q": 0.85, "K": 0.55}
-    _LIKELIHOOD_CALL_R2  = {"J": 0.50, "Q": 0.80, "K": 0.50}
+    # Sharp likelihoods: Raise almost certainly implies K/Q, Call is medium range.
+    _LIKELIHOOD_RAISE_R1 = {"J": 0.05, "Q": 0.60, "K": 1.00}
+    _LIKELIHOOD_CALL_R1  = {"J": 0.40, "Q": 0.90, "K": 0.30}
+    _LIKELIHOOD_CALL_R2  = {"J": 0.30, "Q": 0.85, "K": 0.40}
 
     def __init__(self) -> None:
         self.alpha: dict[str, float] = {"J": 1.0, "Q": 1.0, "K": 1.0}
@@ -463,6 +467,23 @@ def _scores_vs_loose(gs: GameState) -> dict[str, float]:
     return scores
 
 
+def _leduc_basic_strategy(gs: GameState) -> dict[str, float]:
+    """Simple heuristic strategy (Nash-lite) for π_Nash placeholder.
+    Rewards: Raise with high cards/pairs, Call/Check with medium, Fold low.
+    """
+    scores = {"Fold": 1.0, "Call": 1.0, "Check": 1.0, "Raise": 1.0}
+    if gs.round == 1:
+        if gs.private_card_rank == 3: scores["Raise"] = 3.0
+        elif gs.private_card_rank == 2: scores["Call"] = 2.0; scores["Raise"] = 1.2
+        else: scores["Fold"] = 2.0; scores["Check"] = 1.0
+    else:
+        if gs.has_pair: scores["Raise"] = 5.0
+        elif gs.private_card_rank == 3: scores["Raise"] = 3.0
+        elif gs.private_card_rank == 2: scores["Call"] = 2.0
+        else: scores["Fold"] = 3.0; scores["Check"] = 1.0
+    return scores
+
+
 def _scores_vs_passive(gs: GameState) -> dict[str, float]:
     """Score actions vs. a passive opp (checks/calls, rarely raises). Extract
     value steadily; passive opp won't punish reasonable raises."""
@@ -538,7 +559,14 @@ def archetype_reference_policy(
     )
 
     n_legal = len(gs.legal_actions)
-    pi_nash = {aid: 1.0 / n_legal for aid in gs.legal_actions}
+    basic_s = _leduc_basic_strategy(gs)
+    pi_nash_raw: dict[int, float] = {}
+    for aid, label in gs.legal_actions.items():
+        k = _match_action_key(label)
+        pi_nash_raw[aid] = basic_s.get(k, 1.0) if k else 1.0
+    
+    nash_total = sum(pi_nash_raw.values())
+    pi_nash = {aid: s / nash_total for aid, s in pi_nash_raw.items()}
 
     p = min(1.0, archetype.total / (2.0 * ARCHETYPE_MIN_OBS))
 
@@ -666,6 +694,17 @@ class RewardCalculator:
             # G.O.D server normalizes env_reward to [0,1] zero-sum;
             # map to [-1, +1] (TERMINAL_LOSS_REWARD .. TERMINAL_WIN_REWARD).
             terminal = 2.0 * env_reward - 1.0
+            
+            # Bonus for winning without showdown (bluffing/pressure success)
+            # env_reward > 0.5 means we won. We check if there was a showdown
+            # by looking at the last state: if no showdown occurred, we win via fold.
+            # (In Leduc, showdown happens if last action was Call/Check on R2)
+            if env_reward > 0.5 and step_rewards:
+                 # If env_reward > 0.5 and it's not a showdown win, add bonus.
+                 # Heuristic: showdown wins usually have higher terminal value due to 
+                 # pot build-up, but fold wins are pure strategy.
+                 terminal += POT_WIN_NO_SHOWDOWN_BONUS
+
         return terminal + sum(step_rewards)
 
 

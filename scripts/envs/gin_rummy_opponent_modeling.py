@@ -42,16 +42,14 @@ RANK_ORDER = ['A', '2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K']
 # Terminal reward amplified 5× so the win/loss outcome dominates per-step
 # PBRS shaping — prior run (eval_loss 0.5263) lost to base env (0.5823)
 # because per-step PBRS magnitudes (~0.02-0.35) drowned the ±1.0 terminal.
-TERMINAL_WIN_REWARD  =  5.0
-INVALID_PENALTY      = -0.5    # stronger invalid signal
+TERMINAL_WIN_REWARD  =  8.0
+INVALID_PENALTY      = -1.0    # stronger invalid signal
 
-# Discard safety — 2.5× amplified so gradient on discard choice is
-# meaningful relative to the new terminal scale.
-SAFE_DISCARD_BONUS        = 0.05  # was 0.02
-DANGEROUS_DISCARD_PENALTY = 0.05  # was 0.02
-# Upcard-pick credit (action 52). Wraps meld_potential DP; scaled linearly
-# with deadwood reduction, capped at potential=10.
-UPCARD_PICK_WEIGHT        = 0.05  # was 0.02
+# Discard safety — amplified to encourage defensive play
+SAFE_DISCARD_BONUS        = 0.15  # was 0.05
+DANGEROUS_DISCARD_PENALTY = 0.20  # was 0.05
+# Upcard-pick credit (action 52). Stronger signal for drawing known useful cards.
+UPCARD_PICK_WEIGHT        = 0.15  # was 0.05
 
 # --- Structural discard bonuses (DeadCardTracker + VoidRunInference,
 # boss-impossible — boss's opponent_modeling has neither class). Anchored on
@@ -77,17 +75,17 @@ KNOCK_COMMIT_BONUS        = 0.75
 # near the actual decision boundary per Kotnik/Kalita (2003).
 KOTNIK_KALITA_THRESHOLD = 8       # aggressive-knock deadwood threshold
 CHOW_ROBBINS_THRESHOLD  = 0.55    # p_now threshold = 1 − (my_dw / est_opp_dw)
-GIN_POTENTIAL           = 0.40    # was 0.70
-KNOCK_POTENTIAL_HIGH    = 0.30    # was 0.50 (dw ≤ 4 aggressive tier)
-KNOCK_POTENTIAL_LEGAL       = 0.20  # was 0.40 (knock-legal, dw ≤ knock_card)
-KNOCK_POTENTIAL_NEAR        = 0.10  # was 0.35 (near-knock, narrowed to dw ≤ kc+3)
+GIN_POTENTIAL           = 0.60    # was 0.40
+KNOCK_POTENTIAL_HIGH    = 0.50    # was 0.30 (dw ≤ 4 aggressive tier)
+KNOCK_POTENTIAL_LEGAL   = 0.35    # was 0.20 (knock-legal, dw ≤ knock_card)
+KNOCK_POTENTIAL_NEAR    = 0.15    # was 0.10 (near-knock, narrowed to dw ≤ kc+3)
 # KNOCK_POTENTIAL_APPROACHING removed — the dw ≤ kc+10 zone was too broad,
 # firing on most hands and diluting gradient near the knock decision boundary.
 CONFIDENCE_MIN_OBS      = 3
 CONFIDENCE_MIN_TURN     = 4
 # Discard-safety thresholds (Mizukami 2015 danger score)
-DISCARD_DANGER_THRESHOLD = 0.8
-DISCARD_SAFE_THRESHOLD   = 0.3
+DISCARD_DANGER_THRESHOLD = 0.65  # was 0.80 (be more suspicious)
+DISCARD_SAFE_THRESHOLD   = 0.25  # was 0.30 (be more certain of safety)
 # Per-step deadwood PBRS scale — halved so Φ = −dw/scale gradient is 2×
 # sharper per unit of deadwood reduction.
 DEADWOOD_PBRS_SCALE     = 50.0    # was 100.0

@@ -26,18 +26,18 @@ _MAX_PROMPT_LEN     = 5000    # prompt token cap — 5k tokens (LD obs shorter t
 _TIMEOUT            = 2400    # HTTP timeout (seconds) — 40 min covers slow MCTS reset
 
 # Risky-move bonus parameters
-BLUFF_PROB_THRESHOLD  = 0.35   # below this = model is bluffing (unlikely bid)
-RISKY_LIAR_PROB_MIN   = 0.35   # liar call in [0.35, 0.60] = risky-but-correct zone
+BLUFF_PROB_THRESHOLD  = 0.30   # below this = model is bluffing (unlikely bid)
+RISKY_LIAR_PROB_MIN   = 0.30   # liar call in [0.30, 0.60] = risky-but-correct zone
 RISKY_LIAR_PROB_MAX   = 0.60
-BLUFF_WIN_BONUS       = 0.5    # bonus for winning after calling a bluff
-RISKY_LIAR_WIN_BONUS  = 0.8    # EDGE 3: 0.5 → 0.8. More aggressive risky-but-correct challenge bonus
+BLUFF_WIN_BONUS       = 0.7    # bonus for winning after calling a bluff
+RISKY_LIAR_WIN_BONUS  = 1.0    # EDGE 3: 0.8 -> 1.0. High stakes for high-reward risky challenges
 RISKY_BONUS_MAX_COUNT = 2      # cap: max 2 bluff/risky events per episode credited
 SHUFFLE_PROB          = 0.5    # probability of shuffling displayed action order each turn
 NORMALIZE_REWARDS     = False  # disable reward normalization (raw discounted return)
 
 # Bayesian-informed bonus/penalty (supplements existing score-based rewards)
-BAYES_GOOD_CALL_BONUS   =  0.15  # call liar when Bayesian says bid unlikely (P<35%)
-BAYES_BAD_CALL_PENALTY  = -0.10  # call liar when Bayesian says bid plausible (P>70%)
+BAYES_GOOD_CALL_BONUS   =  0.20  # call liar when Bayesian says bid unlikely (P<30%)
+BAYES_BAD_CALL_PENALTY  = -0.25  # call liar when Bayesian says bid plausible (P>70%)
 BAYES_GOOD_BID_BONUS    =  0.05  # bid well-supported by Bayesian estimate
 BAYES_OVERREACH_PENALTY = -0.05  # bid far exceeding Bayesian estimate (+2 over expected)
 
@@ -55,7 +55,7 @@ class Bid:
 
 @dataclass
 class Action:
-    SCORE_TEMPERATURE = 0.4   # EDGE 2: 0.5 → 0.4. Sharper score curve, more sensitive to high p
+    SCORE_TEMPERATURE = 0.35   # EDGE 2: 0.4 -> 0.35. Even sharper score curve
 
     action_id: int
     label: str
@@ -311,7 +311,7 @@ class RewardCalculator:
                 if action.is_liar and gs.current_bid is not None:
                     own_support = bayes._own_dice_support(gs.our_dice, gs.current_bid.face)
                     p_true      = bayes.bid_posterior_prob(gs.current_bid, own_support)
-                    if p_true < 0.35:
+                    if p_true < BLUFF_PROB_THRESHOLD:
                         reward += BAYES_GOOD_CALL_BONUS    # Bayesian says bid likely false → good call
                     elif p_true > 0.70:
                         reward += BAYES_BAD_CALL_PENALTY   # Bayesian says bid likely true → bad call
