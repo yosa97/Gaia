@@ -163,7 +163,8 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         rollout_last=_gin_opp_rollout_last,
         reward_func=_gin_opp_reward,
         curriculum_factory=_gin_opp_curriculum,
-        vllm_max_model_length=8192,
+        # 12288: PvP games run longer (no MCTS shortcircuit) — need larger window.
+        vllm_max_model_length=12288,
         num_generations=8,
         reasoning=ModeConfig(initial_max_turn=12, rollouts_per_stage=100),
         no_mask=ModeConfig(initial_max_turn=12, rollouts_per_stage=100),
@@ -207,7 +208,9 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         rollout_last=_leduc_opp_rollout_last,
         reward_func=_leduc_opp_reward,
         curriculum_factory=_leduc_opp_curriculum,
-        num_generations=4,
+        # PvP: 8 generations (up from 4) — more rollout diversity for exploitative
+        # strategy learning against varied opponent archetypes.
+        num_generations=8,
         temperature=2.0,
         top_k=5,
     ),

@@ -68,7 +68,13 @@ FALLBACK_CACHE_DIR = "/tmp/sft_dataset_cache"
 DEFAULT_BUDGET_MIN = 165
 TARGET_GAMES = ("liars_dice", "leduc_poker", "gin_rummy")
 TARGET_OUTCOMES = ("win", "draw")
-OUTCOME_WEIGHTS = {"win": 5, "draw": 3, "loss": 1}
+# PvP: raise win weight 5 -> 8. Model must learn from winning trajectories
+# more aggressively against diverse human/AI opponent styles.
+OUTCOME_WEIGHTS = {"win": 8, "draw": 3, "loss": 1}
+
+# Gin-Rummy specialist dataset (whitelisted) — only loaded for gin_rummy game.
+GIN_RUMMY_TRAJ_REPO = "GoodStartLabs/gin-rummy-trajectories-32k"
+GIN_RUMMY_TRAJ_DIR  = "GoodStartLabs__gin-rummy-trajectories-32k"
 
 
 # === Game-specific system prompts (verbatim from scripts/envs/<game>_opponent_modeling.py) ===
@@ -458,6 +464,55 @@ def _load_env_training(root: str, target_game: str) -> Optional[Dataset]:
     return ds.map(_map_fn, with_indices=True, remove_columns=columns_to_remove)
 
 
+def _load_gin_rummy_trajectories(root: str) -> Optional[Dataset]:
+    """Load GoodStartLabs/gin-rummy-trajectories-32k for gin_rummy specialist training.
+
+    This dataset is only used as Phase 2.5 for gin_rummy game — it contains
+    32k expert game traces that sharpen meld/knock/discard decision making.
+    Schema: {observation, action, outcome} or ShareGPT {conversations} format.
+    """
+    miner_list = os.getenv("MINER_DATASETS", "")
+    if GIN_RUMMY_TRAJ_DIR in miner_list:
+        # Pre-mounted by run_anon.sh/run_augm.sh via MINER_DATASETS_3
+        dataset_root = os.getenv("MINER_DATASETS_DIR", root)
+        dataset_path = str(Path(dataset_root) / GIN_RUMMY_TRAJ_DIR)
+    else:
+        # Fallback: direct download
+        if not _direct_download(GIN_RUMMY_TRAJ_REPO, GIN_RUMMY_TRAJ_DIR, root):
+            return None
+        dataset_path = str(Path(root) / GIN_RUMMY_TRAJ_DIR)
+
+    try:
+        ds = load_dataset(dataset_path, split="train")
+    except Exception:
+        try:
+            ds = load_dataset(GIN_RUMMY_TRAJ_REPO, split="train")
+        except Exception as exc:
+            log_info(f"[full_sft] gin-rummy-trajectories load failed: {exc}")
+            return None
+
+    log_info(f"[full_sft] gin-rummy-trajectories loaded: {len(ds)} samples; columns={ds.column_names}")
+
+    # Convert to messages format — handle both ShareGPT and flat schemas.
+    def _traj_to_messages(row):
+        # ShareGPT format: {conversations: [{from, value}]}
+        if "conversations" in row:
+            return _sharegpt_to_messages(row, target_game="gin_rummy",
+                                         add_hint=False, strip_thought=True)
+        # Flat format: {observation, action} or {prompt, response}
+        obs = row.get("observation") or row.get("prompt") or row.get("input") or ""
+        act = row.get("action") or row.get("response") or row.get("output") or ""
+        return {
+            "messages": [
+                {"role": "system", "content": GIN_RUMMY_SYSTEM_PROMPT},
+                {"role": "user",   "content": str(obs)},
+                {"role": "assistant", "content": str(act)},
+            ]
+        }
+
+    return ds.map(_traj_to_messages, remove_columns=ds.column_names)
+
+
 def _load_boardgame_qa(root: str) -> Optional[Dataset]:
     if not _direct_download(BOARDGAME_QA_REPO, BOARDGAME_QA_DIR, root):
         return None
@@ -725,6 +780,41 @@ def main():
             callbacks=[TimeBudgetCallback(budget_min * 60.0)],
         )
         trainer2.train()
+
+        # === PHASE 2.5: Gin Rummy specialist (only if target_game == gin_rummy) ===
+        # GoodStartLabs/gin-rummy-trajectories-32k — 32k expert traces.
+        # Applied AFTER Phase 2 so main env data provides the base,
+        # and specialist data sharpens meld/knock/discard strategy on top.
+        # Inherits same adapter (no PEFT re-wrap needed).
+        if target_game == "gin_rummy":
+            gin_traj_ds = _load_gin_rummy_trajectories(root)
+            if gin_traj_ds is not None:
+                # Sample up to 3000 rows to keep training time bounded.
+                n_traj = min(3000, len(gin_traj_ds))
+                gin_traj_ds = gin_traj_ds.shuffle(seed=42).select(range(n_traj))
+                phase25_args = copy.deepcopy(training_args)
+                phase25_args.num_train_epochs = 3
+                phase25_args.learning_rate = 5e-6   # gentle — specialist fine-tune
+                phase25_args.output_dir = os.path.join(training_args.output_dir, "phase25")
+                phase25_args.report_to = []
+                if is_main_process(LOCAL_RANK):
+                    os.makedirs(phase25_args.output_dir, exist_ok=True)
+                log_info(
+                    f"[full_sft] Phase 2.5 START — gin_rummy specialist "
+                    f"n={n_traj} epoch=3 lr=5e-6"
+                )
+                trainer25 = SFTTrainer(
+                    model=model,
+                    processing_class=tokenizer,
+                    args=phase25_args,
+                    train_dataset=gin_traj_ds,
+                    peft_config=None,
+                    callbacks=[TimeBudgetCallback(budget_min * 60.0)],
+                )
+                trainer25.train()
+                log_info("[full_sft] Phase 2.5 DONE — gin_rummy specialist complete")
+            else:
+                log_info("[full_sft] Phase 2.5 SKIPPED — gin-rummy-trajectories unavailable")
 
         if is_main_process(LOCAL_RANK):
             final_dir = train_request.get("submission_dir", training_args.output_dir)

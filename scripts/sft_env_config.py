@@ -109,6 +109,13 @@ PER_GAME_EPOCH_OVERRIDE = {
         "1_2_b": 12,
         "2_4_b": 12,
     },
+    # gin_rummy: more epochs needed to converge on meld/knock decision boundaries.
+    # LIMA-style bump — only safe for small buckets where overfit risk is low.
+    "gin_rummy": {
+        "0_1_b": 12,
+        "1_2_b": 12,
+        "2_4_b": 12,
+    },
 }
 
 
@@ -198,7 +205,9 @@ def get_run_cmd(config: dict, gpu_nums: int) -> str:
     )
 
     if config.get("use_lora", False):
-        template += " --use_peft --lora_r 64 --lora_alpha 128 --lora_target_modules all-linear"
+        # LoRA R=128 for PvP tournament — larger adapter capacity needed to model
+        # diverse opponent styles. Alpha=256 keeps alpha/r ratio=2 (standard).
+        template += " --use_peft --lora_r 128 --lora_alpha 256 --lora_target_modules all-linear"
 
     if config.get("distributed") == "ds":
         template += " --deepspeed ds_config/zero3.json"
@@ -231,6 +240,9 @@ def get_training_json(train_info: dict) -> dict:
     base_config["learning_rate"] = base_config["lr"]
     base_config["min_lr_rate"] = 0.1
     base_config["max_seq_len"] = 2048
+    # PvP: slightly higher weight_decay (0.05 vs 0.01) to regularize against
+    # opponent-style overfitting — model must generalize, not memorize one style.
+    base_config["weight_decay"] = 0.05
 
     dataset_type = train_info.get("dataset_type") or {}
     base_config["environment_name"] = dataset_type.get("environment_name", "liars_dice")
