@@ -191,7 +191,7 @@ def get_run_cmd(config: dict, gpu_nums: int) -> str:
     --save_total_limit 5 \
     --logging_steps 10 \
     --learning_rate {learning_rate} \
-    --weight_decay 0.01 \
+    --weight_decay {weight_decay} \
     --warmup_ratio 0.1 \
     --lr_scheduler_type cosine_with_min_lr \
     --lr_scheduler_kwargs "{\\"min_lr_rate\\": {min_lr_rate}}" \
