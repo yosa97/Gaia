@@ -34,12 +34,18 @@ LOCAL_FOLDER="/app/checkpoints/$TASK_ID/$EXPECTED_REPO_NAME"
 SFT_WARMUP_REPO=""
 DOCKER_BUILDKIT=1
 
-# ── Miner-requested whitelisted datasets (slot 1 + slot 2) ─────────────────
+# ── Miner-requested whitelisted datasets ──────────────────────────────────
+# Slot 1: env_training (WAJIB — data game utama untuk SFT Phase 2)
 MINER_DATASETS_HOST_DIR="$(pwd)/miner_datasets_cache"
 MINER_DATASET_REPO_1="gradients-io-tournaments/env_training_gradients"
 MINER_DATASET_DIR_1="gradients-io-tournaments__env_training_gradients"
+# Slot 2: Boardgame-QA (reasoning warm-up untuk SFT Phase 1)
 MINER_DATASET_REPO_2="tasksource/Boardgame-QA"
 MINER_DATASET_DIR_2="tasksource__Boardgame-QA"
+# Slot 3: Gin Rummy specialist (32k expert traces — hanya aktif jika game=gin_rummy)
+# Dilewati otomatis oleh trainer jika game bukan gin_rummy.
+MINER_DATASET_REPO_3="GoodStartLabs/gin-rummy-trajectories-32k"
+MINER_DATASET_DIR_3="GoodStartLabs__gin-rummy-trajectories-32k"
 
 # ── Auto-detect wandb mode ─────────────────────────────────────────────────
 WANDB_RUN_NAME="${TASK_ID}_${EXPECTED_REPO_NAME}_full_sft"
@@ -106,6 +112,9 @@ download_dataset() {
 
 download_dataset "$MINER_DATASET_REPO_1" "$MINER_DATASET_DIR_1"
 download_dataset "$MINER_DATASET_REPO_2" "$MINER_DATASET_DIR_2"
+# Dataset ke-3 hanya relevan untuk gin_rummy (Phase 2.5 specialist)
+# Tetap didownload agar tersedia jika DATASET_TYPE diganti ke gin_rummy
+download_dataset "$MINER_DATASET_REPO_3" "$MINER_DATASET_DIR_3"
 
 # Run trainer (no env server — full SFT doesn't need rollout)
 echo "Starting full SFT trainer..."
@@ -138,7 +147,7 @@ docker run --rm --gpus all \
   --env WANDB_TOKEN="$WANDB_TOKEN" \
   --env WANDB_INIT_TIMEOUT=300 \
   --env MINER_DATASETS_DIR=/cache/miner_datasets \
-  --env MINER_DATASETS="$MINER_DATASET_DIR_1,$MINER_DATASET_DIR_2" \
+  --env MINER_DATASETS="$MINER_DATASET_DIR_1,$MINER_DATASET_DIR_2,$MINER_DATASET_DIR_3" \
   $TRAINING_MODE_ENVS \
   --env HF_TOKEN="$HUGGINGFACE_TOKEN" \
   --name full-sft-trainer \

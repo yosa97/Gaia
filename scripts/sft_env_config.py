@@ -270,7 +270,7 @@ def get_training_json(train_info: dict) -> dict:
     base_config["request_path"] = train_info["request_path"]
 
     train_request = deepcopy(train_info)
-    train_request["lora_r"] = 64 if base_config.get("use_lora") else None
+    train_request["lora_r"] = 128 if base_config.get("use_lora") else None
     train_request["effective_batch_size"] = (
         base_config["batch_size"]
         * base_config["gradient_accumulation_steps"]
