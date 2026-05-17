@@ -21,6 +21,28 @@ DATASET_TYPE='{
 FILE_FORMAT="s3"
 HOURS_TO_COMPLETE=3
 
+# ── Tournament round variant ───────────────────────────────────────────────
+# Toggles SFT data source via the USE_AUGMENTED_DATA env var read by
+# scripts/train_sft_env.py:_load_env_training.
+#
+#   MODE=augm  (default) -> use scripts/data/augmented/env_training_<game>_cot.jsonl
+#                            when present (the "Augmented" tournament round).
+#   MODE=anon            -> force fallback to the raw HF dataset
+#                            (the "Anons" tournament round).
+#
+# Override on the command line:
+#   MODE=anon bash examples/run_enviroment.sh
+MODE="${MODE:-augm}"
+case "$MODE" in
+  augm) USE_AUGMENTED_DATA=1 ;;
+  anon) USE_AUGMENTED_DATA=0 ;;
+  *)
+    echo "[run_environment] ERROR: MODE must be 'augm' or 'anon' (got '$MODE')" >&2
+    exit 1
+    ;;
+esac
+echo "[run_environment] MODE=$MODE  USE_AUGMENTED_DATA=$USE_AUGMENTED_DATA"
+
 # ── Wandb ──────────────────────────────────────────────────────────────────
 WANDB_TOKEN=""
 WANDB_PROJECT="environment"
@@ -148,6 +170,7 @@ docker run --rm --gpus all \
   --env WANDB_INIT_TIMEOUT=300 \
   --env MINER_DATASETS_DIR=/cache/miner_datasets \
   --env MINER_DATASETS="$MINER_DATASET_DIR_1,$MINER_DATASET_DIR_2,$MINER_DATASET_DIR_3" \
+  --env USE_AUGMENTED_DATA="$USE_AUGMENTED_DATA" \
   $TRAINING_MODE_ENVS \
   --env HF_TOKEN="$HUGGINGFACE_TOKEN" \
   --name full-sft-trainer \
