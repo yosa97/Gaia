@@ -13,7 +13,7 @@
 cd "$(dirname "$0")/.." || exit 1
 
 TASK_ID="1"
-MODEL=""
+MODEL="${MODEL:-NousResearch/Hermes-3-Llama-3.2-3B}"
 DATASET="dummy"
 DATASET_TYPE='{
   "environment_name": "liars_dice"
