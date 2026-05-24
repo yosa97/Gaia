@@ -1,0 +1,81 @@
+# Benchmark Configuration for Augmentation Strategy Comparison
+#
+# This config defines the experimental matrix for comparing augmentation strategies
+# across tournament environments.
+#
+# Usage:
+#   python scripts/train_grpo_env.py \
+#     --config_file benchmark_config.yaml \
+#     --environment gin_rummy \
+#     --augmentation_strategy gaussian_noise \
+#     --benchmark_mode
+
+# Environment targets (6 tournament games)
+environments:
+  - goof_spiel
+  - gin_rummy
+  - gin_rummy_opponent_modeling
+  - liars_dice
+  - leduc_poker
+  - alfworld
+
+# Augmentation strategies to evaluate
+strategies:
+  - name: none
+    description: "Baseline (no augmentation)"
+    hyperparams: {}
+
+  - name: gaussian_noise
+    description: "Add Gaussian noise to all weights"
+    hyperparams:
+      std: 0.005
+
+  - name: weight_scaling
+    description: "Scale linear layer weights by constant factor"
+    hyperparams:
+      factor: 1.001
+
+  - name: magnitude_pruning
+    description: "Zero out weights below magnitude threshold"
+    hyperparams:
+      ratio: 0.001
+
+# Metrics to collect
+metrics:
+  - convergence_speed        # Training steps to reach 50% of final win_rate
+  - final_task_success       # Final win rate / task success percentage
+  - parameter_efficiency     # win_rate per parameter count (normalized)
+  - training_time            # Wall-clock time for training
+
+# Experiment parameters
+experiment:
+  model_name: "NousResearch/Hermes-3-Llama-3.2-3B"
+
+  # Training configurations per environment
+  training_steps: 10000
+  batch_size: 4
+  learning_rate: 3e-5
+
+  # Checkpoint evaluation points
+  eval_checkpoints: [1000, 5000, 10000]
+
+  # Metrics collection
+  metrics_window_size: 100    # Episodes per window for rolling stats
+  save_metrics_interval: 100  # Log metrics every N episodes
+
+# Pilot experiment (gin_rummy only, 2 strategies)
+pilot:
+  environments:
+    - gin_rummy
+  strategies:
+    - gaussian_noise
+    - weight_scaling
+  training_steps: 5000
+  notes: "Validate metrics collection with single environment before scaling to all 6"
+
+# Output configuration
+output:
+  results_dir: "./results/augmentation_benchmark"
+  metrics_file: "benchmark_results.csv"
+  plots_dir: "./results/augmentation_benchmark/plots"
+  logs_dir: "./results/augmentation_benchmark/logs"

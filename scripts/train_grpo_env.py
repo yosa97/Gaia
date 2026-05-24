@@ -42,6 +42,8 @@ from utility import log_info
 from model_utility import is_reasoning_tokenizer
 from envs import GAMES_TO_TASK_ID_RANGE
 from envs.env_configs import EnvTrainingConfig, get_env_config
+from augmentation_strategies import get_strategy, list_strategies
+from benchmark_metrics import EnvironmentMetricsCollector
 
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
 STANDARD_GRPO_EXTRA_COLUMN = "extra_data"
@@ -344,6 +346,15 @@ class TrainingArguments(GRPOConfig):
         metadata={"help": "HuggingFace repo ID of a LoRA SFT checkpoint to warm-start GRPO from. "
                          "Also readable from SFT_CHECKPOINT_REPO env var. "
                          "If set, adapter is loaded, merged into base model, then GRPO proceeds normally."},
+    )
+    augmentation_strategy: Optional[str] = field(
+        default="none",
+        metadata={"help": f"Augmentation strategy to apply to model: {', '.join(list_strategies())}. "
+                         "Default: 'none' (no augmentation)."},
+    )
+    benchmark_mode: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Enable benchmarking mode to collect metrics for augmentation strategy comparison."},
     )
 
 def print_trainable_parameters(model):
@@ -1060,6 +1071,24 @@ def main():
         if peft_config is None:  # this is full-weight training
             # some model need to resize the token embeddings or encounter the size mismatch error; only for full-weight models
             resize_if_needed(train_request["model_name"], model, len(tokenizer))
+
+        # ── Augmentation Strategy Application ──────────────────────────────
+        if training_args.augmentation_strategy != "none" and is_main_process(LOCAL_RANK):
+            log_info(f"[Augment] Applying augmentation strategy: {training_args.augmentation_strategy}")
+            strategy = get_strategy(training_args.augmentation_strategy)
+            model = strategy.apply(model)
+            log_info(f"[Augment] ✅ Augmentation applied: {strategy}")
+
+        # ── Benchmark Metrics Collector ────────────────────────────────────
+        metrics_collector = None
+        if training_args.benchmark_mode and is_main_process(LOCAL_RANK):
+            log_info(f"[Benchmark] Initializing metrics collector for strategy={training_args.augmentation_strategy}")
+            metrics_collector = EnvironmentMetricsCollector(
+                env_name=training_args.environment_name,
+                strategy_name=training_args.augmentation_strategy,
+                model_name=train_request["model_name"],
+            )
+            log_info(f"[Benchmark] ✅ Metrics collector initialized: {metrics_collector}")
 
         # Check if this is the main process and create the output directory
         if is_main_process(LOCAL_RANK):  # Only create directory on main process
