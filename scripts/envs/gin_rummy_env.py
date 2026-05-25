@@ -199,27 +199,43 @@ def parse_discard_pile(observation: str) -> list[str]:
     return [pile_str[i:i+2] for i in range(0, len(pile_str), 2)]
 
 
-def parse_game_state(observation: str) -> GameState:
-    if 'Invalid' in observation and 'Legal Actions:' not in observation:
-        raise ValueError("Invalid action response — not a game state")
-    player_match = re.search(r'You are Player (\d+)', observation)
-    player_id = int(player_match.group(1)) if player_match else 0
-    hand = parse_hand_from_observation(observation)
-    dw_match = re.search(r'Deadwood=(\d+)', observation)
-    deadwood = int(dw_match.group(1)) if dw_match else 0
-    phase_match = re.search(r'Phase: (\w+)', observation)
-    phase = phase_match.group(1) if phase_match else 'Draw'
-    knock_match = re.search(r'Knock card: (\d+)', observation)
-    knock_card = int(knock_match.group(1)) if knock_match else 10
-    upcard_match = re.search(r'Stock size: \d+\s+Upcard: (\w+)', observation)
-    upcard = upcard_match.group(1) if upcard_match else 'XX'
-    stock_match = re.search(r'Stock size: (\d+)', observation)
-    stock_size = int(stock_match.group(1)) if stock_match else 0
-    return GameState(
-        hand=hand, deadwood=deadwood, phase=phase, knock_card=knock_card,
-        upcard=upcard, stock_size=stock_size,
-        discard_pile=parse_discard_pile(observation), player_id=player_id,
-    )
+def parse_game_state(observation: str) -> "GameState | None":
+    """
+    Parse Gin Rummy game state from observation string.
+    Returns None if observation cannot be parsed (Finding #1).
+    """
+    try:
+        if not observation or ('Invalid' in observation and 'Legal Actions:' not in observation):
+            return None
+
+        player_match = re.search(r'You are Player (\d+)', observation)
+        if not player_match:
+            return None
+
+        player_id = int(player_match.group(1))
+        hand = parse_hand_from_observation(observation)
+        if not hand:
+            return None  # No valid hand found
+
+        dw_match = re.search(r'Deadwood=(\d+)', observation)
+        deadwood = int(dw_match.group(1)) if dw_match else 0
+        phase_match = re.search(r'Phase: (\w+)', observation)
+        phase = phase_match.group(1) if phase_match else 'Draw'
+        knock_match = re.search(r'Knock card: (\d+)', observation)
+        knock_card = int(knock_match.group(1)) if knock_match else 10
+        upcard_match = re.search(r'Stock size: \d+\s+Upcard: (\w+)', observation)
+        upcard = upcard_match.group(1) if upcard_match else 'XX'
+        stock_match = re.search(r'Stock size: (\d+)', observation)
+        stock_size = int(stock_match.group(1)) if stock_match else 0
+
+        return GameState(
+            hand=hand, deadwood=deadwood, phase=phase, knock_card=knock_card,
+            upcard=upcard, stock_size=stock_size,
+            discard_pile=parse_discard_pile(observation), player_id=player_id,
+        )
+    except Exception as e:
+        print(f"Warning: Failed to parse gin_rummy game state: {e}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -428,7 +444,13 @@ def _run_episode(
         episode_id = result_block.get("episode_id", "")
         raw_observation = result_block.get("observation", "")
         formatted_observation = extract_and_format_observation(raw_observation)
-        game_state_history.append(parse_game_state(formatted_observation))
+
+        # Handle None from parse_game_state (Finding #1 safety)
+        initial_state = parse_game_state(formatted_observation)
+        if initial_state is None:
+            print(f"Failed to parse initial game state (Game {game_id})")
+            return index, None
+        game_state_history.append(initial_state)
     except Exception as exc:
         print(f"Failed to reset environment (Game {game_id}): {exc}")
         return index, None
@@ -520,10 +542,11 @@ def _run_episode(
 
         # --- Reward calculation ---
         if not is_invalid and not done:
-            try:
-                game_state = parse_game_state(formatted_observation)
-            except Exception as exc:
-                print(f"Failed to parse game state: {exc}")
+            game_state = parse_game_state(formatted_observation)
+
+            # Handle None from parse_game_state (Finding #1 safety)
+            if game_state is None:
+                print(f"Warning: Failed to parse game state at turn {turn_number}")
                 immediate_reward = -10.0
             else:
                 game_state_history.append(game_state)

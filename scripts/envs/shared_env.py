@@ -23,6 +23,47 @@ GAMES_TO_TASK_ID_RANGE: dict[str, tuple[int, int]] = {
 
 
 # ---------------------------------------------------------------------------
+# Episode Filtering (Finding #4 - Filter Win Only)
+# ---------------------------------------------------------------------------
+
+def should_keep_episode_for_training(
+    episode_reward: float,
+    game_result: str = None,
+    filter_mode: str = "wins_only"  # "all", "wins_only", "wins_draws"
+) -> bool:
+    """
+    Filter episodes based on game result (Finding #4).
+
+    Args:
+        episode_reward: Episode reward value
+        game_result: Game outcome ('win', 'loss', 'draw', or None)
+        filter_mode: 'all' (keep all), 'wins_only', 'wins_draws'
+
+    Returns:
+        True if episode should be kept for training, False otherwise
+    """
+    if filter_mode == "all":
+        return True
+    elif filter_mode == "wins_only":
+        return game_result == "win"
+    elif filter_mode == "wins_draws":
+        return game_result in ("win", "draw")
+    else:
+        return True  # Default: keep all
+
+
+def normalize_reward_for_filtering(reward: float, game_result: str = None) -> float:
+    """
+    Normalize reward: 1.0 for win, 0.0 for loss/draw (Finding #4).
+    Useful when training only on wins for cleaner signal.
+    """
+    if game_result == "win":
+        return 1.0
+    else:
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
 # Curriculum scheduler (base class — subclass to extend per-game logic)
 # ---------------------------------------------------------------------------
 
