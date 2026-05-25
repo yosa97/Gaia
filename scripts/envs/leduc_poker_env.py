@@ -24,6 +24,8 @@ from envs.shared_env import (
 _SELECTED_GAME = "leduc_poker"
 _MAX_EPISODE_TOKENS = 16384
 _MAX_PROMPT_LEN = 4096
+_MAX_INPUT_CHARS = 28000  # COMMIT #1: Increased from 22k for longer observations
+_USE_REACT_FORMAT = False  # COMMIT #4: Disabled per-turn REACT format for cleaner alignment
 _TIMEOUT = 2400
 _INVALID_PENALTY = -0.1
 _MAX_TURNS = 10

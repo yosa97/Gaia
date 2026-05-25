@@ -26,6 +26,8 @@ from envs.shared_env import (
 _SELECTED_GAME = "gin_rummy"
 _MAX_EPISODE_TOKENS = 16384
 _MAX_PROMPT_LEN = 5000
+_MAX_INPUT_CHARS = 28000  # COMMIT #5: Increased from 22k for longer observations
+_FINAL_MAX_TURN = 12  # COMMIT #5: Increased from 8 for harder curriculum (fix Finished:0/8)
 _TIMEOUT = 2400
 
 CARD_VALUES = {

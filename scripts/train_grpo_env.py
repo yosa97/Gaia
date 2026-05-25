@@ -445,6 +445,11 @@ class TrainingArguments(GRPOConfig):
         metadata={"help": "Maximum number of task ID samples for dataset. Default 100k for faster training. "
                          "Increase to 200k for more thorough training."},
     )
+    enable_sft_warmup: Optional[bool] = field(
+        default=True,
+        metadata={"help": "COMMIT #1: Enable Phase1 SFT warmup before GRPO training. "
+                         "Provides better convergence and stability. Default: True."},
+    )
 
 def print_trainable_parameters(model):
     """
@@ -1145,9 +1150,14 @@ def main():
             # ── SFT Cold-Start Stage ──────────────────────────────────────
             # Run a short SFT phase using whitelisted datasets before GRPO.
             # Only runs when MINER_DATASETS_DIR / MINER_DATASETS env vars are set.
-            if is_main_process(LOCAL_RANK):
-                log_info("[Main] Checking for SFT cold-start datasets...")
-            model = run_sft_cold_start(model, tokenizer, training_args, peft_config=get_peft_config(model_args))
+            # COMMIT #1: Controlled by enable_sft_warmup flag
+            if training_args.enable_sft_warmup:
+                if is_main_process(LOCAL_RANK):
+                    log_info("[Main] COMMIT #1: Phase1 SFT warmup enabled. Checking for SFT cold-start datasets...")
+                model = run_sft_cold_start(model, tokenizer, training_args, peft_config=get_peft_config(model_args))
+            else:
+                if is_main_process(LOCAL_RANK):
+                    log_info("[Main] Phase1 SFT warmup disabled. Skipping cold-start stage.")
 
         # some model need to set the generation config or encounter the invalid generation config error
         set_generation_config(train_request["model_name"], model)

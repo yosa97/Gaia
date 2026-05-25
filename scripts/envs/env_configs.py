@@ -154,6 +154,7 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         rollout_last=_gin_rollout_last,
         reward_func=_gin_reward,
         curriculum_factory=_gin_curriculum,
+        vllm_max_model_length=8192,  # COMMIT #9: Increased from default 5248 for better context
         reasoning=ModeConfig(initial_max_turn=8),
         no_mask=ModeConfig(initial_max_turn=4, rollouts_per_stage=512),
         full_prompt=ModeConfig(initial_max_turn=8),
@@ -175,6 +176,7 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         rollout_last=_liar_rollout_last,
         reward_func=_liar_reward,
         curriculum_factory=_liar_curriculum,
+        vllm_max_model_length=6144,  # COMMIT #9: Optimized for liars_dice observation length
         reasoning=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
         no_mask=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
         full_prompt=ModeConfig(rollouts_per_stage=2048, initial_max_turn=1),
@@ -199,6 +201,7 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         rollout_last=_leduc_rollout_last,
         reward_func=_leduc_reward,
         curriculum_factory=_leduc_curriculum,
+        vllm_max_model_length=6144,  # COMMIT #9: Optimized for leduc observation length
         num_generations=8,
         temperature=2.0,
         top_k=5,
