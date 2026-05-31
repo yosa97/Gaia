@@ -146,8 +146,11 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         rollout_last=_goof_rollout_last,
         reward_func=_goof_reward,
         curriculum_factory=_goof_curriculum,
+        # All three modes start curriculum at turn=1 for goof_spiel.
+        # full_prompt trains on entire episode (all turns accumulated) — preferred for tournament.
         reasoning=ModeConfig(initial_max_turn=1),
         no_mask=ModeConfig(initial_max_turn=1),
+        full_prompt=ModeConfig(initial_max_turn=1),
     ),
     "gin_rummy": EnvTrainingConfig(
         rollout_full=_gin_rollout_full,

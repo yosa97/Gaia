@@ -286,19 +286,6 @@ def get_run_cmd(config: dict, gpu_nums: int):
     return template
 
 
-    # If SFT warm-start mode is active, pass the checkpoint repo as a CLI arg.
-    # This is purely informational inside train_grpo_env.py (it also reads the
-    # env var directly), but passing it via CLI keeps the run config auditable
-    # in the torchrun logs.
-    sft_warmup = os.environ.get("SFT_WARMUP", "0") == "1"
-    sft_checkpoint_repo = os.environ.get("SFT_CHECKPOINT_REPO", "")
-    if sft_warmup and sft_checkpoint_repo:
-        template += f" --sft_checkpoint {sft_checkpoint_repo}"
-
-    print(f"template: {template}", flush=True)
-    return template
-
-
 def get_training_json(train_info: dict) -> dict:
     model_name = train_info["model_name"]
     model_path = train_info["model_path"]

@@ -1,13 +1,17 @@
 #!/bin/bash
-# Environment training runner — supports three modes:
+# Environment training runner — pure GRPO for SN56 tournament (Goofspiel).
 #
-#   MODE 1 (SFT_ONLY=1)  : Pure SFT (Boardgame-QA warm-up + env game data).
-#   MODE 2 (SFT_WARMUP=1): Load pre-trained SFT checkpoint, then GRPO.
-#                           Set SFT_CHECKPOINT_REPO to your HF adapter repo.
-#   MODE 3 (default)     : GRPO from cold base model (original behaviour).
+# Tournament rules (as of 2026):
+#   1. You may NOT bring your own dataset in the docker image.
+#   2. You may NOT bring a pretrained model in the docker image.
+#   3. You may NOT do any SFT for environment tasks.
 #
-# Current active mode: MODE 1 (SFT_ONLY=1 set below)
-# To switch to MODE 2: comment out SFT_ONLY=1, uncomment SFT_WARMUP lines.
+# This script runs GRPO-only training on the Goofspiel environment.
+# Only one supported environment in tournament: goof_spiel (Task IDs 0-99999999).
+#
+# Usage:
+#   bash examples/run_environment.sh
+#   MODEL=Qwen/Qwen2.5-7B-Instruct bash examples/run_environment.sh
 
 # Always run from the repo root so relative paths (dockerfiles/, etc.) resolve correctly.
 cd "$(dirname "$0")/.." || exit 1
@@ -16,32 +20,10 @@ TASK_ID="1"
 MODEL="${MODEL:-NousResearch/Hermes-3-Llama-3.2-3B}"
 DATASET="dummy"
 DATASET_TYPE='{
-  "environment_name": "liars_dice"
+  "environment_name": "goof_spiel"
 }'
 FILE_FORMAT="s3"
 HOURS_TO_COMPLETE=3
-
-# ── Tournament round variant ───────────────────────────────────────────────
-# Toggles SFT data source via the USE_AUGMENTED_DATA env var read by
-# scripts/train_sft_env.py:_load_env_training.
-#
-#   MODE=augm  (default) -> use scripts/data/augmented/env_training_<game>_cot.jsonl
-#                            when present (the "Augmented" tournament round).
-#   MODE=anon            -> force fallback to the raw HF dataset
-#                            (the "Anons" tournament round).
-#
-# Override on the command line:
-#   MODE=anon bash examples/run_environment.sh
-MODE="${MODE:-augm}"
-case "$MODE" in
-  augm) USE_AUGMENTED_DATA=1 ;;
-  anon) USE_AUGMENTED_DATA=0 ;;
-  *)
-    echo "[run_environment] ERROR: MODE must be 'augm' or 'anon' (got '$MODE')" >&2
-    exit 1
-    ;;
-esac
-echo "[run_environment] MODE=$MODE  USE_AUGMENTED_DATA=$USE_AUGMENTED_DATA"
 
 # ── Wandb ──────────────────────────────────────────────────────────────────
 WANDB_TOKEN=""
@@ -52,25 +34,10 @@ HUGGINGFACE_USERNAME=""
 HUGGINGFACE_TOKEN=""
 EXPECTED_REPO_NAME=""
 LOCAL_FOLDER="/app/checkpoints/$TASK_ID/$EXPECTED_REPO_NAME"
-# Repo SFT checkpoint dari run sebelumnya — diisi manual jika mau pakai MODE 2.
-SFT_WARMUP_REPO=""
 DOCKER_BUILDKIT=1
 
-# ── Miner-requested whitelisted datasets ──────────────────────────────────
-# Slot 1: env_training (WAJIB — data game utama untuk SFT Phase 2)
-MINER_DATASETS_HOST_DIR="$(pwd)/miner_datasets_cache"
-MINER_DATASET_REPO_1="gradients-io-tournaments/env_training_gradients"
-MINER_DATASET_DIR_1="gradients-io-tournaments__env_training_gradients"
-# Slot 2: Boardgame-QA (reasoning warm-up untuk SFT Phase 1)
-MINER_DATASET_REPO_2="tasksource/Boardgame-QA"
-MINER_DATASET_DIR_2="tasksource__Boardgame-QA"
-# Slot 3: Gin Rummy specialist (32k expert traces — hanya aktif jika game=gin_rummy)
-# Dilewati otomatis oleh trainer jika game bukan gin_rummy.
-MINER_DATASET_REPO_3="GoodStartLabs/gin-rummy-trajectories-32k"
-MINER_DATASET_DIR_3="GoodStartLabs__gin-rummy-trajectories-32k"
-
 # ── Auto-detect wandb mode ─────────────────────────────────────────────────
-WANDB_RUN_NAME="${TASK_ID}_${EXPECTED_REPO_NAME}_full_sft"
+WANDB_RUN_NAME="${TASK_ID}_${EXPECTED_REPO_NAME}_grpo_env"
 
 if [ -n "$WANDB_TOKEN" ]; then
   WANDB_MODE="online"
@@ -83,8 +50,8 @@ fi
 # ── Directory setup ────────────────────────────────────────────────────────
 CHECKPOINTS_DIR="$(pwd)/secure_checkpoints"
 OUTPUTS_DIR="$(pwd)/outputs"
-mkdir -p "$CHECKPOINTS_DIR" "$OUTPUTS_DIR" "$MINER_DATASETS_HOST_DIR"
-chmod 777 "$CHECKPOINTS_DIR" "$OUTPUTS_DIR" "$MINER_DATASETS_HOST_DIR"
+mkdir -p "$CHECKPOINTS_DIR" "$OUTPUTS_DIR"
+chmod 777 "$CHECKPOINTS_DIR" "$OUTPUTS_DIR"
 
 NETWORK_NAME="env_training_net"
 docker network create "$NETWORK_NAME" 2>/dev/null || true
@@ -106,53 +73,19 @@ docker run --rm \
   --file-format "$FILE_FORMAT" \
   --task-type "EnvTask"
 
-# ── Pre-download both whitelisted SFT datasets ─────────────────────────────
-download_dataset() {
-  local repo="$1"
-  local dir_name="$2"
-  local target="$MINER_DATASETS_HOST_DIR/$dir_name"
-  if [ -d "$target" ] && [ -n "$(ls -A "$target" 2>/dev/null)" ]; then
-    echo "[sft] Dataset already cached: $target"
-    return 0
-  fi
-  echo "[sft] Downloading $repo -> $target ..."
-  TOKEN_ARG=""
-  if [ -n "$HUGGINGFACE_TOKEN" ]; then
-    TOKEN_ARG="--token $HUGGINGFACE_TOKEN"
-  fi
-  docker run --rm \
-    --volume "$MINER_DATASETS_HOST_DIR:/data:rw" \
-    -e HF_HUB_DISABLE_PROGRESS_BARS=1 \
-    python:3.11-slim \
-    bash -c "pip install -q huggingface_hub && hf download '$repo' --repo-type dataset --local-dir /data/$dir_name $TOKEN_ARG"
-  if [ -d "$target" ] && [ -n "$(ls -A "$target" 2>/dev/null)" ]; then
-    echo "[sft] Cached: $target"
-  else
-    echo "[sft] WARN: download $repo failed; train_full_sft will fall back to direct download"
-  fi
-}
+# ── Start environment server (Goofspiel via Affinetes/OpenSpiel) ───────────
+# The validator provisions one server per GPU during tournament.
+# Locally: start the environment server before running this script,
+# then set ENVIRONMENT_SERVER_URLS to point to it.
+# Example: ENVIRONMENT_SERVER_URLS="http://localhost:8001" bash examples/run_environment.sh
+ENV_SERVER_URLS="${ENVIRONMENT_SERVER_URLS:-http://localhost:8001}"
+echo "[env] Using environment servers: $ENV_SERVER_URLS"
 
-download_dataset "$MINER_DATASET_REPO_1" "$MINER_DATASET_DIR_1"
-download_dataset "$MINER_DATASET_REPO_2" "$MINER_DATASET_DIR_2"
-# Dataset ke-3 hanya relevan untuk gin_rummy (Phase 2.5 specialist)
-# Tetap didownload agar tersedia jika DATASET_TYPE diganti ke gin_rummy
-download_dataset "$MINER_DATASET_REPO_3" "$MINER_DATASET_DIR_3"
-
-# Run trainer (no env server — full SFT doesn't need rollout)
-echo "Starting full SFT trainer..."
-
-# ── Training mode switch ───────────────────────────────────────────────────
-# MODE 1 (default): Pure SFT
-# MODE 2: SFT checkpoint → GRPO (lebih kompetitif, butuh SFT_WARMUP_REPO diisi)
-#   Isi SFT_WARMUP_REPO di atas dengan repo dari run SFT sebelumnya, lalu:
-#   comment baris TRAINING_MODE_ENVS MODE 1, uncomment baris MODE 2.
-TRAINING_MODE_ENVS="--env SFT_ONLY=1"
-# Uncomment baris berikut (dan comment baris di atas) untuk aktifkan MODE 2:
-# TRAINING_MODE_ENVS="--env SFT_WARMUP=1 --env SFT_CHECKPOINT_REPO=${SFT_WARMUP_REPO}"
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Pure GRPO training (no SFT — tournament Rule #3) ──────────────────────
+echo "Starting GRPO environment trainer..."
 
 TIMEOUT_SECONDS=$(echo "$HOURS_TO_COMPLETE * 3600" | bc | cut -d. -f1)
-(sleep $TIMEOUT_SECONDS && echo "[WATCHDOG] TIMEOUT — stopping container..." && docker stop full-sft-trainer 2>/dev/null) &
+(sleep $TIMEOUT_SECONDS && echo "[WATCHDOG] TIMEOUT — stopping container..." && docker stop grpo-env-trainer 2>/dev/null) &
 TIMER_PID=$!
 
 docker run --rm --gpus all \
@@ -164,16 +97,12 @@ docker run --rm --gpus all \
   --network "$NETWORK_NAME" \
   --volume "$CHECKPOINTS_DIR:/cache:rw" \
   --volume "$OUTPUTS_DIR:/app/checkpoints/:rw" \
-  --volume "$MINER_DATASETS_HOST_DIR:/cache/miner_datasets:ro" \
   --env WANDB_API_KEY="$WANDB_TOKEN" \
   --env WANDB_TOKEN="$WANDB_TOKEN" \
   --env WANDB_INIT_TIMEOUT=300 \
-  --env MINER_DATASETS_DIR=/cache/miner_datasets \
-  --env MINER_DATASETS="$MINER_DATASET_DIR_1,$MINER_DATASET_DIR_2,$MINER_DATASET_DIR_3" \
-  --env USE_AUGMENTED_DATA="$USE_AUGMENTED_DATA" \
-  $TRAINING_MODE_ENVS \
+  --env ENVIRONMENT_SERVER_URLS="$ENV_SERVER_URLS" \
   --env HF_TOKEN="$HUGGINGFACE_TOKEN" \
-  --name full-sft-trainer \
+  --name grpo-env-trainer \
   standalone-text-trainer \
   --task-id "$TASK_ID" \
   --model "$MODEL" \

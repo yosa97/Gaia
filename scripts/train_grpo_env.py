@@ -1,6 +1,7 @@
 import json
 import os
 import random
+import requests
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -446,9 +447,10 @@ class TrainingArguments(GRPOConfig):
                          "Increase to 200k for more thorough training."},
     )
     enable_sft_warmup: Optional[bool] = field(
-        default=True,
-        metadata={"help": "COMMIT #1: Enable Phase1 SFT warmup before GRPO training. "
-                         "Provides better convergence and stability. Default: True."},
+        default=False,
+        metadata={"help": "Enable Phase1 SFT warmup before GRPO training. "
+                         "DISABLED by default: tournament Rule #3 prohibits SFT for environment tasks. "
+                         "Set to True only for non-environment (text) tasks."},
     )
 
 def print_trainable_parameters(model):
@@ -485,6 +487,13 @@ def print_trainable_parameters(model):
 
 class ActionMaskedGRPOTrainer(GRPOTrainer):
     """GRPO trainer that applies an action mask to loss/IS/metrics."""
+
+    def __init__(self, *args, rollout_func=None, **kwargs):
+        # Pop rollout_func before calling super so we don't crash on TRL versions
+        # that don't accept it as an __init__ kwarg.  We store it ourselves and
+        # our _generate_and_score_completions override is the only caller.
+        super().__init__(*args, **kwargs)
+        self.rollout_func = rollout_func
 
     def _generate_and_score_completions(self, inputs: list[dict[str, torch.Tensor | Any]]) -> dict[str, Any]:
         if getattr(self, "rollout_func", None) is None:
@@ -1092,9 +1101,8 @@ def main():
         
         output_dir = training_args.output_dir
 
-        # ── Load and validate tokenizer (Finding #3) ───────────────────────
+        # ── Load tokenizer ─────────────────────────────────────────────────
         tokenizer = AutoTokenizer.from_pretrained(train_request["model_path"])
-        tokenizer = _validate_and_setup_tokenizer(tokenizer, model, train_request["model_name"])
 
         quantization_config = get_quantization_config(model_args)
         device_string = "cuda:" + str(LOCAL_RANK)
@@ -1128,6 +1136,9 @@ def main():
 
         model = model_class.from_pretrained(train_request["model_path"], **model_kwargs)
 
+        # ── Validate tokenizer (after model is loaded) ──────────────────────
+        tokenizer = _validate_and_setup_tokenizer(tokenizer, model, train_request["model_name"])
+
         # ── SFT Warm-Start (SFT → GRPO) ───────────────────────────────────
         # If SFT_WARMUP=1, load a pre-trained SFT LoRA adapter from HF and
         # merge it into the base model before GRPO begins.  This gives GRPO
@@ -1148,16 +1159,10 @@ def main():
                 log_info(f"[SFT-Warmup] LR adjusted: {original_lr:.2e} → {training_args.learning_rate:.2e}")
         else:
             # ── SFT Cold-Start Stage ──────────────────────────────────────
-            # Run a short SFT phase using whitelisted datasets before GRPO.
-            # Only runs when MINER_DATASETS_DIR / MINER_DATASETS env vars are set.
-            # COMMIT #1: Controlled by enable_sft_warmup flag
-            if training_args.enable_sft_warmup:
-                if is_main_process(LOCAL_RANK):
-                    log_info("[Main] COMMIT #1: Phase1 SFT warmup enabled. Checking for SFT cold-start datasets...")
-                model = run_sft_cold_start(model, tokenizer, training_args, peft_config=get_peft_config(model_args))
-            else:
-                if is_main_process(LOCAL_RANK):
-                    log_info("[Main] Phase1 SFT warmup disabled. Skipping cold-start stage.")
+            # Tournament Rule #3: "You may not do any SFT for environment tasks."
+            # SFT is permanently disabled here regardless of enable_sft_warmup flag.
+            if is_main_process(LOCAL_RANK):
+                log_info("[Main] SFT cold-start DISABLED for environment tasks (tournament Rule #3). Proceeding directly to GRPO.")
 
         # some model need to set the generation config or encounter the invalid generation config error
         set_generation_config(train_request["model_name"], model)
