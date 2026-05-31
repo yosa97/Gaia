@@ -168,7 +168,7 @@ async def main():
         )
 
         # ── Download SFT cold-start datasets ──────────────────────────────
-        # MINER_DATASETS and MINER_DATASETS_DIR are injected by run_enviroment.sh.
+        # MINER_DATASETS and MINER_DATASETS_DIR are injected by run_environment.sh.
         # If not set, this step is silently skipped and SFT won't run.
         miner_datasets_csv = os.environ.get("MINER_DATASETS", "")
         miner_datasets_dir = os.environ.get("MINER_DATASETS_DIR", "")

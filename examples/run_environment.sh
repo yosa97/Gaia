@@ -31,7 +31,7 @@ HOURS_TO_COMPLETE=3
 #                            (the "Anons" tournament round).
 #
 # Override on the command line:
-#   MODE=anon bash examples/run_enviroment.sh
+#   MODE=anon bash examples/run_environment.sh
 MODE="${MODE:-augm}"
 case "$MODE" in
   augm) USE_AUGMENTED_DATA=1 ;;

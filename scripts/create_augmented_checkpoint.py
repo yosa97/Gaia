@@ -132,7 +132,7 @@ def main():
     )
     print(f"\n✅ Upload selesai!")
     print(f"   Augmented repo: https://huggingface.co/{full_repo_id}")
-    print(f"\n   Gunakan di run_enviroment.sh:")
+    print(f"\n   Gunakan di run_environment.sh:")
     print(f'   MODEL="{full_repo_id}"')
 
 

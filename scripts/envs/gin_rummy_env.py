@@ -378,7 +378,7 @@ _SYSTEM_PROMPT = (
     "5. Knock: declare end when deadwood \u2264 knock_card\n\n"
     "KNOCKING:\n- Gin: 0 deadwood = 25-point bonus\n\n"
     "SCORING: Winner scores difference in deadwood.\n"
-    "Card Values: A=1, 2-10=face value, J=11, Q=12, K=13\n\n"
+    "Card Values: A=1, 2-9=face value, T/J/Q/K=10\n\n"
     "IMPORTANT: Always respond with the action ID number ONLY.\n\n"
     "# Output Format\nYou must respond with ONLY the action ID (a single number).\n"
     "Do NOT include descriptions or explanations.\n\n"
