@@ -122,6 +122,28 @@ docker run --rm \
 ENV_SERVER_URLS="${ENVIRONMENT_SERVER_URLS:-http://host.docker.internal:8001}"
 echo "[env] Using environment servers: $ENV_SERVER_URLS"
 
+# Pre-flight: when the payload contains OpenSpiel games, verify at least one
+# env server is actually listening BEFORE downloading models / booting the
+# trainer. host.docker.internal == this host, so test via localhost here.
+if echo "$DATASET_TYPE" | grep -qE "liars_dice|gin_rummy|leduc_poker"; then
+  reachable=0
+  IFS=',' read -ra _urls <<< "$ENV_SERVER_URLS"
+  for u in "${_urls[@]}"; do
+    probe="${u/host.docker.internal/localhost}"
+    if curl -s -o /dev/null --max-time 3 "$probe"; then
+      reachable=1; echo "[env] OK: $u reachable"
+    else
+      echo "[env] UNREACHABLE: $u"
+    fi
+  done
+  if [ "$reachable" -eq 0 ]; then
+    echo "[env] FATAL: no environment server reachable. Start them first:"
+    echo "       bash run_environment_env.sh   (ports 8001-8004)"
+    echo "       docker ps --filter name=agentgym-server"
+    exit 1
+  fi
+fi
+
 # ── Stale-output guard ──────────────────────────────────────────────────────
 # A failed previous run can leave a noise-fallback model in outputs/$TASK_ID.
 # text_trainer also guards against this in-container, but clean host-side too
@@ -130,6 +152,11 @@ if [ -d "$OUTPUTS_DIR/$TASK_ID" ]; then
   echo "[cleanup] Removing stale output from previous run: $OUTPUTS_DIR/$TASK_ID"
   rm -rf "$OUTPUTS_DIR/$TASK_ID"
 fi
+# Also clear this task's logs from the previous run, so post-run checks
+# (add_noise detection, upload guard) never react to stale files.
+rm -f "$TRAIN_LOGS_DIR/tokenize_${TASK_ID}.log" \
+      "$TRAIN_LOGS_DIR/train_${TASK_ID}.log" \
+      "$TRAIN_LOGS_DIR/add_noise_${TASK_ID}.log"
 
 # ── SFT multi-env training (whitelist-compliant; GRPO fallback for envs
 #    without an SFT generator) ──────────────────────────────────────────────
@@ -192,6 +219,11 @@ if [ -z "$HUGGINGFACE_TOKEN" ]; then
   echo "[upload] HUGGINGFACE_TOKEN empty — SKIPPING upload (local test mode)."
   echo "         Model output: $OUTPUTS_DIR/$TASK_ID/$EXPECTED_REPO_NAME"
   exit 0
+fi
+# Never upload a noise-fallback model from a failed local run (8GB of nothing).
+if [ -f "$TRAIN_LOGS_DIR/add_noise_${TASK_ID}.log" ]; then
+  echo "[upload] Training FAILED (noise-fallback detected) — SKIPPING upload."
+  exit 1
 fi
 echo "Uploading outputs..."
 docker run --rm --gpus all \
