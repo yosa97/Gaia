@@ -114,10 +114,22 @@ docker run --rm \
 
 # ── Environment servers (OpenSpiel games need them; intercode does NOT) ────
 # The validator provisions one server per GPU during tournament (the MCTS API
-# image). Locally: start them first (e.g. bash run_environment_env.sh), then:
-#   ENVIRONMENT_SERVER_URLS="http://localhost:8001,http://localhost:8002" bash examples/run_environment.sh
-ENV_SERVER_URLS="${ENVIRONMENT_SERVER_URLS:-http://localhost:8001}"
+# image). Locally: start them first (bash run_environment_env.sh — they publish
+# host ports 8001+). NOTE: inside the trainer container `localhost` is the
+# container itself, NOT the VM — so the default uses host.docker.internal
+# (mapped to the host gateway via --add-host below). Override if needed:
+#   ENVIRONMENT_SERVER_URLS="http://host.docker.internal:8001,http://host.docker.internal:8002" bash examples/run_environment.sh
+ENV_SERVER_URLS="${ENVIRONMENT_SERVER_URLS:-http://host.docker.internal:8001}"
 echo "[env] Using environment servers: $ENV_SERVER_URLS"
+
+# ── Stale-output guard ──────────────────────────────────────────────────────
+# A failed previous run can leave a noise-fallback model in outputs/$TASK_ID.
+# text_trainer also guards against this in-container, but clean host-side too
+# so the uploader can never ship a stale model.
+if [ -d "$OUTPUTS_DIR/$TASK_ID" ]; then
+  echo "[cleanup] Removing stale output from previous run: $OUTPUTS_DIR/$TASK_ID"
+  rm -rf "$OUTPUTS_DIR/$TASK_ID"
+fi
 
 # ── SFT multi-env training (whitelist-compliant; GRPO fallback for envs
 #    without an SFT generator) ──────────────────────────────────────────────
@@ -134,6 +146,7 @@ docker run --rm --gpus all \
   --memory=64g \
   --cpus=8 \
   --network "$NETWORK_NAME" \
+  --add-host=host.docker.internal:host-gateway \
   --volume "$CHECKPOINTS_DIR:/cache:rw" \
   --volume "$OUTPUTS_DIR:/app/checkpoints/:rw" \
   --volume "$MINER_DATASETS_HOST_DIR:/cache/miner_datasets:ro" \

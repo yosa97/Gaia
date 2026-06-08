@@ -71,6 +71,7 @@ def run_cmd_with_log(cmd: str, log_file_path: str, env_vars: dict = None):
 
         # Log the return code
         log_file.write(f"\nProcess completed with return code: {return_code}\n")
+        return return_code
 
 
 def replace_args_in_cmd(cmd: str, arg_name: str, arg_value: str):
@@ -358,6 +359,15 @@ def main():
     print(f"submission_dir: {submission_dir}", flush=True)
     if not os.path.exists(submission_dir):
         os.makedirs(submission_dir, exist_ok=True)
+    else:
+        # Stale-artifact guard: clear leftovers from a previous run (e.g. a
+        # noise-fallback model whose upload failed). Without this, the
+        # post-training success check can mistake old files for fresh output
+        # and upload a stale model.
+        for _f in os.listdir(submission_dir):
+            _p = os.path.join(submission_dir, _f)
+            print(f"[text_trainer] Removing stale artifact: {_p}", flush=True)
+            shutil.rmtree(_p) if os.path.isdir(_p) else os.remove(_p)
 
     output_dir = f"/workspace/scripts/soutputs/{args.task_id}"
     os.makedirs(output_dir, exist_ok=True)
@@ -505,10 +515,24 @@ def main():
     with open(request_path, "w") as f:
         json.dump(train_info, f, indent=4, ensure_ascii=False)
 
+    env_generation_failed = False
     if tokenize_cmd:
-        run_cmd_with_log(
+        _gen_rc = run_cmd_with_log(
             tokenize_cmd, os.path.join(ds_folder, f"tokenize_{args.task_id}.log")
         )
+        if _gen_rc != 0 and args.task_type == TaskType.ENVIRONMENTTASK.value:
+            # Trajectory gen / merge failed (all envs unreachable, miner dataset
+            # not mounted, etc). torchrun would only crash at load_from_disk —
+            # skip it with an explicit message and let the noise-model fallback
+            # below still produce a submission (NULL submission = lost task).
+            env_generation_failed = True
+            print(
+                f"[text_trainer] DATASET GENERATION FAILED (rc={_gen_rc}) — "
+                f"skipping training. Check tokenize_{args.task_id}.log "
+                f"(env servers reachable? miner datasets mounted?). "
+                f"Falling back to noise model so a submission still exists.",
+                flush=True,
+            )
 
     original_train_cmd = train_cmd
     train_success = False
@@ -521,7 +545,10 @@ def main():
     set_state(state)
     # TODO Run something magic here
     count = 0
+    success = False  # set by run_training; checked after the loop
     while True:
+        if env_generation_failed:
+            break  # no dataset — go straight to the fallback path below
         state = get_state()
         train_cmd = original_train_cmd  # will replace based on the state later
         c_train_info = copy.deepcopy(train_info)
@@ -605,7 +632,10 @@ def main():
         
         count += 1
 
-    if not os.path.exists(submission_dir) or len(os.listdir(submission_dir)) < 2:
+    # Success requires BOTH: run_training reported success (success.txt written
+    # by the trainer) AND the submission dir is populated. Checking only the
+    # dir contents is unsafe — stale artifacts from a previous run would pass.
+    if (not success) or not os.path.exists(submission_dir) or len(os.listdir(submission_dir)) < 2:
         print(f"Training failed for task {args.task_id}", flush=True)
     else:
         print(f"Training successfully done for task {args.task_id}", flush=True)
