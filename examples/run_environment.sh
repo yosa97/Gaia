@@ -69,8 +69,12 @@ fi
 CHECKPOINTS_DIR="$(pwd)/secure_checkpoints"
 OUTPUTS_DIR="$(pwd)/outputs"
 MINER_DATASETS_HOST_DIR="${MINER_DATASETS_HOST_DIR:-$(pwd)/miner_datasets}"
-mkdir -p "$CHECKPOINTS_DIR" "$OUTPUTS_DIR" "$MINER_DATASETS_HOST_DIR"
-chmod 777 "$CHECKPOINTS_DIR" "$OUTPUTS_DIR"
+# Trainer working dir (/workspace/scripts/datasets) holds tokenize_*.log,
+# train_*.log, add_noise_*.log AND the generated SFT datasets. Mount it to the
+# host so debugging survives `docker run --rm`.
+TRAIN_LOGS_DIR="$(pwd)/train_logs"
+mkdir -p "$CHECKPOINTS_DIR" "$OUTPUTS_DIR" "$MINER_DATASETS_HOST_DIR" "$TRAIN_LOGS_DIR"
+chmod 777 "$CHECKPOINTS_DIR" "$OUTPUTS_DIR" "$TRAIN_LOGS_DIR"
 
 # ── Miner datasets (whitelisted SFT path — Rule 3) ────────────────────────
 # In tournament the validator mounts these from your requested_datasets.
@@ -133,6 +137,7 @@ docker run --rm --gpus all \
   --volume "$CHECKPOINTS_DIR:/cache:rw" \
   --volume "$OUTPUTS_DIR:/app/checkpoints/:rw" \
   --volume "$MINER_DATASETS_HOST_DIR:/cache/miner_datasets:ro" \
+  --volume "$TRAIN_LOGS_DIR:/workspace/scripts/datasets:rw" \
   --env WANDB_API_KEY="$WANDB_TOKEN" \
   --env WANDB_TOKEN="$WANDB_TOKEN" \
   --env WANDB_INIT_TIMEOUT=300 \
@@ -158,7 +163,23 @@ kill $TIMER_PID 2>/dev/null || true
 # Cleanup
 docker network rm "$NETWORK_NAME" 2>/dev/null || true
 
-# Upload to HF
+# ── Post-run summary + log hints ───────────────────────────────────────────
+echo
+echo "[logs] Trainer logs preserved in: $TRAIN_LOGS_DIR"
+echo "       tokenize_${TASK_ID}.log  = trajectory gen + merge output"
+echo "       train_${TASK_ID}.log     = SFT/GRPO training output"
+echo "       add_noise_${TASK_ID}.log = ONLY exists if training FAILED (fallback model!)"
+if [ -f "$TRAIN_LOGS_DIR/add_noise_${TASK_ID}.log" ]; then
+  echo "[logs] WARNING: add_noise log found — training FAILED, saved model is noise-fallback."
+  echo "       Root cause: tail -50 $TRAIN_LOGS_DIR/tokenize_${TASK_ID}.log $TRAIN_LOGS_DIR/train_${TASK_ID}.log"
+fi
+
+# Upload to HF — skip cleanly when no valid token (avoids 401 crash at the end)
+if [ -z "$HUGGINGFACE_TOKEN" ]; then
+  echo "[upload] HUGGINGFACE_TOKEN empty — SKIPPING upload (local test mode)."
+  echo "         Model output: $OUTPUTS_DIR/$TASK_ID/$EXPECTED_REPO_NAME"
+  exit 0
+fi
 echo "Uploading outputs..."
 docker run --rm --gpus all \
   --volume "$OUTPUTS_DIR:/app/checkpoints/:rw" \
