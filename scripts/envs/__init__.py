@@ -26,6 +26,7 @@ from envs.leduc_poker_env import (
 )
 from envs.env_configs import EnvTrainingConfig, get_env_config
 from envs.shared_env import GAMES_TO_TASK_ID_RANGE
+from envs.sft_env_configs import supports_sft
 
 __all__ = [
     "alfworld_rollout_first_prompt_and_completion_parallelized",
@@ -47,4 +48,5 @@ __all__ = [
     "EnvTrainingConfig",
     "get_env_config",
     "GAMES_TO_TASK_ID_RANGE",
+    "supports_sft",
 ]

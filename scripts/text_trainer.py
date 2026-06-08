@@ -32,7 +32,12 @@ from dpo_config import get_training_json as get_dpo_training_json
 from grpo_config import get_training_json as get_grpo_training_json
 from instruct_config import get_training_json as get_instruct_training_json
 from grpo_env_config import get_training_json as get_env_training_json
-from sft_env_config import get_training_json as get_full_sft_training_json
+from sft_env_config import (
+    get_training_json as get_sft_env_training_json,
+    get_training_json_multi_env as get_sft_env_training_json_multi_env,
+)
+from envs import supports_sft
+from tournament_env_utils import log_tournament_environment
 from transformers import AutoConfig
 
 
@@ -430,13 +435,68 @@ def main():
         train_cmd = train_info["run_cmd"]
 
     elif args.task_type == TaskType.ENVIRONMENTTASK.value:
-        sft_only = os.environ.get("SFT_ONLY", "0") == "1"
-        if sft_only:
-            print("[text_trainer] SFT_ONLY=1 detected — routing to full SFT (train_sft_env.py)", flush=True)
-            train_info = get_full_sft_training_json(train_info)
+        # PvP tournament 2026-05-25+: validator sends `environment_names: list[str]`
+        # for multi-env tasks (R1=2 envs, R2=4 envs, R3=6 envs). ALL envs are
+        # PvP-evaluated head-to-head → SFT data MUST cover all listed envs.
+        #
+        # Routing:
+        #   - environment_names list with len >= 2 → multi-env path (scaled per-env
+        #     trajectory gen + merge + single SFT)
+        #   - environment_names list with len == 1 → single-env (treat first as legacy)
+        #   - environment_name str (legacy) → single-env
+        env_names = dataset_type_dict.get("environment_names")
+        is_multi_env = (
+            env_names
+            and isinstance(env_names, list)
+            and len(env_names) >= 2
+        )
+
+        if is_multi_env:
+            # Drop envs this trainer has no SFT generator for (e.g. intercode) instead of
+            # failing the whole task. We still train on the supported subset so the model
+            # competes where it can rather than producing no submission at all.
+            supported_envs = [e for e in env_names if supports_sft(e)]
+            dropped = [e for e in env_names if not supports_sft(e)]
+            if dropped:
+                print(f"[text_trainer] Dropping envs with no SFT generator: {dropped}. "
+                      f"Training on supported subset: {supported_envs}.", flush=True)
+            if not supported_envs:
+                raise ValueError(
+                    f"Multi-env task contains no SFT-supported envs: {env_names}. "
+                    f"Add a trajectory generator + register in envs/sft_env_configs.py."
+                )
+            # Reflect the filtered set so the single-env builder (which reads
+            # dataset_type.environment_names) picks up a supported env, not a dropped one.
+            dataset_type_dict["environment_names"] = supported_envs
+            if len(supported_envs) >= 2:
+                print(f"[text_trainer] Multi-env task detected: {supported_envs} "
+                      f"(n={len(supported_envs)}). Running scaled per-env trajectory gen + "
+                      f"merge + single SFT.", flush=True)
+                log_tournament_environment(",".join(supported_envs))
+                train_info = get_sft_env_training_json_multi_env(train_info, supported_envs)
+                tokenize_cmd = train_info["generate_cmd"]
+            else:
+                env_name = supported_envs[0]
+                print(f"[text_trainer] Single supported env after dropping unsupported: "
+                      f"{env_name}.", flush=True)
+                log_tournament_environment(env_name)
+                train_info = get_sft_env_training_json(train_info)
+                tokenize_cmd = train_info["generate_cmd"]
         else:
-            train_info = get_env_training_json(train_info)
-        tokenize_cmd = ""
+            # Single-env path (legacy + R0/organic)
+            if env_names and len(env_names) == 1:
+                env_name = env_names[0]
+                print(f"[text_trainer] Single-env from environment_names list: "
+                      f"{env_name}", flush=True)
+            else:
+                env_name = dataset_type_dict.get("environment_name", "")
+            log_tournament_environment(env_name)
+            if supports_sft(env_name):
+                train_info = get_sft_env_training_json(train_info)
+                tokenize_cmd = train_info["generate_cmd"]
+            else:
+                train_info = get_env_training_json(train_info)
+                tokenize_cmd = ""
         train_cmd = train_info["run_cmd"]
     else:
         raise ValueError(f"Task type {args.task_type} not supported")
@@ -445,7 +505,7 @@ def main():
     with open(request_path, "w") as f:
         json.dump(train_info, f, indent=4, ensure_ascii=False)
 
-    if not args.task_type == TaskType.ENVIRONMENTTASK.value:
+    if tokenize_cmd:
         run_cmd_with_log(
             tokenize_cmd, os.path.join(ds_folder, f"tokenize_{args.task_id}.log")
         )
