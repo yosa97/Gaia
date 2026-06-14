@@ -24,6 +24,7 @@ Score-based sampling (winner 5EgpWgYv leduc_poker strategy):
 """
 
 import argparse
+import os
 import random
 from collections import Counter
 from concurrent.futures import CancelledError, ProcessPoolExecutor, as_completed
@@ -32,6 +33,17 @@ from datasets import Dataset, DatasetDict
 
 from envs.shared_env import GAMES_TO_TASK_ID_RANGE, init_env_pool
 from envs.sft_env_configs import get_sft_trajectory_generator
+
+
+# ── Miner-unique seed ────────────────────────────────────────────────────────
+# CRITICAL for tournament dedup avoidance. Teams sharing the same base code with
+# the hardcoded seed=42 sample the SAME game_ids -> identical trajectories ->
+# near-identical trained models -> flagged as duplicate submissions.
+# This seed makes our sampled games (and the env-server reset seed) UNIQUE so
+# our training data — and therefore our model — diverges from everyone else's.
+# Override per-run with the MINER_SEED env var. CHANGE THIS to your own number;
+# do NOT leave it at any value a teammate is using.
+MINER_SEED = int(os.environ.get("MINER_SEED", "970197"))
 
 
 # ── Process-pool worker ───────────────────────────────────────────────────────
@@ -136,7 +148,7 @@ def main() -> None:
                    help="Number of worker processes. Default 0 = num_servers. "
                         "Each process holds one concurrent env server connection; "
                         "raise to increase throughput, lower to reduce env server load.")
-    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--seed", type=int, default=MINER_SEED)
     # Score-based sampling (winner's leduc_poker strategy). Only effective when
     # the generator returns a (messages, score) tuple — pure list[dict] returns
     # are kept regardless.
@@ -188,9 +200,11 @@ def main() -> None:
 
     task_id_min, task_id_max = GAMES_TO_TASK_ID_RANGE[args.environment_name]
 
+    # Per-env reset seed derived from the miner-unique seed (not hardcoded 42)
+    # so the env server deals DIFFERENT games than teammates using seed 42.
     reset_payload = {
         "task_id": task_id_min,
-        "seed": 42,
+        "seed": args.seed,
         "opponent": "mcts",
         "mcts_max_simulations": 225,
         "mcts_num_rollouts": 1,

@@ -108,7 +108,10 @@ for _key in SFT_ENV_SIZE_CONFIG:
 # (R4c liars WIN). All used gpu_count=4 (rank0-3 in torchrun).
 PER_MODEL_OVERRIDE: dict[str, dict] = {
     "Qwen/Qwen3-4B-Instruct-2507": {
-        "lr": 3.571428571428571e-05,   # Loki: arch=qwen3forcausallm 4.022B → 3.571e-5
+        # Dedup divergence: team/Loki default was 3.571e-5. Nudged ~10% lower so
+        # the optimization trajectory (and final weights) differ from teammates
+        # while staying in the stable band for this arch/size.
+        "lr": 3.2e-05,
         "distributed": "ddp",
         "gpu_count": 4,                # Loki: rank0-3 visible
         "batch_size": 20,
@@ -279,19 +282,30 @@ def get_run_cmd(config: dict, gpu_nums: int) -> str:
 #
 # `multi_env_min` per-env floor: prevents tiny per-env datasets when n_envs is large
 # (e.g. R3 with 6 envs would naively give gin 8K/6≈1.3K — too small for variant cov).
+# NOTE (dedup divergence): these per-env settings are deliberately CHANGED from
+# the shared 56susnet/jembut team defaults (which were liars 100k/mt30,
+# gin 15k/mt200, leduc 100k/mt10/score^3). Different num_games + max_turn +
+# window slicing => a different training set than teammates even at the same
+# seed, and combined with the unique MINER_SEED the resulting model is distinct.
+# `window_turns`/`window_step` control how each game is sliced into training
+# examples; differing them changes the example distribution itself.
 _ENV_GENERATE_ARGS: dict[str, dict] = {
-    "liars_dice":  {"num_games": 100_000, "max_turn":  30,
+    "liars_dice":  {"num_games": 120_000, "max_turn":  28,
+                    "window_turns": 8,  "window_step": 3,
+                    "sample_by_score": True, "score_power": 2.0,
                     "multi_env_min": 25_000},
-    "gin_rummy":   {"num_games":  15_000, "max_turn": 200,
+    "gin_rummy":   {"num_games":  18_000, "max_turn": 180,
+                    "window_turns": 12, "window_step": 5,
                     "multi_env_min":  5_000},
-    "leduc_poker": {"num_games": 100_000, "max_turn":  10,
-                    "sample_by_score": True, "score_power": 3.0,
+    "leduc_poker": {"num_games": 110_000, "max_turn":   9,
+                    "window_turns": 6,  "window_step": 2,
+                    "sample_by_score": True, "score_power": 2.5,
                     "multi_env_min": 25_000},
     # intercode: dataset-builder env (no episode play; num_games = max examples
     # taken from the whitelisted intercode_bigcode_combined_12k jsonl; max_turn
     # unused but required by the shared CLI). Builder is fast (<1 min) so the
     # per-env time budget is never the binding constraint.
-    "intercode":   {"num_games": 12_000, "max_turn": 1,
+    "intercode":   {"num_games": 11_000, "max_turn": 1,
                     "multi_env_min": 4_000},
 }
 
@@ -341,6 +355,11 @@ def _build_generate_cmd(env_name: str, dataset_path: str, env_args: dict,
         f" --num_games {num_games}"
         f" --max_turn {env_args['max_turn']}"
     )
+    # Divergent window slicing (changes the example distribution vs team defaults)
+    if env_args.get("window_turns"):
+        cmd += f" --window_turns {env_args['window_turns']}"
+    if env_args.get("window_step"):
+        cmd += f" --window_step {env_args['window_step']}"
     if soft_fail:
         cmd += " --soft-fail"
     # Time-bounded mode (Patch A) — caps total wall time for this env's traj gen

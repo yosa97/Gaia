@@ -49,9 +49,15 @@ class SFTEnvTrainingArgs(SFTConfig):
 
 @dataclass
 class LoraArguments:
-    lora_r: int = 128
-    lora_alpha: int = 512
-    lora_dropout: float = 0.1
+    # Dedup divergence: team default was r=128/alpha=512/dropout=0.1 (winner's
+    # recipe). We use r=96/alpha=384 (same 4:1 alpha:r ratio for stability) and
+    # slightly higher dropout. A different LoRA rank changes the adapter's
+    # weight dimensionality, so even on the same data the resulting weights
+    # diverge from teammates running r=128. Combined with the unique seed and
+    # different data composition, the submitted model is distinct.
+    lora_r: int = 96
+    lora_alpha: int = 384
+    lora_dropout: float = 0.12
     lora_target_modules: str = "all"
     lora_weight_path: str = ""
     lora_bias: str = "none"

@@ -92,9 +92,15 @@ def extract_value_from_cmd(cmd: str, arg_name: str):
         return None
 
 
-def get_model_architecture(model_name: str) -> str:
+def get_model_architecture(model_name: str, model_path: str | None = None) -> str:
+    # Tournament containers have NO internet, and the validator passes an
+    # anonymized model id (e.g. "0311af13fabfa2c5") as model_name. Calling
+    # AutoConfig.from_pretrained(model_name) would try huggingface.co and
+    # DNS-fail. Prefer the LOCAL pre-downloaded cache path; only fall back to
+    # the name (offline) if no path is given.
+    source = model_path if model_path and os.path.isdir(model_path) else model_name
     try:
-        config = AutoConfig.from_pretrained(model_name)
+        config = AutoConfig.from_pretrained(source, local_files_only=True)
         architectures = config.architectures
         if len(architectures) > 1:
             return "Multiple architectures"
@@ -105,8 +111,8 @@ def get_model_architecture(model_name: str) -> str:
         return "Unknown"
 
 
-def is_openai_model(model_name: str) -> bool:
-    architecture = get_model_architecture(model_name)
+def is_openai_model(model_name: str, model_path: str | None = None) -> bool:
+    architecture = get_model_architecture(model_name, model_path)
     if architecture.lower() == "gptossforcausallm":
         return True
     return False
@@ -384,7 +390,7 @@ def main():
     model_path = str(train_paths.get_text_base_model_path(original_model_name))
 
     is_openai = False
-    if is_openai_model(original_model_name):
+    if is_openai_model(original_model_name, model_path):
         print("Upgrading python packages for openai model", flush=True)
         run_cmd_with_log(
             "pip uninstall -y transformers && pip install transformers==4.55.0",
