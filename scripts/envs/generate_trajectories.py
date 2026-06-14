@@ -47,7 +47,7 @@ from envs.sft_env_configs import get_sft_trajectory_generator
 # — the real protection is the genuine data mechanism (_dedup_and_rebalance)
 # plus the per-game seeded sampling in the *_trajectories.py generators.
 # >>> CHANGE THIS NUMBER to something only you use <<<
-_HARDCODED_MINER_SEED = 970197
+_HARDCODED_MINER_SEED = 483047253
 MINER_SEED = int(os.environ.get("MINER_SEED", str(_HARDCODED_MINER_SEED)))
 
 

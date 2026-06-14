@@ -49,7 +49,7 @@ def main() -> None:
     # changes the optimization path under a limited step budget, nudging the
     # final weights away from teammates. Safe — only reorders, never drops data.
     import os
-    _miner_seed = int(os.environ.get("MINER_SEED", "970197"))
+    _miner_seed = int(os.environ.get("MINER_SEED", "483047253"))
     p.add_argument(
         "--shuffle-seed",
         type=int,

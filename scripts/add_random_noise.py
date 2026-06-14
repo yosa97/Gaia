@@ -21,7 +21,7 @@ def main(model_path: str, save_folder: str):
     # the duplicate detector. Seed the noise with MINER_SEED so even our
     # fallback is distinct. (The real fix is not failing — see offline fix —
     # this just protects the worst case.)
-    miner_seed = int(os.environ.get("MINER_SEED", "970197"))
+    miner_seed = int(os.environ.get("MINER_SEED", "483047253"))
     torch.manual_seed(miner_seed)
 
     # Step 2: Add random noise to the input embeddings

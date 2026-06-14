@@ -38,7 +38,7 @@ _TIMEOUT = 2400
 # random.Random(game_id ^ MINER_SEED), so the random games we generate (and
 # therefore which ones survive score-sampling) differ from teammates. Set
 # MINER_SEED uniquely.
-_MINER_SEED = int(os.environ.get("MINER_SEED", "970197"))
+_MINER_SEED = int(os.environ.get("MINER_SEED", "483047253"))
 
 # System prompt sourced from PvP canonical (matches validator eval format exactly)
 _SYSTEM_PROMPT = SYSTEM_PROMPT_LEDUC_POKER

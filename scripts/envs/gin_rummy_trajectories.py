@@ -46,7 +46,7 @@ _TIMEOUT = 2400
 # first. Equal-score discards are interchangeable, so this never lowers play
 # quality — it just makes our discard data (and this file) differ. Set MINER_SEED
 # uniquely.
-_MINER_SEED = int(os.environ.get("MINER_SEED", "970197"))
+_MINER_SEED = int(os.environ.get("MINER_SEED", "483047253"))
 _TIE_RNG = random.Random(_MINER_SEED)
 
 # System prompt now sourced from PvP canonical (matches validator eval format)

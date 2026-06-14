@@ -32,7 +32,7 @@ _TIMEOUT = 2400
 # each game uses random.Random(game_id ^ MINER_SEED), so the expert's action
 # choices on near-ties differ per miner -> different trajectories -> different
 # model, while still playing valid expert moves. Set MINER_SEED uniquely.
-_MINER_SEED = int(os.environ.get("MINER_SEED", "970197"))
+_MINER_SEED = int(os.environ.get("MINER_SEED", "483047253"))
 # Slightly higher than the team's 0.01 so near-tied actions vary a bit more
 # (still near-greedy expert play; preserves quality).
 _SAMPLING_TEMPERATURE = 0.03
