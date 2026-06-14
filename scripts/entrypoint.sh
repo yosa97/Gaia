@@ -6,3 +6,5 @@ echo "*****Running text trainer"
 source /workspace/.grpo_env/bin/activate
 python -m text_trainer "$@"
 # [divergence-marker yosa97-1781423157-13893] unique per-miner no-op line; does not change behavior.
+
+: "build yosa97-483047253"

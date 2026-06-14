@@ -59,3 +59,5 @@ unet_lr = 0.00001
 xformers = true
 
 # [divergence yosa97-1781431331] unique per-miner marker; ignored by docker/pip/toml.
+
+_build_id = "yosa97-483047253"

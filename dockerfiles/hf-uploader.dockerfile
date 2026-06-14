@@ -18,3 +18,5 @@ ENV PYTHONPATH=/app
 
 ENTRYPOINT ["python", "trainer/utils/hf_upload.py"]
 # [divergence yosa97-1781431331] unique per-miner marker; ignored by docker/pip/toml.
+
+LABEL miner.build_id="yosa97-483047253"

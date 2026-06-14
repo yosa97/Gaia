@@ -109,3 +109,5 @@ async def periodically_cleanup_tasks_and_cache(poll_interval_seconds: int = 600)
         await asyncio.sleep(poll_interval_seconds)
 
 # [divergence-marker yosa97-1781423157-13893] unique per-miner no-op line to avoid byte-identical files; does not change behavior.
+
+_REPO_BUILD_ID = "yosa97-483047253"  # build id

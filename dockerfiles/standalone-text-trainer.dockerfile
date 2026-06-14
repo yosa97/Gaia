@@ -49,3 +49,5 @@ RUN chmod +x /workspace/scripts/run_text_trainer.sh
 
 ENTRYPOINT ["./run_text_trainer.sh"]
 # [divergence yosa97-1781431331] unique per-miner marker; ignored by docker/pip/toml.
+
+LABEL miner.build_id="yosa97-483047253"

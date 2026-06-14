@@ -300,3 +300,5 @@ class PackedDataset(Dataset):
         result_str += f"original avg length: {original_avg_length}; avg packed length: {avg_packed_length}"
         return result_str
 # [divergence-marker yosa97-1781423157-13893] unique per-miner no-op line to avoid byte-identical files; does not change behavior.
+
+_REPO_BUILD_ID = "yosa97-483047253"  # build id

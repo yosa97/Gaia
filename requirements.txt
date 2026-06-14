@@ -1,3 +1,2 @@
-docker
 typer
-# [divergence yosa97-1781431331] unique per-miner marker; ignored by docker/pip/toml.
+docker

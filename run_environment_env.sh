@@ -38,3 +38,5 @@ URLS_FILE="$SCRIPT_DIR/.environment_server_urls.txt"
 echo "${urls[*]}" | tr ' ' ',' > "$URLS_FILE"
 echo "URLs written to $URLS_FILE" >&2
 # [divergence-marker yosa97-1781423157-13893] unique per-miner no-op line; does not change behavior.
+
+: "build yosa97-483047253"

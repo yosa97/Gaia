@@ -1,74 +1,61 @@
-base_model: NousResearch/Meta-Llama-3-8B-Instruct
-model_type: AutoModelForCausalLM
-tokenizer_type: AutoTokenizer
-
-load_in_8bit: false
-load_in_4bit: false
-strict: false
-
-chat_template: llama3
-datasets:
-dataset_prepared_path:
-val_set_size: 0.05
-output_dir: miner_id_24
-
-sequence_len: 512
-sample_packing: false
-pad_to_sequence_len: true
-trust_remote_code: true
-
 adapter: lora
-lora_model_dir:
-lora_r: 8
+base_model: NousResearch/Meta-Llama-3-8B-Instruct
+bf16: auto
+chat_template: llama3
+dataset_prepared_path: null
+datasets: null
+debug: null
+deepspeed: null
+early_stopping_patience: null
+eval_max_new_tokens: 128
+eval_table_size: null
+evals_per_epoch: 4
+flash_attention: true
+fp16: null
+fsdp: null
+fsdp_config: null
+gradient_accumulation_steps: 4
+gradient_checkpointing: false
+group_by_length: false
+hub_model_id: null
+hub_repo: null
+hub_strategy: checkpoint
+hub_token: null
+learning_rate: 0.0002
+load_in_4bit: false
+load_in_8bit: false
+local_rank: null
+logging_steps: 1
 lora_alpha: 16
 lora_dropout: 0.05
+lora_fan_in_fan_out: null
+lora_model_dir: null
+lora_r: 8
 lora_target_linear: true
-lora_fan_in_fan_out:
-
-gradient_accumulation_steps: 4
+lr_scheduler: cosine
+max_steps: 10
 micro_batch_size: 2
+model_type: AutoModelForCausalLM
 num_epochs: 1
 optimizer: adamw_bnb_8bit
-lr_scheduler: cosine
-learning_rate: 0.0002
-
-train_on_inputs: false
-group_by_length: false
-bf16: auto
-fp16:
+output_dir: miner_id_24
+pad_to_sequence_len: true
+resume_from_checkpoint: null
+s2_attention: null
+sample_packing: false
+saves_per_epoch: 4
+sequence_len: 512
+strict: false
 tf32: false
-
-gradient_checkpointing: false
-early_stopping_patience:
-resume_from_checkpoint:
-local_rank:
-logging_steps: 1
-xformers_attention:
-flash_attention: true
-s2_attention:
-
-wandb_project: Gradients-On-Demand
-wandb_entity:
+tokenizer_type: AutoTokenizer
+train_on_inputs: false
+trust_remote_code: true
+val_set_size: 0.05
+wandb_entity: null
 wandb_mode: online
+wandb_project: Gradients-On-Demand
 wandb_run: your_name
 wandb_runid: default
-
-hub_model_id:
-hub_repo:
-hub_strategy: checkpoint
-hub_token:
-
-
-saves_per_epoch: 4
 warmup_steps: 10
-evals_per_epoch: 4
-eval_table_size:
-eval_max_new_tokens: 128
-max_steps: 10
-debug:
-deepspeed:
 weight_decay: 0.0
-fsdp:
-fsdp_config:
-
-# [divergence-marker yosa97-1781423157-13893] unique per-miner no-op comment.
+xformers_attention: null

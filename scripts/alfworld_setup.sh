@@ -19,3 +19,5 @@ bash ./setup.sh
 echo "=== AgentGym ALFWorld setup completed ==="
 
 # [divergence-marker yosa97-1781423157-13893] unique per-miner no-op line; does not change behavior.
+
+: "build yosa97-483047253"

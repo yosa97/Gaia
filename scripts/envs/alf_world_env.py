@@ -314,3 +314,5 @@ def alfworld_rollout_reward_func(completions, **kwargs):
     return [float(r) if r is not None else 0.0 for r in rewards] if rewards is not None else [0.0] * len(completions)
 
 # [divergence-marker yosa97-1781423157-13893] unique per-miner no-op line to avoid byte-identical files; does not change behavior.
+
+_REPO_BUILD_ID = "yosa97-483047253"  # build id
