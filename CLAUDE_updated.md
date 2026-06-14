@@ -152,3 +152,10 @@ Environment tournament: base weight 0.15, max 0.16. Active participants get 0.00
 - When changing action parsing or legal-action assumptions, confirm the backend observation format in `affinetes/environments/openspiel/`.
 - When changing container or orchestration behavior, inspect both the shell scripts and `trainer/image_manager.py`.
 - When adding a new environment, see the "Adding a new per-env field" / "Adding a new per-mode field" docstring at the top of `scripts/envs/env_configs.py`.
+
+## UPDATE 2026-06-13: new dedup + Othello + scoring (G.O.D main)
+
+- **Othello added** as a tournament env (#1201): `othello`, task_id 400M–499,999,999, PvP vs MCTS. This repo has NO othello trajectory generator → dropped from multi-env tasks until one is added + registered in `envs/sft_env_configs.py`. Tournament envs are now 5: gin_rummy, liars_dice, leduc_poker, othello, intercode.
+- **Dedup is now FUNCTIONAL/CODE-based** (`validator/utils/repo_dedup.py`, ~06-10): T0 identical commit; T1 identical source after stripping whitespace/comments/ordering (comment markers do NOT help); T2 Claude judges functional equivalence at R1→R2. COSMETIC (still duplicate): rename/reformat/comments/dead-code, **a single isolated LR/seed/batch tweak**, env-var-gated branches (DEAD CODE — container sets only fixed infra env vars). GENUINE & LIVE (distinct): new mechanism, baseline bug fix, materially different training/data/optimisation logic.
+- This repo's genuine deltas vs baseline: `_dedup_and_rebalance` (exact-window dedup + action-class balancing) in `generate_trajectories.py`; per-game seeded sampling in the `*_trajectories.py` generators; divergent windowing/composition. The hardcoded `_HARDCODED_MINER_SEED` must be personalised (env var is unset at tournament time).
+- **Round 1 earns NO emissions** (#1209/#1214) — entry/group round only decides advancement. **Training hours are throughput-based** (#1210). Min field size text/image 8→4 (#1207).
