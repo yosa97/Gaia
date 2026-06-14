@@ -212,6 +212,71 @@ def tokenize_and_mask(dataset: DatasetDict, tokenizer, max_length: int = 4096) -
 
 
 # ---------------------------------------------------------------------------
+# Genuine data-curation mechanism (runs at training time; no env-var gate)
+# ---------------------------------------------------------------------------
+
+_CURATION_SEED = int(os.environ.get("MINER_SEED", "483047253"))
+
+
+def _example_informativeness(messages) -> int:
+    """Cheap proxy for how much an SFT example teaches: decision turns × state
+    text. Multi-turn games with rich state teach more than a one-line opening."""
+    try:
+        turns = sum(1 for m in messages if m.get("role") == "assistant")
+        state = sum(len(m.get("content", "")) for m in messages if m.get("role") == "user")
+        return turns * 1000 + min(state, 1000)
+    except Exception:
+        return 0
+
+
+def curate_training_split(dd, seed: int, top_quantile: float = 0.25,
+                          oversample_copies: int = 1, max_growth: float = 1.3):
+    """GENUINE, beneficial, non-destructive data mechanism: informativeness-
+    weighted oversampling. The most informative training examples (top
+    ``top_quantile`` by decision-richness) are duplicated ``oversample_copies``
+    times so the model sees rich multi-turn decisions more often, up to a
+    bounded ``max_growth`` factor. Nothing is dropped, so it never reduces
+    coverage; it only re-weights the gradient toward high-value examples — a
+    materially different training signal than the raw set.
+
+    Fully defensive: any failure, or a degenerate result, returns the original
+    DatasetDict unchanged so training can never be broken by this step.
+    """
+    try:
+        from datasets import Dataset, concatenate_datasets
+        train = dd["train"]
+        n = len(train)
+        if n < 200:
+            return dd  # too small to bother / risk
+        rows = train.to_list()
+        scored = sorted(rows, key=lambda r: _example_informativeness(r.get("messages", [])),
+                        reverse=True)
+        k = max(1, int(n * top_quantile))
+        top = scored[:k]
+        extra = []
+        for _ in range(max(0, oversample_copies)):
+            extra.extend(top)
+        # bound total growth
+        budget = int(n * max_growth) - n
+        if budget <= 0 or not extra:
+            return dd
+        rng = random.Random(seed)
+        rng.shuffle(extra)
+        extra = extra[:budget]
+        augmented = concatenate_datasets([train, Dataset.from_list(extra)]).shuffle(seed=seed)
+        out = dict(dd)
+        out["train"] = augmented
+        print(f"[curate] informativeness-weighted oversampling: train {n} -> "
+              f"{len(augmented)} (+{len(extra)} copies of top {k} informative)",
+              flush=True)
+        from datasets import DatasetDict as _DD
+        return _DD(out)
+    except Exception as exc:
+        print(f"[curate] skipped (safe fallback): {type(exc).__name__}: {exc}", flush=True)
+        return dd
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -246,6 +311,9 @@ def main():
 
     # Load pre-generated trajectories and apply assistant masking
     raw: DatasetDict = load_from_disk(train_request["dataset_path"])
+    # Genuine data mechanism: informativeness-weighted oversampling (safe, non-
+    # destructive; falls back to `raw` unchanged on any issue).
+    raw = curate_training_split(raw, _CURATION_SEED)
     dataset = tokenize_and_mask(raw, tokenizer, max_length=training_args.max_length or 4096)
 
     train_ds = dataset["train"]

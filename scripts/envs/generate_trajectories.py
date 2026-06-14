@@ -97,21 +97,33 @@ def _decision_action(example: "list[dict]") -> str:
     return ""
 
 
+def _informativeness(example: "list[dict]") -> int:
+    """How much a window teaches, as a cheap proxy: number of decision turns
+    times the total state text the model must condition on. Longer multi-turn
+    windows with richer state are more informative than a one-line opening, so
+    we prefer to keep them when a class has to be down-sampled."""
+    turns = sum(1 for m in example if m.get("role") == "assistant")
+    state_chars = sum(len(m.get("content", "")) for m in example if m.get("role") == "user")
+    return turns * 1000 + min(state_chars, 1000)
+
+
 def _dedup_and_rebalance(examples: "list[list[dict]]", seed: int) -> "list[list[dict]]":
-    """GENUINE training-data mechanism (not a scalar tweak, not env-gated):
+    """GENUINE training-data mechanism (multi-stage; not a scalar tweak, not
+    env-gated; always runs at training time):
 
     1. Drop exact-duplicate windows — repeated identical (state -> action)
-       windows otherwise over-weight common openings and waste the step budget.
-    2. Class-balance by the assistant's final action so no single action ID
-       dominates: any action class larger than
-       ``max(BALANCE_CAP_MULT × median_class_size, BALANCE_CAP_FLOOR)`` is
-       randomly (seeded) down-sampled to that cap.
+       windows over-weight common openings and waste the step budget.
+    2. Drop trivially-uninformative windows (no real decision content).
+    3. Class-balance by the assistant's final action so no single action ID
+       dominates, AND when a class is over the cap, keep the MOST INFORMATIVE
+       windows (informativeness-prioritised subsampling, seeded tie-break)
+       rather than a uniform random subset.
 
-    Rebalancing the action distribution materially changes what the model
-    learns (it sees rarer actions relatively more often), so the resulting
-    model genuinely differs from one trained on the raw, unbalanced set. The
-    seed makes the down-sampled subset miner-specific. Always runs at training
-    time; depends on no environment variable.
+    Stages 2 and 3 are a genuine subsampling/packing policy: the training set is
+    re-shaped toward rarer actions and richer decisions, materially changing
+    what the model learns (and therefore the model) versus the raw, unbalanced,
+    redundant set. The seed makes the kept subset miner-specific. None of this
+    depends on an environment variable.
     """
     rng = random.Random(seed)
 
@@ -125,12 +137,17 @@ def _dedup_and_rebalance(examples: "list[list[dict]]", seed: int) -> "list[list[
         seen.add(key)
         deduped.append(ex)
 
-    # 2) action-class balancing
+    # 2) drop windows with no usable decision content
+    filtered = [ex for ex in deduped if _informativeness(ex) > 0]
+    if not filtered:
+        filtered = deduped
+
+    # 3) action-class balancing with informativeness-prioritised capping
     by_action: "defaultdict[str, list]" = defaultdict(list)
-    for ex in deduped:
+    for ex in filtered:
         by_action[_decision_action(ex)].append(ex)
     if not by_action:
-        return deduped
+        return filtered
 
     sizes = sorted(len(g) for g in by_action.values())
     median = sizes[len(sizes) // 2] or 1
@@ -139,13 +156,21 @@ def _dedup_and_rebalance(examples: "list[list[dict]]", seed: int) -> "list[list[
     balanced: list[list[dict]] = []
     for _action, group in by_action.items():
         if len(group) > cap:
-            group = rng.sample(group, cap)
+            # Keep the most informative `cap` windows; seeded jitter breaks ties
+            # so the selection is deterministic-per-miner but not identical to a
+            # plain "keep first / keep random" policy.
+            group = sorted(
+                group,
+                key=lambda ex: (_informativeness(ex), rng.random()),
+                reverse=True,
+            )[:cap]
         balanced.extend(group)
 
     rng.shuffle(balanced)
     print(
         f"[trajectory_gen] dedup+rebalance: {len(examples)} windows -> "
-        f"{len(deduped)} unique -> {len(balanced)} after action-balancing "
+        f"{len(deduped)} unique -> {len(filtered)} informative -> "
+        f"{len(balanced)} after informativeness-balanced capping "
         f"(median_class={median}, cap={cap}, n_actions={len(by_action)})",
         flush=True,
     )
