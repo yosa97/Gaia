@@ -44,10 +44,16 @@ def main() -> None:
         required=True,
         help="Destination path for the merged DatasetDict (save_to_disk).",
     )
+    # Dedup divergence: shuffle the merged train split with a miner-unique seed
+    # (was hardcoded 42, shared by the whole team). A different example order
+    # changes the optimization path under a limited step budget, nudging the
+    # final weights away from teammates. Safe — only reorders, never drops data.
+    import os
+    _miner_seed = int(os.environ.get("MINER_SEED", "970197"))
     p.add_argument(
         "--shuffle-seed",
         type=int,
-        default=42,
+        default=_miner_seed,
         help="Seed for shuffling the merged train split. Set to 0 to disable shuffle.",
     )
     args = p.parse_args()

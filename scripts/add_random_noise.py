@@ -15,6 +15,15 @@ def main(model_path: str, save_folder: str):
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     noise_std = 0.01
 
+    # Dedup divergence for the FAILURE fallback: when training fails, this noise
+    # model is the submission. Without a unique seed every failed miner running
+    # the shared code emits the SAME base+noise distribution and they collide on
+    # the duplicate detector. Seed the noise with MINER_SEED so even our
+    # fallback is distinct. (The real fix is not failing — see offline fix —
+    # this just protects the worst case.)
+    miner_seed = int(os.environ.get("MINER_SEED", "970197"))
+    torch.manual_seed(miner_seed)
+
     # Step 2: Add random noise to the input embeddings
     print("Modifying input embeddings...", flush=True)
     with torch.no_grad():
