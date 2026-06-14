@@ -20,6 +20,7 @@ terminal step (positive = win, negative = loss). The trajectory generator
 clamps this to [0, 1] before using it as a sampling probability.
 """
 
+import os
 import random
 import re
 
@@ -32,18 +33,26 @@ from envs.pvp_format import (
 )
 
 _TIMEOUT = 2400
+# Dedup divergence: miner-unique seed for the per-game random action RNG. The
+# team's shared file used the global RNG (random.choice); here each game uses
+# random.Random(game_id ^ MINER_SEED), so the random games we generate (and
+# therefore which ones survive score-sampling) differ from teammates. Set
+# MINER_SEED uniquely.
+_MINER_SEED = int(os.environ.get("MINER_SEED", "970197"))
 
 # System prompt sourced from PvP canonical (matches validator eval format exactly)
 _SYSTEM_PROMPT = SYSTEM_PROMPT_LEDUC_POKER
 
 
-def _random_action(obs: str) -> str:
-    """Pick a uniformly random legal action ID from the observation text.
+def _random_action(obs: str, rng: "random.Random | None" = None) -> str:
+    """Pick a random legal action ID from the observation text using ``rng``
+    (a per-game miner-unique RNG) so the generated games diverge from teammates.
 
     Falls back to '1' (Call) if no actions parseable (defensive).
     """
+    picker = rng or random
     actions = re.findall(r"^[ \t]*(\d+)\s*->", obs, re.MULTILINE)
-    return random.choice(actions) if actions else "1"
+    return picker.choice(actions) if actions else "1"
 
 
 def generate_random_episode(
@@ -82,6 +91,10 @@ def generate_random_episode(
     # PvP eval alternates player perspectives via position swap
     player_id = game_id % 2
 
+    # Per-game miner-unique RNG (deterministic per game_id+MINER_SEED, distinct
+    # from teammates using the global RNG on the same game_id).
+    rng = random.Random((game_id * 0x9E3779B1) ^ _MINER_SEED)
+
     user_prompt = build_pvp_user_prompt_leduc_poker(raw_observation, player_id=player_id)
     messages: list[dict] = [
         {"role": "system", "content": _SYSTEM_PROMPT},
@@ -93,7 +106,7 @@ def generate_random_episode(
     for _ in range(max_turn):
         # Random action from RAW observation (legal action IDs are in both
         # raw and PvP-formatted observations — the IDs themselves are unchanged)
-        action = _random_action(raw_observation)
+        action = _random_action(raw_observation, rng=rng)
         messages.append({"role": "assistant", "content": action})
 
         try:

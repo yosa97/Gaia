@@ -24,6 +24,8 @@ Expected score boost vs naive heuristic: +8-15% on R2/R4a gin (per
 [[reference_winner_trajectory_logic]]).
 """
 
+import os
+import random
 import re
 from collections import Counter, defaultdict
 from typing import Optional
@@ -37,6 +39,15 @@ from envs.pvp_format import (
 )
 
 _TIMEOUT = 2400
+# Dedup divergence: gin's expert is deterministic (optimal-deadwood DP), so its
+# trajectories diverge from teammates only via the unique game_ids (MINER_SEED).
+# To also vary the data where it's quality-NEUTRAL, ties between equally-scored
+# discards are broken with this miner-seeded RNG instead of always picking the
+# first. Equal-score discards are interchangeable, so this never lowers play
+# quality — it just makes our discard data (and this file) differ. Set MINER_SEED
+# uniquely.
+_MINER_SEED = int(os.environ.get("MINER_SEED", "970197"))
+_TIE_RNG = random.Random(_MINER_SEED)
 
 # System prompt now sourced from PvP canonical (matches validator eval format)
 _SYSTEM_PROMPT = SYSTEM_PROMPT_GIN_RUMMY
@@ -320,7 +331,7 @@ def choose_discard(hand: list[str], legal: list[tuple[str, str]], deadwood: int,
     meld_cards = get_optimal_meld_cards(hand)
     rank_counts, adj_cards = _hand_stats(hand)
 
-    best_id, best_score = None, None
+    best_ids, best_score = [], None
     for aid, label in legal:
         card_match = _RE_CARD_EXACT.match(label.strip())
         if not card_match:
@@ -329,9 +340,14 @@ def choose_discard(hand: list[str], legal: list[tuple[str, str]], deadwood: int,
         s = discard_score(card, hand, meld_cards, rank_counts, adj_cards, dead_cards)
         if best_score is None or s > best_score:
             best_score = s
-            best_id = aid
+            best_ids = [aid]
+        elif s == best_score:
+            best_ids.append(aid)
 
-    return best_id or legal[0][0]
+    # Miner-seeded tie-break among equally-best discards (quality-neutral).
+    if best_ids:
+        return best_ids[0] if len(best_ids) == 1 else _TIE_RNG.choice(best_ids)
+    return legal[0][0]
 
 
 def choose_draw(hand: list[str], upcard: str, legal: list[tuple[str, str]]) -> str:

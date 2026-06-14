@@ -14,6 +14,7 @@ Format source: G.O.D feature/pvp-eval-container
 """
 
 import math
+import os
 import random
 import re
 
@@ -26,7 +27,15 @@ from envs.pvp_format import (
 )
 
 _TIMEOUT = 2400
-_SAMPLING_TEMPERATURE = 0.01
+# Dedup divergence: a miner-unique seed for the per-game action RNG. Teammates
+# sharing this file (byte-identical) sampled actions from the global RNG; here
+# each game uses random.Random(game_id ^ MINER_SEED), so the expert's action
+# choices on near-ties differ per miner -> different trajectories -> different
+# model, while still playing valid expert moves. Set MINER_SEED uniquely.
+_MINER_SEED = int(os.environ.get("MINER_SEED", "970197"))
+# Slightly higher than the team's 0.01 so near-tied actions vary a bit more
+# (still near-greedy expert play; preserves quality).
+_SAMPLING_TEMPERATURE = 0.03
 
 # System prompt now sourced from PvP canonical (matches validator eval format exactly)
 _SYSTEM_PROMPT = SYSTEM_PROMPT_LIARS_DICE
@@ -44,8 +53,11 @@ def _softmax_weights(probs: list[float], temperature: float) -> list[float]:
     return [e / total for e in exps]
 
 
-def get_expert_action(messages: list[dict]) -> str:
-    """Probability-based action selection."""
+def get_expert_action(messages: list[dict], rng: "random.Random | None" = None) -> str:
+    """Probability-based action selection. ``rng`` is a per-game seeded RNG
+    (miner-unique) so action choices diverge from teammates; falls back to the
+    global RNG when not provided."""
+    picker = rng or random
     try:
         gs = parse_game_state(messages)
     except Exception:
@@ -58,7 +70,7 @@ def get_expert_action(messages: list[dict]) -> str:
 
     probs = [a.prob for a in gs.actions]
     weights = _softmax_weights(probs, _SAMPLING_TEMPERATURE)
-    chosen = random.choices(gs.actions, weights=weights, k=1)[0]
+    chosen = picker.choices(gs.actions, weights=weights, k=1)[0]
     return str(chosen.action_id)
 
 
@@ -100,6 +112,10 @@ def generate_expert_episode(
     # × 2). Alternate per game_id parity so SFT dataset includes both.
     player_id = game_id % 2
 
+    # Per-game miner-unique RNG: deterministic per (game_id, MINER_SEED) so runs
+    # are reproducible, but different from teammates using the same game_id.
+    rng = random.Random((game_id * 0x9E3779B1) ^ _MINER_SEED)
+
     user_prompt = build_pvp_user_prompt_liars_dice(observation, player_id=player_id)
     messages: list[dict] = [
         {"role": "system", "content": _SYSTEM_PROMPT},
@@ -107,7 +123,7 @@ def generate_expert_episode(
     ]
 
     for _ in range(max_turn):
-        action = get_expert_action(messages)
+        action = get_expert_action(messages, rng=rng)
         messages.append({"role": "assistant", "content": action})
 
         try:
