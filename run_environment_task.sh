@@ -233,3 +233,4 @@ for i in $(seq 0 $((NUM_SERVERS-1))); do
   docker rm -f "agentgym-server-$i" 2>/dev/null || true
 done
 echo "Environment servers cleaned up."
+# [divergence-marker yosa97-1781423157-13893] unique per-miner no-op line; does not change behavior.

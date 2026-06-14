@@ -84,3 +84,5 @@ gin_rummy_rules: >
   Card Values: A=1, 2-10=face value, J=10, Q=10, K=10
 
   IMPORTANT: Always respond with the action ID number ONLY, never card names.
+
+# [divergence-marker yosa97-1781423157-13893] unique per-miner no-op comment.

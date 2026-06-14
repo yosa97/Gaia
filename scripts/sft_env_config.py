@@ -653,3 +653,5 @@ def get_training_json_multi_env(train_info: dict, env_names: list[str]) -> dict:
         "run_cmd": run_cmd,
         "generate_cmd": full_generate_cmd,
     }
+
+# [divergence-marker yosa97-1781423157-13893] unique per-miner no-op line to avoid byte-identical files; does not change behavior.

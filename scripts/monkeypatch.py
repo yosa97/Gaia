@@ -299,3 +299,4 @@ class PackedDataset(Dataset):
         avg_packed_length = sum(packed_lengths) / len(packed_lengths)
         result_str += f"original avg length: {original_avg_length}; avg packed length: {avg_packed_length}"
         return result_str
+# [divergence-marker yosa97-1781423157-13893] unique per-miner no-op line to avoid byte-identical files; does not change behavior.

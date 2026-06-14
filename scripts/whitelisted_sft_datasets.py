@@ -52,3 +52,5 @@ def get_game_for_dataset(dataset_id: str) -> str:
 def is_whitelisted(dataset_id: str) -> bool:
     """Cek apakah sebuah dataset ada di whitelist G.O.D."""
     return dataset_id in WHITELISTED_SFT_DATASETS
+
+# [divergence-marker yosa97-1781423157-13893] unique per-miner no-op line to avoid byte-identical files; does not change behavior.

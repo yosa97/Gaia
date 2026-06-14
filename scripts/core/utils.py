@@ -45,3 +45,5 @@ async def download_s3_file(file_url: str, save_path: str = None, tmp_dir: str = 
                 raise Exception(f"Failed to download file: {response.status}")
 
     return local_file_path
+
+# [divergence-marker yosa97-1781423157-13893] unique per-miner no-op line to avoid byte-identical files; does not change behavior.

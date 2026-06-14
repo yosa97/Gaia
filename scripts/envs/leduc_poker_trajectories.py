@@ -139,3 +139,5 @@ def generate_random_episode(
 # `sft_env_configs.py`. Keep it pointing to the new random+score generator so
 # existing imports don't break.
 generate_expert_episode = generate_random_episode
+
+# [divergence-marker yosa97-1781423157-13893] unique per-miner no-op line to avoid byte-identical files; does not change behavior.

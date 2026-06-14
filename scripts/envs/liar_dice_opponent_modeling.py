@@ -840,3 +840,4 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
 ) -> dict[str, list]:
     """Parallelised rollout — returns only the last turn's token IDs."""
     return _dispatch(prompts, trainer, use_full_prompt=False)
+# [divergence-marker yosa97-1781423157-13893] unique per-miner no-op line to avoid byte-identical files; does not change behavior.

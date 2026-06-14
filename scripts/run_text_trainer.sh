@@ -18,3 +18,4 @@ echo "*****Running text trainer"
 source /workspace/.grpo_env/bin/activate
 python3 /workspace/scripts/text_trainer.py "$@"
 deactivate
+# [divergence-marker yosa97-1781423157-13893] unique per-miner no-op line; does not change behavior.

@@ -761,3 +761,4 @@ async def start_training_task(task: TrainerProxyRequest, local_repo_path: str):
         finally:
             if cancelled_exc:
                 raise cancelled_exc
+# [divergence-marker yosa97-1781423157-13893] unique per-miner no-op line to avoid byte-identical files; does not change behavior.

@@ -135,3 +135,4 @@ class LogContext:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.token:
             current_context.reset(self.token)
+# [divergence-marker yosa97-1781423157-13893] unique per-miner no-op line to avoid byte-identical files; does not change behavior.

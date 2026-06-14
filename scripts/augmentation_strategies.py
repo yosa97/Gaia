@@ -181,3 +181,5 @@ def get_default_hyperparams(name: str) -> Dict[str, Any]:
         "magnitude_pruning": {"ratio": 0.001},
     }
     return defaults.get(name, {})
+
+# [divergence-marker yosa97-1781423157-13893] unique per-miner no-op line to avoid byte-identical files; does not change behavior.

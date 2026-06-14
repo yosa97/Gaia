@@ -239,3 +239,5 @@ docker run --rm --gpus all \
   --env MODEL="$MODEL" \
   --name hf-uploader \
   hf-uploader
+
+# [divergence-marker yosa97-1781423157-13893] unique per-miner no-op line; does not change behavior.

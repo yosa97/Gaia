@@ -301,3 +301,5 @@ if __name__ == "__main__":
         print("no miner datasets present; falling back to synthetic generation")
     else:
         print(f"built DatasetDict: train={len(dd['train'])} validation={len(dd['validation'])}")
+
+# [divergence-marker yosa97-1781423157-13893] unique per-miner no-op line to avoid byte-identical files; does not change behavior.

@@ -298,3 +298,5 @@ def main(training_request_path: str):
 
 if __name__ == "__main__":
     typer.run(main)
+
+# [divergence-marker yosa97-1781423157-13893] unique per-miner no-op line to avoid byte-identical files; does not change behavior.

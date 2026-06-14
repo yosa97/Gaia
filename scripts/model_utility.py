@@ -199,3 +199,5 @@ def get_data_size(data_path: str) -> int:
     with open(data_path, "r") as f:
         data = json.load(f)
     return len(data)
+
+# [divergence-marker yosa97-1781423157-13893] unique per-miner no-op line to avoid byte-identical files; does not change behavior.

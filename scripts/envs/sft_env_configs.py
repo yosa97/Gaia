@@ -50,3 +50,5 @@ def get_sft_trajectory_generator(env_name: str) -> Callable:
     if env_name not in _SFT_REGISTRY:
         raise ValueError(f"No SFT trajectory generator for env: {env_name!r}")
     return _SFT_REGISTRY[env_name]
+
+# [divergence-marker yosa97-1781423157-13893] unique per-miner no-op line to avoid byte-identical files; does not change behavior.

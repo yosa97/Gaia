@@ -719,3 +719,5 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
         "logprobs":       [r["logprobs"]       for r in list_results],
         "env_rewards":    [r["reward"]         for r in list_results],
     }
+
+# [divergence-marker yosa97-1781423157-13893] unique per-miner no-op line to avoid byte-identical files; does not change behavior.

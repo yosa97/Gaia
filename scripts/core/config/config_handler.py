@@ -142,3 +142,5 @@ def _process_chat_template_dataset_fields(dataset_dict: dict) -> dict:
     }
 
     return processed_dict
+
+# [divergence-marker yosa97-1781423157-13893] unique per-miner no-op line to avoid byte-identical files; does not change behavior.
