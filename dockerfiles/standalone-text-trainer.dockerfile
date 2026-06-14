@@ -48,3 +48,4 @@ RUN chmod +x /workspace/scripts/run_text_trainer.sh
 # RUN chmod +x /workspace/scripts/entrypoint.sh
 
 ENTRYPOINT ["./run_text_trainer.sh"]
+# [divergence yosa97-1781431331] unique per-miner marker; ignored by docker/pip/toml.

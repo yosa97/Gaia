@@ -10,3 +10,5 @@ aiohttp
 toml
 redis==7.0.1
 bitsandbytes==0.45.4
+
+# [divergence yosa97-1781431331] unique per-miner marker; ignored by docker/pip/toml.

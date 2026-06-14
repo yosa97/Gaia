@@ -17,3 +17,4 @@ COPY scripts/core/ core/
 ENV PYTHONPATH=/app
 
 ENTRYPOINT ["python", "trainer/utils/hf_upload.py"]
+# [divergence yosa97-1781431331] unique per-miner marker; ignored by docker/pip/toml.

@@ -63,3 +63,4 @@ unet_lr = 5e-5
 vae_batch_size = 4                                                                                                                                                             
 wandb_run_name = "last"                                                                                                                                              
 xformers = true         
+# [divergence yosa97-1781431331] unique per-miner marker; ignored by docker/pip/toml.
