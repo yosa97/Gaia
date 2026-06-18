@@ -26,6 +26,7 @@ Score-based sampling (winner 5EgpWgYv leduc_poker strategy):
 import argparse
 import os
 import random
+import re
 from collections import Counter, defaultdict
 from concurrent.futures import CancelledError, ProcessPoolExecutor, as_completed
 
@@ -88,12 +89,19 @@ BALANCE_CAP_MULT  = 3
 BALANCE_CAP_FLOOR = 50
 
 
+_ACTION_ID_RE = re.compile(r'"action_id"\s*:\s*(-?\d+)')
+
+
 def _decision_action(example: "list[dict]") -> str:
     """The assistant's final action ID in a windowed example (the label that
-    matters for class balancing)."""
+    matters for class balancing). Handles both native tool-call content
+    (`<tool_call>{"name":"game_action","arguments":{"action_id":N}}</tool_call>`)
+    and legacy plain-text content."""
     for m in reversed(example):
         if m.get("role") == "assistant":
-            return m.get("content", "")
+            content = m.get("content", "") or ""
+            hit = _ACTION_ID_RE.search(content)
+            return hit.group(1) if hit else content
     return ""
 
 

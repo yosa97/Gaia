@@ -11,17 +11,26 @@ The eval no longer reads a plain-text action. Each turn it:
     (e.g. plain text) => InvalidActionForfeitError => the model LOSES the turn.
 
 So SFT must teach the model to emit a `game_action` tool call, not text. This
-module builds the new system/user prompts and the assistant tool-call message,
-and exposes the tool schema so the tokenizer's chat template renders the call.
+module builds the new system/user prompts and the assistant tool-call message.
 
 State/legal-action reconstruction reuses pvp_format's per-game reformatters
 (the agents' format_state output is unchanged); only the wrapper, the system
 template and the OUTPUT (tool call) differ.
 
-IMPORTANT: HF chat templates vary in how they expect assistant tool_calls
-(arguments as dict vs JSON string). This module emits arguments as a dict,
-which Qwen3 / most HF templates accept. VERIFY on the real tokenizer (see
-scripts/smoke_tool_format.py) before trusting the SFT output.
+DESIGN — content-based tool call (intentional, low-risk):
+The assistant turn carries the tool call as the model's NATIVE serialization in
+plain CONTENT — `<tool_call>\n{"name":"game_action","arguments":{"action_id":N}}\n</tool_call>` —
+NOT a structured `tool_calls` field. Reasons:
+  * The tournament base model is Qwen3-4B-Instruct-2507; SGLang serves it with
+    the 'qwen25' tool-call parser, which extracts exactly this <tool_call> JSON
+    block from generated text — so producing that text trains the model to do
+    precisely what the parser reads back.
+  * Because it is plain content, the existing tokenizer/assistant-masking and
+    the whole text pipeline (_clean / dedup / windowing / save) work UNCHANGED.
+    No reliance on how a given tokenizer renders a structured tool_calls field
+    (which could not be checked without the real tokenizer).
+GAME_ACTION_TOOL below mirrors the validator's tool schema for reference / the
+optional smoke test; the SFT pipeline itself does not need to pass it anywhere.
 """
 
 from __future__ import annotations
@@ -50,8 +59,8 @@ _TOOL_GUIDANCE = (
 GAME_ACTION_TOOL_NAME = "game_action"
 
 # Tool schema, shape-matched to core/pvp/tools.build_game_action_tool ->
-# FunctionSchema.to_openai(). Pass this to tokenizer.apply_chat_template(tools=...)
-# so the assistant tool call renders in the model's native format.
+# FunctionSchema.to_openai(). Reference only (mirrors what the validator passes
+# at eval); the content-based SFT pipeline does NOT pass this to the tokenizer.
 GAME_ACTION_TOOL = {
     "type": "function",
     "function": {
@@ -99,30 +108,42 @@ def build_user_prompt(state_desc: str, player_id: int, legal_actions_block: str)
     )
 
 
+import json as _json
+
+
 def assistant_action_message(action_id) -> dict:
     """Assistant turn that COMMITS the move via a game_action tool call.
 
-    arguments is a dict (action_id int). This is what apply_chat_template renders
-    into the model's native tool-call text at train time, and what SGLang parses
-    back at eval time.
+    We put the tool call in the assistant CONTENT as the model's NATIVE
+    serialization (Qwen / Hermes `<tool_call>{...}</tool_call>`), NOT in a
+    `tool_calls` field. Why:
+      * The tournament base model is Qwen3-4B-Instruct-2507; SGLang serves it
+        with the 'qwen25' tool-call parser, which extracts exactly this
+        <tool_call> JSON block from the generated text.
+      * Keeping it as plain content means the existing assistant-masking and the
+        whole text pipeline (_clean / dedup / windowing / save) work unchanged —
+        no dependency on how a tokenizer renders a structured `tool_calls` field
+        (which cannot be verified without the real tokenizer).
+    At eval, the model emits this same block, SGLang parses action_id -> a legal
+    move is committed instead of a forfeit.
     """
     try:
         aid = int(action_id)
     except (TypeError, ValueError):
         aid = action_id
+    payload = _json.dumps({"name": GAME_ACTION_TOOL_NAME, "arguments": {"action_id": aid}})
     return {
         "role": "assistant",
-        "content": "",
-        "tool_calls": [
-            {
-                "type": "function",
-                "function": {
-                    "name": GAME_ACTION_TOOL_NAME,
-                    "arguments": {"action_id": aid},
-                },
-            }
-        ],
+        "content": f"<tool_call>\n{payload}\n</tool_call>",
     }
+
+
+def extract_action_id(assistant_content: str):
+    """Pull the action_id back out of a native tool-call assistant content
+    (used by data-balancing). Returns str(action_id) or '' if not parseable."""
+    import re as _re
+    m = _re.search(r'"action_id"\s*:\s*(-?\d+)', assistant_content or "")
+    return m.group(1) if m else ""
 
 
 # ---------------------------------------------------------------------------

@@ -27,9 +27,10 @@ import re
 import requests
 
 from envs.leduc_poker_env import _format_observation
-from envs.pvp_format import (
+from envs.pvp_tool_format import (
     SYSTEM_PROMPT_LEDUC_POKER,
-    build_pvp_user_prompt_leduc_poker,
+    build_user_prompt_leduc_poker as build_pvp_user_prompt_leduc_poker,
+    assistant_action_message,
 )
 
 _TIMEOUT = 2400
@@ -107,7 +108,8 @@ def generate_random_episode(
         # Random action from RAW observation (legal action IDs are in both
         # raw and PvP-formatted observations — the IDs themselves are unchanged)
         action = _random_action(raw_observation, rng=rng)
-        messages.append({"role": "assistant", "content": action})
+        # SFT target = native game_action tool call (new eval).
+        messages.append(assistant_action_message(action))
 
         try:
             step_res = requests.post(

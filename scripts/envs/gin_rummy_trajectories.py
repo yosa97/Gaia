@@ -33,9 +33,10 @@ from typing import Optional
 import requests
 
 from envs.gin_rummy_env import extract_and_format_observation
-from envs.pvp_format import (
+from envs.pvp_tool_format import (
     SYSTEM_PROMPT_GIN_RUMMY,
-    build_pvp_user_prompt_gin_rummy,
+    build_user_prompt_gin_rummy as build_pvp_user_prompt_gin_rummy,
+    assistant_action_message,
 )
 
 _TIMEOUT = 2400
@@ -482,7 +483,8 @@ def generate_expert_episode(
     for _ in range(max_turn):
         # Expert reads RAW env observation (not PvP-reformatted)
         action = _get_expert_action_from_raw(_last_raw_obs)
-        messages.append({"role": "assistant", "content": action})
+        # SFT target = native game_action tool call (new eval).
+        messages.append(assistant_action_message(action))
 
         try:
             step_res = requests.post(

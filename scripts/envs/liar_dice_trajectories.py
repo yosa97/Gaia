@@ -21,9 +21,12 @@ import re
 import requests
 
 from envs.liar_dice_env import parse_game_state
-from envs.pvp_format import (
+# Tool-calling format (new eval, #1201): system/user prompts in the new format
+# and the assistant turn is a native game_action tool call (not plain text).
+from envs.pvp_tool_format import (
     SYSTEM_PROMPT_LIARS_DICE,
-    build_pvp_user_prompt_liars_dice,
+    build_user_prompt_liars_dice as build_pvp_user_prompt_liars_dice,
+    assistant_action_message,
 )
 
 _TIMEOUT = 2400
@@ -124,7 +127,9 @@ def generate_expert_episode(
 
     for _ in range(max_turn):
         action = get_expert_action(messages, rng=rng)
-        messages.append({"role": "assistant", "content": action})
+        # SFT target = native game_action tool call (new eval). The env server
+        # still receives the raw action id below.
+        messages.append(assistant_action_message(action))
 
         try:
             step_res = requests.post(

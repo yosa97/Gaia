@@ -43,24 +43,26 @@ def main(model_path: str) -> None:
     msgs = [
         {"role": "system", "content": SYSTEM_PROMPT_LIARS_DICE},
         {"role": "user", "content": user},
-        assistant_action_message(5),
+        assistant_action_message(5),  # content = native <tool_call> text
     ]
-    tools = [GAME_ACTION_TOOL]
 
-    print("=== 1) render full conversation with tools ===")
-    text = tok.apply_chat_template(msgs, tools=tools, tokenize=False, add_generation_prompt=False)
+    # CONTENT-BASED approach: the tool call lives in the assistant CONTENT as
+    # native <tool_call> text, so we tokenize EXACTLY like train_sft_env does —
+    # plain apply_chat_template, no tools= needed.
+    print("=== 1) render full conversation (plain, no tools=) ===")
+    text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
     print(text)
-    has_action = "5" in text and ("game_action" in text or "action_id" in text)
-    print(f"\n[check] tool call rendered (contains game_action/action_id + id): {has_action}")
+    has_action = "<tool_call>" in text and "game_action" in text and "5" in text
+    print(f"\n[check] <tool_call> game_action(action_id=5) present in rendered text: {has_action}")
 
-    print("\n=== 2) assistant masking (train_sft_env logic) ===")
-    ids = tok.apply_chat_template(msgs, tools=tools, tokenize=True, add_generation_prompt=False)
+    print("\n=== 2) assistant masking (train_sft_env logic, no tools=) ===")
+    ids = tok.apply_chat_template(msgs, tokenize=True, add_generation_prompt=False)
     mask = [0] * len(ids)
     for i, m in enumerate(msgs):
         if m["role"] != "assistant":
             continue
-        p = len(tok.apply_chat_template(msgs[:i], tools=tools, tokenize=True, add_generation_prompt=True))
-        r = len(tok.apply_chat_template(msgs[:i + 1], tools=tools, tokenize=True, add_generation_prompt=False))
+        p = len(tok.apply_chat_template(msgs[:i], tokenize=True, add_generation_prompt=True))
+        r = len(tok.apply_chat_template(msgs[:i + 1], tokenize=True, add_generation_prompt=False))
         p = max(0, min(p, len(ids)))
         r = max(0, min(r, len(ids)))
         for j in range(p, r):
