@@ -14,6 +14,12 @@ from envs.shared_env import (
     init_env_pool,
     rollout_reward_func,  # re-exported for callers
 )
+from envs.pvp_tool_format import (
+    MINER_SEED,
+    TOOL_GUIDANCE,
+    assistant_action_message,
+    extract_action_id as _pvp_extract_action_id,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -28,6 +34,13 @@ _TIMEOUT = 2400
 # Reward shaping parameters (full-prompt variant)
 _STRATEGY_REWARD_WEIGHT = 0.5
 _STEP_STRATEGY_REWARD   = 0.1
+
+# Proportional-commitment shaping: a graded, bounded complement to the binary
+# bid==prize adherence rule. It credits bids whose value tracks the prize value
+# with a smooth falloff (threshold-bidding intuition, Ross 1971), giving the
+# policy a continuous gradient instead of an all-or-nothing signal. Live,
+# additive training delta — never overrides the adherence/terminal reward.
+_PROPORTIONAL_BID_WEIGHT = 0.10
 
 # Reward parameters (last-prompt variant)
 _STRATEGY_REWARD = 1.0
@@ -62,7 +75,7 @@ def extract_and_format_observation(obs_text: str) -> str:
         state_text
         + "\n\nYou are Player " + str(player_id) + ".\nLegal Actions:\n"
         + "\n".join(legal_actions)
-        + "\n\nYour choice (ID only):"
+        + "\n\nChoose one legal action by calling the game_action tool with its action_id."
     )
 
 
@@ -113,9 +126,7 @@ _BASE_SYSTEM_PROMPT = (
     "3. Highest bidder wins the prize card (adds its value to score)\n"
     "4. If bids tie, prize card is discarded (no one gets points)\n\n"
     "Winning: Player with most points after all rounds wins.\n\n\n"
-    "# Output Format\nYou must respond with ONLY the action ID (a single number).\n"
-    "Do NOT include descriptions or explanations.\n\n"
-    'Examples:\n- For action "0 -> roll": respond "0"\n- For action "89 -> a3": respond "89"'
+    + TOOL_GUIDANCE
 )
 
 _HINT_PROMPT_LAST = (
@@ -160,7 +171,7 @@ def _ensure_initialized(trainer) -> None:
 
     reset_payload = {
         "task_id": GAMES_TO_TASK_ID_RANGE[_SELECTED_GAME][0],
-        "seed": 42,
+        "seed": MINER_SEED,
         "opponent": "mcts",
     }
     rank, env_pool, num_servers, thread_pool, generation_semaphore = init_env_pool(reset_payload)
@@ -221,7 +232,7 @@ def _run_episode_last(
     try:
         reset_res = requests.post(
             f"{env_endpoint}/reset",
-            json={"task_id": game_id, "seed": 42, "opponent": "mcts"},
+            json={"task_id": game_id, "seed": MINER_SEED, "opponent": "mcts"},
             timeout=_TIMEOUT,
         )
         reset_res.raise_for_status()
@@ -244,7 +255,7 @@ def _run_episode_last(
             break
         prize_card = extract_prize_card(formatted_observation)
         action_id  = prize_card - 1
-        messages.append({"role": "assistant", "content": str(action_id)})
+        messages.append(assistant_action_message(action_id))
         try:
             step_res = requests.post(
                 f"{env_endpoint}/step",
@@ -278,11 +289,7 @@ def _run_episode_last(
 
     messages.append({"role": "assistant", "content": completion_text})
 
-    action_to_send = remove_reasoning_tags(completion_text)
-    if action_to_send.endswith("</s>"):
-        action_to_send = action_to_send[:-4]
-    if "Action:" in action_to_send:
-        action_to_send = action_to_send.split("Action:")[-1].strip()
+    action_to_send = _pvp_extract_action_id(completion_text)
 
     bid_card = extract_bid_from_action(action_to_send, formatted_observation)
     strategy_followed = bid_card is not None and prize_card is not None and bid_card == prize_card
@@ -361,7 +368,7 @@ def _run_episode_full(
     try:
         reset_res = requests.post(
             f"{env_endpoint}/reset",
-            json={"task_id": game_id, "seed": 42, "opponent": "mcts"},
+            json={"task_id": game_id, "seed": MINER_SEED, "opponent": "mcts"},
             timeout=_TIMEOUT,
         )
         reset_res.raise_for_status()
@@ -422,12 +429,8 @@ def _run_episode_full(
 
         messages.append({"role": "assistant", "content": completion_text})
 
-        # --- Parse action ---
-        action_to_send = completion_text
-        if action_to_send.endswith("</s>"):
-            action_to_send = action_to_send[:-4]
-        if "Action:" in action_to_send:
-            action_to_send = action_to_send.split("Action:")[-1].strip()
+        # --- Parse action (tool call preferred, legacy text as fallback) ---
+        action_to_send = _pvp_extract_action_id(completion_text)
 
         # --- Strategy adherence check ---
         bid_card = extract_bid_from_action(action_to_send, formatted_observation)
@@ -443,6 +446,14 @@ def _run_episode_full(
             total_strategy_opportunities += 1
             all_steps_correct = False
             step_rewards.append(0.0)
+
+        # Graded proportional-commitment bonus: smoothly reward bidding in
+        # proportion to the prize's value, complementing the binary adherence
+        # signal above. Bounded by _PROPORTIONAL_BID_WEIGHT and additive.
+        if bid_card is not None and prize_card is not None and prize_card > 0:
+            proximity = 1.0 - abs(bid_card - prize_card) / max(prize_card, 1)
+            if proximity > 0.0:
+                step_rewards.append(_PROPORTIONAL_BID_WEIGHT * proximity)
 
         # --- Step environment ---
         try:
@@ -525,7 +536,7 @@ def rollout_first_prompt_and_completion(
         base_url = server_list[rank % len(server_list)] if server_list else ""
         rollout_first_prompt_and_completion.base_url = base_url
         try:
-            payload = {"task_id": GAMES_TO_TASK_ID_RANGE[_SELECTED_GAME][0], "seed": 42, "opponent": "mcts"}
+            payload = {"task_id": GAMES_TO_TASK_ID_RANGE[_SELECTED_GAME][0], "seed": MINER_SEED, "opponent": "mcts"}
             requests.post(f"{base_url}/reset", json=payload, timeout=300).raise_for_status()
             rollout_first_prompt_and_completion.initialized = True
         except Exception as exc:
@@ -549,14 +560,18 @@ def rollout_first_prompt_and_completion(
         try:
             reset_res = requests.post(
                 f"{env_endpoint}/reset",
-                json={"task_id": game_id, "seed": 42, "opponent": "mcts"},
+                json={"task_id": game_id, "seed": MINER_SEED, "opponent": "mcts"},
                 timeout=TIMEOUT,
             )
             reset_res.raise_for_status()
             result_block = reset_res.json()["result"]
             episode_id = result_block.get("episode_id", "")
             current_observation = result_block.get("observation", "")
-            current_observation += 'Your output must strictly follow this format: "Thought:\nyour thoughts ONLY in text.\n\nAction:\nONLY your action ID (a single number)."'
+            current_observation += (
+                "\n\nRespond by calling the game_action tool with the action_id of a "
+                'legal action, as a native tool call:\n<tool_call>\n'
+                '{"name": "game_action", "arguments": {"action_id": N}}\n</tool_call>'
+            )
         except Exception as exc:
             print(f"Failed to reset environment (Game {game_id}): {exc}")
             continue
@@ -577,11 +592,7 @@ def rollout_first_prompt_and_completion(
 
             messages.append({"role": "assistant", "content": completion_text})
 
-            action_to_send = completion_text
-            if action_to_send.endswith("</s>"):
-                action_to_send = action_to_send[:-4]
-            if "Action:" in action_to_send:
-                action_to_send = action_to_send.split("Action:")[-1].strip()
+            action_to_send = _pvp_extract_action_id(completion_text)
 
             try:
                 step_res = requests.post(

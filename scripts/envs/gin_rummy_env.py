@@ -17,6 +17,10 @@ from envs.shared_env import (
     init_env_pool,
     rollout_reward_func,  # re-exported for callers
 )
+from envs.pvp_tool_format import (
+    TOOL_GUIDANCE,
+    extract_action_id as _pvp_extract_action_id,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -26,8 +30,6 @@ from envs.shared_env import (
 _SELECTED_GAME = "gin_rummy"
 _MAX_EPISODE_TOKENS = 16384
 _MAX_PROMPT_LEN = 5000
-_MAX_INPUT_CHARS = 28000  # COMMIT #5: Increased from 22k for longer observations
-_FINAL_MAX_TURN = 12  # COMMIT #5: Increased from 8 for harder curriculum (fix Finished:0/8)
 _TIMEOUT = 2400
 
 CARD_VALUES = {
@@ -201,43 +203,27 @@ def parse_discard_pile(observation: str) -> list[str]:
     return [pile_str[i:i+2] for i in range(0, len(pile_str), 2)]
 
 
-def parse_game_state(observation: str) -> "GameState | None":
-    """
-    Parse Gin Rummy game state from observation string.
-    Returns None if observation cannot be parsed (Finding #1).
-    """
-    try:
-        if not observation or ('Invalid' in observation and 'Legal Actions:' not in observation):
-            return None
-
-        player_match = re.search(r'You are Player (\d+)', observation)
-        if not player_match:
-            return None
-
-        player_id = int(player_match.group(1))
-        hand = parse_hand_from_observation(observation)
-        if not hand:
-            return None  # No valid hand found
-
-        dw_match = re.search(r'Deadwood=(\d+)', observation)
-        deadwood = int(dw_match.group(1)) if dw_match else 0
-        phase_match = re.search(r'Phase: (\w+)', observation)
-        phase = phase_match.group(1) if phase_match else 'Draw'
-        knock_match = re.search(r'Knock card: (\d+)', observation)
-        knock_card = int(knock_match.group(1)) if knock_match else 10
-        upcard_match = re.search(r'Stock size: \d+\s+Upcard: (\w+)', observation)
-        upcard = upcard_match.group(1) if upcard_match else 'XX'
-        stock_match = re.search(r'Stock size: (\d+)', observation)
-        stock_size = int(stock_match.group(1)) if stock_match else 0
-
-        return GameState(
-            hand=hand, deadwood=deadwood, phase=phase, knock_card=knock_card,
-            upcard=upcard, stock_size=stock_size,
-            discard_pile=parse_discard_pile(observation), player_id=player_id,
-        )
-    except Exception as e:
-        print(f"Warning: Failed to parse gin_rummy game state: {e}")
-        return None
+def parse_game_state(observation: str) -> GameState:
+    if 'Invalid' in observation and 'Legal Actions:' not in observation:
+        raise ValueError("Invalid action response — not a game state")
+    player_match = re.search(r'You are Player (\d+)', observation)
+    player_id = int(player_match.group(1)) if player_match else 0
+    hand = parse_hand_from_observation(observation)
+    dw_match = re.search(r'Deadwood=(\d+)', observation)
+    deadwood = int(dw_match.group(1)) if dw_match else 0
+    phase_match = re.search(r'Phase: (\w+)', observation)
+    phase = phase_match.group(1) if phase_match else 'Draw'
+    knock_match = re.search(r'Knock card: (\d+)', observation)
+    knock_card = int(knock_match.group(1)) if knock_match else 10
+    upcard_match = re.search(r'Stock size: \d+\s+Upcard: (\w+)', observation)
+    upcard = upcard_match.group(1) if upcard_match else 'XX'
+    stock_match = re.search(r'Stock size: (\d+)', observation)
+    stock_size = int(stock_match.group(1)) if stock_match else 0
+    return GameState(
+        hand=hand, deadwood=deadwood, phase=phase, knock_card=knock_card,
+        upcard=upcard, stock_size=stock_size,
+        discard_pile=parse_discard_pile(observation), player_id=player_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -378,11 +364,9 @@ _SYSTEM_PROMPT = (
     "5. Knock: declare end when deadwood \u2264 knock_card\n\n"
     "KNOCKING:\n- Gin: 0 deadwood = 25-point bonus\n\n"
     "SCORING: Winner scores difference in deadwood.\n"
-    "Card Values: A=1, 2-9=face value, T/J/Q/K=10\n\n"
-    "IMPORTANT: Always respond with the action ID number ONLY.\n\n"
-    "# Output Format\nYou must respond with ONLY the action ID (a single number).\n"
-    "Do NOT include descriptions or explanations.\n\n"
-    'Examples:\n- For action "0 -> roll": respond "0"\n- For action "89 -> a3": respond "89"'
+    "Card Values: A=1, 2-10=face value, J=11, Q=12, K=13\n\n"
+    "IMPORTANT: Choose ONLY from the listed Legal Actions, identified by their action_id.\n\n"
+    + TOOL_GUIDANCE
 )
 
 _HINT_PROMPT = (
@@ -446,13 +430,7 @@ def _run_episode(
         episode_id = result_block.get("episode_id", "")
         raw_observation = result_block.get("observation", "")
         formatted_observation = extract_and_format_observation(raw_observation)
-
-        # Handle None from parse_game_state (Finding #1 safety)
-        initial_state = parse_game_state(formatted_observation)
-        if initial_state is None:
-            print(f"Failed to parse initial game state (Game {game_id})")
-            return index, None
-        game_state_history.append(initial_state)
+        game_state_history.append(parse_game_state(formatted_observation))
     except Exception as exc:
         print(f"Failed to reset environment (Game {game_id}): {exc}")
         return index, None
@@ -506,12 +484,8 @@ def _run_episode(
 
         messages.append({"role": "assistant", "content": completion_text})
 
-        # --- Parse action ---
-        action_to_send = remove_reasoning_tags(completion_text)
-        if action_to_send.endswith("</s>"):
-            action_to_send = action_to_send[:-4]
-        if "Action:" in action_to_send:
-            action_to_send = action_to_send.split("Action:")[-1].strip()
+        # --- Parse action (tool call preferred, legacy text as fallback) ---
+        action_to_send = _pvp_extract_action_id(completion_text)
 
         # --- Step environment ---
         is_invalid = False
@@ -544,11 +518,10 @@ def _run_episode(
 
         # --- Reward calculation ---
         if not is_invalid and not done:
-            game_state = parse_game_state(formatted_observation)
-
-            # Handle None from parse_game_state (Finding #1 safety)
-            if game_state is None:
-                print(f"Warning: Failed to parse game state at turn {turn_number}")
+            try:
+                game_state = parse_game_state(formatted_observation)
+            except Exception as exc:
+                print(f"Failed to parse game state: {exc}")
                 immediate_reward = -10.0
             else:
                 game_state_history.append(game_state)
@@ -664,5 +637,3 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
 ) -> dict[str, list]:
     """Parallelised rollout — returns only the last turn's token IDs."""
     return _dispatch(prompts, trainer, use_full_prompt=False)
-
-# [divergence-marker yosa97-1781423157-13893] unique per-miner no-op line to avoid byte-identical files; does not change behavior.

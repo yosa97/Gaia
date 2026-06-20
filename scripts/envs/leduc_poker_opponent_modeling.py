@@ -37,6 +37,11 @@ from envs.shared_env import (
     remove_reasoning_tags,
     rollout_reward_func,  # re-exported
 )
+from envs.pvp_tool_format import (
+    MINER_SEED,
+    TOOL_GUIDANCE,
+    extract_action_id as _pvp_extract_action_id,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -101,12 +106,7 @@ _BASE_SYSTEM_PROMPT = (
     "Round 2: One public card is revealed. Same actions, but Raise adds 4 chips.\n\n"
     "Winning: Player with best hand wins pot (or last remaining if others fold).\n"
     "Hand ranking (high to low): Pair (private + public match) > High card value (K > Q > J).\n\n\n\n"
-    "# Output Format\n"
-    "You must respond with ONLY the action ID (a single number).\n"
-    "Do NOT include descriptions or explanations.\n\n"
-    "Examples:\n"
-    '- For action "0 -> Fold": respond "0"\n'
-    '- For action "2 -> Raise": respond "2"'
+    + TOOL_GUIDANCE
 )
 
 _HINT_PROMPT = (
@@ -240,7 +240,8 @@ def _format_observation(raw: str) -> str:
     actions_block = body[legal_start:]
     actions_block = re.sub(r"^  (\d+)", r"\1", actions_block, flags=re.MULTILINE)
     actions_block = actions_block.replace(
-        "Your choice (action ID only):", "Your choice (ID only):"
+        "Your choice (action ID only):",
+        "Choose one legal action by calling the game_action tool with its action_id:",
     )
     parts = [state_block]
     if player_line:
@@ -250,12 +251,9 @@ def _format_observation(raw: str) -> str:
 
 
 def _parse_action(completion_text: str) -> str:
-    action = remove_reasoning_tags(completion_text).strip()
-    if action.endswith("</s>"):
-        action = action[:-4].strip()
-    if "Action:" in action:
-        action = action.split("Action:")[-1].strip()
-    return action
+    # Tool call preferred (matches the evaluator); the shared parser also
+    # handles the legacy "Action: N" / trailing-integer forms as a fallback.
+    return _pvp_extract_action_id(completion_text)
 
 
 # ---------------------------------------------------------------------------
@@ -737,7 +735,7 @@ def _ensure_initialized(trainer) -> None:
 
     reset_payload = {
         "task_id": GAMES_TO_TASK_ID_RANGE[_SELECTED_GAME][0],
-        "seed": 42,
+        "seed": MINER_SEED,
         "opponent": "mcts",
         "mcts_max_simulations": 50,
         "mcts_num_rollouts": 1,

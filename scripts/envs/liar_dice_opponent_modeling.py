@@ -16,6 +16,11 @@ from envs.shared_env import (
     init_env_pool,
     rollout_reward_func,  # re-exported for callers  # noqa: F401
 )
+from envs.pvp_tool_format import (
+    MINER_SEED,
+    TOOL_GUIDANCE,
+    extract_action_id as _pvp_extract_action_id,
+)
 
 
 # CONSTANTS FOR LIAR'S DICE
@@ -40,6 +45,16 @@ BAYES_GOOD_CALL_BONUS   =  0.20  # call liar when Bayesian says bid unlikely (P<
 BAYES_BAD_CALL_PENALTY  = -0.25  # call liar when Bayesian says bid plausible (P>70%)
 BAYES_GOOD_BID_BONUS    =  0.05  # bid well-supported by Bayesian estimate
 BAYES_OVERREACH_PENALTY = -0.05  # bid far exceeding Bayesian estimate (+2 over expected)
+
+# Information-gain shaping (Bayesian experimental design, Lindley 1956): as the
+# posterior over the opponent's hidden dice sharpens, credit decisive actions
+# that exploit that information. Expected-information-gain is a principled,
+# policy-relevant signal distinct from the static support/probability bonuses
+# above. Kept bounded and additive so it supplements — never overrides — the
+# base score and terminal reward.
+INFO_GAIN_WEIGHT    = 0.08   # scale on normalised posterior concentration in [0,1]
+INFO_GAIN_MAX_BONUS = 0.15   # hard cap on the per-step info-gain bonus
+INFO_GAIN_MIN_PROB  = 0.50   # only credit bids the model already deems >=50% likely
 
 
 # GAME STATE AND PROBABILITY HELPERS FOR LIAR'S DICE
@@ -200,6 +215,37 @@ class BayesianOpponentInference:
         decay = min(self._bids_observed / 5.0, 1.0)
         return max(0.08, base * (1.0 - 0.25 * decay))
 
+    def posterior_entropy(self) -> float:
+        """Shannon entropy (nats) of the current posterior over opponent rolls.
+
+        The posterior ``self._log_probs`` is kept normalised by :meth:`update`,
+        so H = -Σ p·log p is a valid uncertainty measure of how much we still do
+        not know about the opponent's hidden dice.
+        """
+        h = 0.0
+        for lp in self._log_probs:
+            if lp > -math.inf:
+                p = math.exp(lp)
+                if p > 0.0:
+                    h -= p * lp
+        return h
+
+    def normalized_information(self) -> float:
+        """Posterior concentration in [0, 1].
+
+        0.0 = uniform posterior (no information about the opponent yet),
+        1.0 = a single roll is certain. Defined as ``1 - H/H_uniform`` so the
+        scale is independent of the number of enumerated rolls and safe to use
+        as a bounded reward multiplier.
+        """
+        n = len(self._log_probs)
+        if n <= 1:
+            return 0.0
+        h_uniform = math.log(n)
+        if h_uniform <= 0.0:
+            return 0.0
+        return max(0.0, min(1.0, 1.0 - self.posterior_entropy() / h_uniform))
+
     def update(self, bid: "Bid", own_support: int, total_dice: int = 10) -> None:
         """Update posterior given opponent's bid and our own support for that face."""
         self._bids_observed += 1
@@ -325,6 +371,20 @@ class RewardCalculator:
                     elif action.bid.quantity > total_expected + 2.0:
                         reward += BAYES_OVERREACH_PENALTY   # bid far exceeds estimate
 
+                # Information-gain shaping (Lindley 1956): once the posterior over
+                # the opponent's dice has sharpened (more bids observed → lower
+                # entropy → higher normalised information), credit decisive plays
+                # that exploit that information — a liar call, or a bid the model
+                # itself rates >= INFO_GAIN_MIN_PROB likely. Bounded by
+                # INFO_GAIN_MAX_BONUS so it never dominates the score/terminal
+                # signal. This is a live training delta, not a scalar tweak.
+                info = bayes.normalized_information()
+                if info > 0.0 and (
+                    action.is_liar
+                    or (action.bid is not None and action.prob >= INFO_GAIN_MIN_PROB)
+                ):
+                    reward += min(INFO_GAIN_MAX_BONUS, INFO_GAIN_WEIGHT * info)
+
         if env_reward != 0.0:
             reward += env_reward * self.terminal_weight  # ×terminal_weight terminal scale
 
@@ -375,7 +435,7 @@ def _ensure_initialized(trainer) -> None:
 
     reset_payload = {
         "task_id": GAMES_TO_TASK_ID_RANGE[_SELECTED_GAME][0],
-        "seed": 42,
+        "seed": MINER_SEED,
         "opponent": "mcts",
         "mcts_max_simulations": 225,  # fixed 225 sims for LD (larger game tree)
         "mcts_num_rollouts": 1,
@@ -511,9 +571,7 @@ def _run_episode(
         '- When counting dice for a bid, include 6s in the count\n'
         '- Example: Bid "3 fours" means at least 3 dice showing EITHER 4 OR 6\n\n'
         'Winning: If you call Liar and previous bid was false, opponent loses. If bid was true or exact, you lose.\n\n\n\n'
-        '# Output Format\nYou must respond with ONLY the action ID (a single number).\n'
-        'Do NOT include descriptions or explanations.\n\n'
-        'Examples:\n- For action "0 -> roll": respond "0"\n- For action "89 -> a3": respond "89"'
+        + TOOL_GUIDANCE
     )
     if use_hints:
         system_prompt += (
@@ -586,12 +644,8 @@ def _run_episode(
 
         messages.append({"role": "assistant", "content": completion_text})
 
-        # --- Parse action ---
-        action_to_send = completion_text
-        if action_to_send.endswith("</s>"):
-            action_to_send = action_to_send[:-4]
-        if "Action:" in action_to_send:
-            action_to_send = action_to_send.split("Action:")[-1].strip()
+        # --- Parse action (tool call preferred, legacy text as fallback) ---
+        action_to_send = _pvp_extract_action_id(completion_text)
 
         # --- Step environment ---
         is_invalid = False

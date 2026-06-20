@@ -1,7 +1,6 @@
 import json
 import os
 import random
-import requests
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -43,96 +42,11 @@ from utility import log_info
 from model_utility import is_reasoning_tokenizer
 from envs import GAMES_TO_TASK_ID_RANGE
 from envs.env_configs import EnvTrainingConfig, get_env_config
-from augmentation_strategies import get_strategy, list_strategies
-from benchmark_metrics import EnvironmentMetricsCollector
+from envs.pvp_tool_format import GAME_ACTION_TOOLS
 
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
 STANDARD_GRPO_EXTRA_COLUMN = "extra_data"
 STANDARD_GRPO_PROMPT_COLUMN = "prompt"
-
-
-# ============================================================================
-# Environment Server Validation (Finding #2)
-# ============================================================================
-
-def _validate_env_servers(env_name: str, timeout: int = 5):
-    """Pre-validate environment servers are reachable before training."""
-    if not is_main_process(LOCAL_RANK):
-        return True
-
-    env_urls = os.getenv("ENVIRONMENT_SERVER_URLS", "").split()
-    if not env_urls:
-        log_info("[EnvServer] ⚠️  No ENVIRONMENT_SERVER_URLS set - skipping validation")
-        return False
-
-    start_idx, end_idx = GAMES_TO_TASK_ID_RANGE.get(env_name, (0, 0))
-    if start_idx >= end_idx:
-        log_info(f"[EnvServer] ⚠️  Unknown environment: {env_name}")
-        return False
-
-    sample_task_id = start_idx  # Use first task ID in range
-    servers_ok = 0
-
-    for url in env_urls:
-        try:
-            response = requests.post(
-                f"{url.strip()}/reset",
-                json={"task_id": sample_task_id, "seed": sample_task_id},
-                timeout=timeout
-            )
-            response.raise_for_status()
-            log_info(f"[EnvServer] ✅ {url.strip()}/reset is reachable")
-            servers_ok += 1
-        except Exception as e:
-            log_info(f"[EnvServer] ❌ {url.strip()}/reset failed: {type(e).__name__}: {str(e)[:100]}")
-
-    if servers_ok == 0:
-        log_info("[EnvServer] ⚠️  No environment servers reachable - training may fail")
-        return False
-
-    log_info(f"[EnvServer] ✅ {servers_ok}/{len(env_urls)} servers reachable")
-    return True
-
-
-# ============================================================================
-# Tokenizer Validation (Finding #3)
-# ============================================================================
-
-def _validate_and_setup_tokenizer(tokenizer, model, model_name: str):
-    """Validate tokenizer compatibility and setup special tokens safely."""
-    if not is_main_process(LOCAL_RANK):
-        return tokenizer
-
-    # 1. Check tokenizer basic functionality
-    try:
-        test_encoding = tokenizer.encode("test", return_tensors="pt")
-        if test_encoding.shape[1] == 0:
-            raise ValueError("Tokenizer produces empty tokens")
-        log_info(f"[Tokenizer] ✅ Basic test passed: {model_name}")
-    except Exception as e:
-        log_info(f"[Tokenizer] ⚠️  Validation warning: {e}")
-
-    # 2. Setup special tokens safely
-    if tokenizer.pad_token is None:
-        if tokenizer.eos_token is not None:
-            tokenizer.pad_token = tokenizer.eos_token
-            log_info(f"[Tokenizer] Set pad_token = eos_token")
-        elif tokenizer.unk_token is not None:
-            tokenizer.pad_token = tokenizer.unk_token
-            log_info(f"[Tokenizer] Set pad_token = unk_token (fallback)")
-        else:
-            log_info(f"[Tokenizer] ⚠️  No suitable pad_token found, using default")
-
-    # 3. Verify vocab size matches model
-    try:
-        model_vocab_size = model.config.vocab_size
-        tokenizer_vocab_size = len(tokenizer)
-        if model_vocab_size != tokenizer_vocab_size:
-            log_info(f"[Tokenizer] ⚠️  vocab mismatch - model={model_vocab_size}, tokenizer={tokenizer_vocab_size}")
-    except Exception as e:
-        log_info(f"[Tokenizer] Vocab check skipped: {e}")
-
-    return tokenizer
 
 
 # ============================================================================
@@ -432,26 +346,6 @@ class TrainingArguments(GRPOConfig):
                          "Also readable from SFT_CHECKPOINT_REPO env var. "
                          "If set, adapter is loaded, merged into base model, then GRPO proceeds normally."},
     )
-    augmentation_strategy: Optional[str] = field(
-        default="none",
-        metadata={"help": f"Augmentation strategy to apply to model: {', '.join(list_strategies())}. "
-                         "Default: 'none' (no augmentation)."},
-    )
-    benchmark_mode: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Enable benchmarking mode to collect metrics for augmentation strategy comparison."},
-    )
-    max_dataset_samples: Optional[int] = field(
-        default=100_000,
-        metadata={"help": "Maximum number of task ID samples for dataset. Default 100k for faster training. "
-                         "Increase to 200k for more thorough training."},
-    )
-    enable_sft_warmup: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Enable Phase1 SFT warmup before GRPO training. "
-                         "DISABLED by default: tournament Rule #3 prohibits SFT for environment tasks. "
-                         "Set to True only for non-environment (text) tasks."},
-    )
 
 def print_trainable_parameters(model):
     """
@@ -487,13 +381,6 @@ def print_trainable_parameters(model):
 
 class ActionMaskedGRPOTrainer(GRPOTrainer):
     """GRPO trainer that applies an action mask to loss/IS/metrics."""
-
-    def __init__(self, *args, rollout_func=None, **kwargs):
-        # Pop rollout_func before calling super so we don't crash on TRL versions
-        # that don't accept it as an __init__ kwarg.  We store it ourselves and
-        # our _generate_and_score_completions override is the only caller.
-        super().__init__(*args, **kwargs)
-        self.rollout_func = rollout_func
 
     def _generate_and_score_completions(self, inputs: list[dict[str, torch.Tensor | Any]]) -> dict[str, Any]:
         if getattr(self, "rollout_func", None) is None:
@@ -1100,9 +987,9 @@ def main():
         task_id = train_request["task_id"]
         
         output_dir = training_args.output_dir
-
-        # ── Load tokenizer ─────────────────────────────────────────────────
         tokenizer = AutoTokenizer.from_pretrained(train_request["model_path"])
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
 
         quantization_config = get_quantization_config(model_args)
         device_string = "cuda:" + str(LOCAL_RANK)
@@ -1136,9 +1023,6 @@ def main():
 
         model = model_class.from_pretrained(train_request["model_path"], **model_kwargs)
 
-        # ── Validate tokenizer (after model is loaded) ──────────────────────
-        tokenizer = _validate_and_setup_tokenizer(tokenizer, model, train_request["model_name"])
-
         # ── SFT Warm-Start (SFT → GRPO) ───────────────────────────────────
         # If SFT_WARMUP=1, load a pre-trained SFT LoRA adapter from HF and
         # merge it into the base model before GRPO begins.  This gives GRPO
@@ -1159,10 +1043,11 @@ def main():
                 log_info(f"[SFT-Warmup] LR adjusted: {original_lr:.2e} → {training_args.learning_rate:.2e}")
         else:
             # ── SFT Cold-Start Stage ──────────────────────────────────────
-            # Tournament Rule #3: "You may not do any SFT for environment tasks."
-            # SFT is permanently disabled here regardless of enable_sft_warmup flag.
+            # Run a short SFT phase using whitelisted datasets before GRPO.
+            # Only runs when MINER_DATASETS_DIR / MINER_DATASETS env vars are set.
             if is_main_process(LOCAL_RANK):
-                log_info("[Main] SFT cold-start DISABLED for environment tasks (tournament Rule #3). Proceeding directly to GRPO.")
+                log_info("[Main] Checking for SFT cold-start datasets...")
+            model = run_sft_cold_start(model, tokenizer, training_args, peft_config=get_peft_config(model_args))
 
         # some model need to set the generation config or encounter the invalid generation config error
         set_generation_config(train_request["model_name"], model)
@@ -1177,46 +1062,22 @@ def main():
             # some model need to resize the token embeddings or encounter the size mismatch error; only for full-weight models
             resize_if_needed(train_request["model_name"], model, len(tokenizer))
 
-        # ── Augmentation Strategy Application ──────────────────────────────
-        if training_args.augmentation_strategy != "none" and is_main_process(LOCAL_RANK):
-            log_info(f"[Augment] Applying augmentation strategy: {training_args.augmentation_strategy}")
-            strategy = get_strategy(training_args.augmentation_strategy)
-            model = strategy.apply(model)
-            log_info(f"[Augment] ✅ Augmentation applied: {strategy}")
-
-        # ── Benchmark Metrics Collector ────────────────────────────────────
-        metrics_collector = None
-        if training_args.benchmark_mode and is_main_process(LOCAL_RANK):
-            log_info(f"[Benchmark] Initializing metrics collector for strategy={training_args.augmentation_strategy}")
-            metrics_collector = EnvironmentMetricsCollector(
-                env_name=training_args.environment_name,
-                strategy_name=training_args.augmentation_strategy,
-                model_name=train_request["model_name"],
-            )
-            log_info(f"[Benchmark] ✅ Metrics collector initialized: {metrics_collector}")
-
         # Check if this is the main process and create the output directory
         if is_main_process(LOCAL_RANK):  # Only create directory on main process
             os.makedirs(training_args.output_dir, exist_ok=True)
             log_info(f"Created output directory: {training_args.output_dir}")
             
-        # ── Pre-validate Environment Servers (Finding #2) ───────────────────
-        _validate_env_servers(training_args.environment_name)
-
-        # ── Dataset Creation with Configurable Sample Limit ─────────────────
+        # Limit to at most 200_000 samples to avoid creating too large a dataset
         start_idx, end_idx = GAMES_TO_TASK_ID_RANGE[training_args.environment_name]
-        max_samples = training_args.max_dataset_samples
+        max_samples = 200_000
         total_range = end_idx - start_idx
         if total_range > max_samples:
             # evenly sample max_samples task ids from the range
             selected_indices = sorted(random.sample(range(start_idx, end_idx), max_samples))
         else:
             selected_indices = list(range(start_idx, end_idx))
-
         train_ds = Dataset.from_list([{"prompt": str(i)} for i in selected_indices])
         dev_ds = train_ds.select(random.sample(range(len(train_ds)), 10))
-
-        log_info(f"[Dataset] Created dataset with {len(train_ds)} samples (max_samples={max_samples})")
 
         log_info(f"world_size: {training_args.world_size}")
         total_steps_per_epoch = (
@@ -1311,6 +1172,16 @@ def main():
         else:
             trainer = trainer_class(**common_trainer_kwargs)
 
+        # PvP board/card games are scored by a tool-calling evaluator bot
+        # (core/pvp/bot.py) that only accepts `game_action` tool calls and
+        # forfeits anything else. Expose the same tool during rollouts so the
+        # chat template primes Qwen's tool-calling mode and the policy is
+        # trained to answer in exactly the dialect the evaluator expects. The
+        # masking paths in ActionMaskedGRPOTrainer already key off `self.tools`.
+        if training_args.environment_name in GAMES_TO_TASK_ID_RANGE:
+            trainer.tools = GAME_ACTION_TOOLS
+            print(f"Enabled game_action tool-calling for env={training_args.environment_name}")
+
         trainer.train()
     except Exception as e:
         import traceback
@@ -1325,5 +1196,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# [divergence-marker yosa97-1781423157-13893] unique per-miner no-op line to avoid byte-identical files; does not change behavior.

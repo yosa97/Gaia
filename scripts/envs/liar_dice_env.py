@@ -17,6 +17,10 @@ from envs.shared_env import (
     init_env_pool,
     rollout_reward_func,  # re-exported for callers
 )
+from envs.pvp_tool_format import (
+    TOOL_GUIDANCE,
+    extract_action_id as _pvp_extract_action_id,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -377,10 +381,7 @@ def _run_episode(
         '- When counting dice for a bid, include 6s in the count\n'
         '- Example: Bid "3 fours" means at least 3 dice showing EITHER 4 OR 6\n\n'
         'Winning: If you call Liar and previous bid was false, opponent loses. If bid was true or exact, you lose.\n\n\n\n'
-        '# Output Format\nYou must respond with ONLY the action ID (a single number).\n'
-        'Do NOT include descriptions or explanations.\n\n'
-        'Examples:\n- For action "0 -> roll": respond "0"\n- For action "89 -> a3": respond "89"'
-        '"'
+        + TOOL_GUIDANCE
     )
     if use_hints:
         system_prompt += (
@@ -447,12 +448,8 @@ def _run_episode(
 
         messages.append({"role": "assistant", "content": completion_text})
 
-        # --- Parse action (game-specific: strip EOS / "Action:" prefix) ---
-        action_to_send = completion_text
-        if action_to_send.endswith("</s>"):
-            action_to_send = action_to_send[:-4]
-        if "Action:" in action_to_send:
-            action_to_send = action_to_send.split("Action:")[-1].strip()
+        # --- Parse action (tool call preferred, legacy text as fallback) ---
+        action_to_send = _pvp_extract_action_id(completion_text)
 
         # --- Step environment ---
         is_invalid = False

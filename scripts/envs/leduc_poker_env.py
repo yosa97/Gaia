@@ -15,6 +15,10 @@ from envs.shared_env import (
     init_env_pool,
     rollout_reward_func,  # re-exported for callers
 )
+from envs.pvp_tool_format import (
+    TOOL_GUIDANCE,
+    extract_action_id as _pvp_extract_action_id,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -42,12 +46,7 @@ _BASE_SYSTEM_PROMPT = (
     "Round 2: One public card is revealed. Same actions, but Raise adds 4 chips.\n\n"
     "Winning: Player with best hand wins pot (or last remaining if others fold).\n"
     "Hand ranking (high to low): Pair (private + public match) > High card value (K > Q > J).\n\n\n\n"
-    "# Output Format\n"
-    "You must respond with ONLY the action ID (a single number).\n"
-    "Do NOT include descriptions or explanations.\n\n"
-    "Examples:\n"
-    '- For action "0 -> roll": respond "0"\n'
-    '- For action "89 -> a3": respond "89"'
+    + TOOL_GUIDANCE
 )
 
 _HINT_PROMPT = (
@@ -408,9 +407,10 @@ def _format_observation(raw: str) -> str:
     # Remove leading spaces from action lines ("  N -> X" → "N -> X")
     actions_block = re.sub(r"^  (\d+)", r"\1", actions_block, flags=re.MULTILINE)
 
-    # Normalise the choice prompt to match eval
+    # Normalise the choice prompt to a tool-calling instruction
     actions_block = actions_block.replace(
-        "Your choice (action ID only):", "Your choice (ID only):"
+        "Your choice (action ID only):",
+        "Choose one legal action by calling the game_action tool with its action_id:",
     )
 
     # Assemble in eval order: state, blank, player, actions
@@ -422,13 +422,8 @@ def _format_observation(raw: str) -> str:
 
 
 def _parse_action(completion_text: str) -> str:
-    """Extract action ID from model output."""
-    action = completion_text.strip()
-    if action.endswith("</s>"):
-        action = action[:-4].strip()
-    if "Action:" in action:
-        action = action.split("Action:")[-1].strip()
-    return action
+    """Extract action ID from model output (tool call preferred)."""
+    return _pvp_extract_action_id(completion_text)
 
 
 def _run_episode(

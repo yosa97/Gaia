@@ -17,6 +17,11 @@ from envs.shared_env import (
     remove_reasoning_tags,
     rollout_reward_func,  # re-exported for callers
 )
+from envs.pvp_tool_format import (
+    MINER_SEED,
+    TOOL_GUIDANCE,
+    extract_action_id as _pvp_extract_action_id,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -897,22 +902,10 @@ def parse_game_state(observation: str) -> GameState:
 
 
 def extract_action_id(completion_text: str) -> str:
-    cleaned = remove_reasoning_tags(completion_text)
-    if cleaned.endswith("</s>"):
-        cleaned = cleaned[:-4].strip()
-    # Prefer explicit "Action: N" pattern — most reliable since the system
-    # prompt instructs the model to emit this form.
-    if "Action:" in cleaned:
-        tail = cleaned.split("Action:")[-1].strip()
-        m = re.match(r"\s*(-?\d+)", tail)
-        if m:
-            return m.group(1)
-    # Fallback: last integer in the output. Instruction-tuned models with
-    # chain-of-thought (Wei et al. 2022) typically place the final answer
-    # at the end of the completion after any reasoning prose, so taking
-    # the last integer is safer than the first (e.g. "1. I play 15" → 15).
-    matches = re.findall(r"-?\d+", cleaned)
-    return matches[-1] if matches else cleaned.strip()
+    # The evaluator expects a `game_action` tool call, so parse that first and
+    # only fall back to the legacy "Action: N" / trailing-integer forms (handled
+    # inside the shared parser) while the policy is still learning the format.
+    return _pvp_extract_action_id(completion_text)
 
 
 # ---------------------------------------------------------------------------
@@ -1007,7 +1000,7 @@ def _ensure_initialized(trainer) -> None:
 
     reset_payload = {
         "task_id": GAMES_TO_TASK_ID_RANGE[_SELECTED_GAME][0],
-        "seed": 42,
+        "seed": MINER_SEED,
         "opponent": "mcts",
         "mcts_max_simulations": _MCTS_SIMS,
         "mcts_num_rollouts": 1,
@@ -1058,10 +1051,8 @@ _SYSTEM_PROMPT = (
     "KNOCKING:\n- Gin: 0 deadwood = 25-point bonus\n\n"
     "SCORING: Winner scores difference in deadwood.\n"
     "Card Values: A=1, 2-10=face value, J=11, Q=12, K=13\n\n"
-    "IMPORTANT: Always respond with the action ID number ONLY, never card names.\n\n"
-    "# Output Format\nYou must respond with ONLY the action ID (a single number).\n"
-    "Do NOT include descriptions or explanations.\n\n"
-    'Examples:\n- For action "0 -> roll": respond "0"\n- For action "89 -> a3": respond "89"'
+    "IMPORTANT: Choose ONLY from the listed Legal Actions, identified by their action_id.\n\n"
+    + TOOL_GUIDANCE
 )
 
 _HINT_PROMPT = (

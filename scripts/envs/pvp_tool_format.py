@@ -1,77 +1,73 @@
-"""Tool-calling PvP format for SFT — matches the NEW env-tournament eval
-(core/pvp/bot.py, released 2026-06-13 #1201).
+"""Tool-calling format helpers for PvP environment training.
 
-The eval no longer reads a plain-text action. Each turn it:
-  * builds system  = "You are playing {game}.\n# Game Rules {rules}" + memory
-                      notes + tool guidance,
-  * builds user    = "Current state:\n{state}\n\nYou are Player {pid}.\n"
-                      "Legal actions:\n{id} -> {move}\n...",
-  * passes the `game_action` tool (+ memory tools) with tool_choice="auto",
-  * and reads the model's TOOL CALL: game_action(action_id=N). No tool call
-    (e.g. plain text) => InvalidActionForfeitError => the model LOSES the turn.
+The SN56 PvP evaluation bot (``core/pvp/bot.py``) serves the policy through
+SGLang with the ``qwen25`` tool-call parser. At inference time the bot exposes a
+single ``game_action`` tool and reads the model's reply as a *native* Qwen tool
+call of the form::
 
-So SFT must teach the model to emit a `game_action` tool call, not text. This
-module builds the new system/user prompts and the assistant tool-call message.
+    <tool_call>
+    {"name": "game_action", "arguments": {"action_id": 3}}
+    </tool_call>
 
-State/legal-action reconstruction reuses pvp_format's per-game reformatters
-(the agents' format_state output is unchanged); only the wrapper, the system
-template and the OUTPUT (tool call) differ.
+If the model instead emits a bare action ID (the legacy "respond with ONLY the
+action ID" behaviour) the bot raises ``InvalidActionForfeitError`` and the game
+is forfeited -> score 0. To avoid that, the GRPO rollouts must train the policy
+to speak the *same* tool-call dialect that the evaluator expects.
 
-DESIGN — content-based tool call (intentional, low-risk):
-The assistant turn carries the tool call as the model's NATIVE serialization in
-plain CONTENT — `<tool_call>\n{"name":"game_action","arguments":{"action_id":N}}\n</tool_call>` —
-NOT a structured `tool_calls` field. Reasons:
-  * The tournament base model is Qwen3-4B-Instruct-2507; SGLang serves it with
-    the 'qwen25' tool-call parser, which extracts exactly this <tool_call> JSON
-    block from generated text — so producing that text trains the model to do
-    precisely what the parser reads back.
-  * Because it is plain content, the existing tokenizer/assistant-masking and
-    the whole text pipeline (_clean / dedup / windowing / save) work UNCHANGED.
-    No reliance on how a given tokenizer renders a structured tool_calls field
-    (which could not be checked without the real tokenizer).
-GAME_ACTION_TOOL below mirrors the validator's tool schema for reference / the
-optional smoke test; the SFT pipeline itself does not need to pass it anywhere.
+This module centralises that dialect so every environment shares one source of
+truth:
+
+* :data:`GAME_ACTION_TOOL` - the JSON-schema tool definition handed to
+  ``apply_chat_template(tools=...)`` so the chat template primes Qwen's
+  tool-calling mode exactly as the evaluator does.
+* :data:`TOOL_GUIDANCE` - a system-prompt block, with a literal example, that
+  instructs the model to answer via the tool call. This is kept independent of
+  the template's auto-injected tool block so the instruction reaches the model
+  even on tokenizers whose chat template does not render the tool schema.
+* :func:`extract_action_id` - a tolerant parser that recovers the chosen
+  ``action_id`` from a tool call (tagged JSON, bare JSON, or ``game_action(...)``
+  call syntax) and falls back to the legacy plain-text forms so training never
+  collapses to all-forfeit while the policy is still learning the format.
+* :func:`assistant_action_message` - builds the assistant turn in tool-call
+  form when an environment needs to replay an expert/teacher action into the
+  dialogue history.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
+import json
+import re
+from typing import Optional
 
-import yaml
+# A fixed, miner-specific seed. Kept here so every environment that wants a
+# reproducible-but-distinct RNG stream can import the same value. The concrete
+# number is arbitrary; what matters is that it is *ours* and not the upstream
+# default of 42, so trajectory sampling diverges from any repo sharing the
+# baseline generators.
+MINER_SEED = 716293041
 
-from envs.pvp_format import (
-    reformat_liars_dice_observation,
-    reformat_leduc_poker_observation,
-    reformat_gin_rummy_observation,
-)
 
-_ASSETS_DIR = Path(__file__).resolve().parent / "pvp_assets"
-_PROMPTS_PATH = _ASSETS_DIR / "pvp_game_prompts.yml"
-
-# Verbatim from core/pvp/bot.py:_TOOL_GUIDANCE (the eval appends this to the
-# system prompt). Keeping it identical makes SFT match the eval's instruction.
-_TOOL_GUIDANCE = (
-    "You get ONE response this turn. In it, optionally edit your memory notes, and "
-    "then call game_action with a legal action id to commit your move. If you do not "
-    "call game_action, you forfeit the turn — so always include it."
-)
-
-GAME_ACTION_TOOL_NAME = "game_action"
-
-# Tool schema, shape-matched to core/pvp/tools.build_game_action_tool ->
-# FunctionSchema.to_openai(). Reference only (mirrors what the validator passes
-# at eval); the content-based SFT pipeline does NOT pass this to the tokenizer.
+# ---------------------------------------------------------------------------
+# Tool schema handed to apply_chat_template(tools=[GAME_ACTION_TOOL])
+# ---------------------------------------------------------------------------
 GAME_ACTION_TOOL = {
     "type": "function",
     "function": {
-        "name": GAME_ACTION_TOOL_NAME,
-        "description": "Commit your move and end your turn.",
+        "name": "game_action",
+        "description": (
+            "Submit the action you choose for the current game state. Call this "
+            "exactly once per turn, passing the integer action_id of one of the "
+            "legal actions listed in the observation."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "action_id": {
                     "type": "integer",
-                    "description": "The id of the legal action to play.",
+                    "description": (
+                        "The integer ID of the legal action you choose to play "
+                        "this turn."
+                    ),
                 }
             },
             "required": ["action_id"],
@@ -79,94 +75,122 @@ GAME_ACTION_TOOL = {
     },
 }
 
-
-def _load_prompts() -> dict:
-    with open(_PROMPTS_PATH) as handle:
-        return yaml.safe_load(handle)
+# Convenience: the list form most callers want to assign to ``trainer.tools``.
+GAME_ACTION_TOOLS = [GAME_ACTION_TOOL]
 
 
-def build_system_prompt(game_name: str) -> str:
-    """NEW system prompt: "You are playing {game}.\n# Game Rules {rules}" + tool
-    guidance. (The eval also injects a dynamic memory-notes block; we omit it for
-    SFT since it is empty/stateful — the model still learns to call game_action.)
+# ---------------------------------------------------------------------------
+# System-prompt guidance block (replaces the legacy "ONLY the action ID" text)
+# ---------------------------------------------------------------------------
+TOOL_GUIDANCE = (
+    "# Output Format\n"
+    "You MUST respond by calling the `game_action` tool with the action_id of a "
+    "legal action. Emit the call as a native tool call in exactly this form:\n"
+    "<tool_call>\n"
+    '{"name": "game_action", "arguments": {"action_id": N}}\n'
+    "</tool_call>\n"
+    "Replace N with the integer ID of your chosen legal action. Do NOT print the "
+    "action ID as bare text, and do NOT add any prose, explanation, or card "
+    "names outside the tool call.\n"
+    "Example - to choose the legal action whose ID is 2, respond with exactly:\n"
+    "<tool_call>\n"
+    '{"name": "game_action", "arguments": {"action_id": 2}}\n'
+    "</tool_call>"
+)
+
+
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
+_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+_ACTION_ID_JSON_RE = re.compile(r'"action_id"\s*:\s*(-?\d+)')
+_GAME_ACTION_CALL_RE = re.compile(r"game_action\s*\(\s*action_id\s*=\s*(-?\d+)\s*\)")
+_THOUGHT_RE = re.compile(r"<thought>.*?</thought>", re.DOTALL)
+
+
+def _action_id_from_tool_call(text: str) -> Optional[str]:
+    """Return the action_id encoded as a tool call, or ``None`` if absent.
+
+    Handles, in order of preference:
+      1. ``<tool_call>{...}</tool_call>`` wrapped JSON (the canonical Qwen form).
+      2. Bare ``{"name": "game_action", "arguments": {"action_id": N}}`` JSON.
+      3. ``game_action(action_id=N)`` Python-call syntax.
     """
-    prompts = _load_prompts()
-    rules_key = f"{game_name}_rules"
-    if rules_key not in prompts:
-        raise ValueError(f"Unknown game: {game_name} (no {rules_key})")
-    base = prompts["system_prompt_template"].format(game_name=game_name, rules=prompts[rules_key])
-    return f"{base}\n\n{_TOOL_GUIDANCE}"
+    # 1) Canonical tagged tool call. Parse the JSON body when well-formed; fall
+    #    back to a regex on the body when the model emitted slightly malformed
+    #    JSON (trailing commas, single quotes) so we still recover the id.
+    for body in _TOOL_CALL_BLOCK_RE.findall(text):
+        try:
+            obj = json.loads(body)
+            args = obj.get("arguments", obj)
+            if isinstance(args, str):
+                args = json.loads(args)
+            if "action_id" in args:
+                return str(int(args["action_id"]))
+        except (ValueError, TypeError):
+            pass
+        m = _ACTION_ID_JSON_RE.search(body)
+        if m:
+            return m.group(1)
+
+    # 2) Bare JSON object naming the tool, without the <tool_call> wrapper.
+    if "game_action" in text:
+        m = _ACTION_ID_JSON_RE.search(text)
+        if m:
+            return m.group(1)
+        m = _GAME_ACTION_CALL_RE.search(text)
+        if m:
+            return m.group(1)
+
+    return None
 
 
-def build_user_prompt(state_desc: str, player_id: int, legal_actions_block: str) -> str:
-    """NEW user prompt — matches core/pvp/bot.LLMBot._user_prompt EXACTLY
-    (lowercase 'Current state' / 'Legal actions'; NO 'Your choice' suffix)."""
-    return (
-        f"Current state:\n{state_desc}\n\n"
-        f"You are Player {player_id}.\n"
-        f"Legal actions:\n{legal_actions_block}"
-    )
+def extract_action_id(completion_text: str) -> str:
+    """Recover the chosen action ID from a model completion.
+
+    Preference order: a valid ``game_action`` tool call first (matching the
+    evaluator), then the legacy ``Action: N`` marker, then the trailing integer.
+    Always returns a string (possibly the cleaned text) so callers behave like
+    the original plain-text parsers.
+    """
+    if completion_text is None:
+        return ""
+
+    tool_id = _action_id_from_tool_call(completion_text)
+    if tool_id is not None:
+        return tool_id
+
+    # --- legacy fallbacks (kept so training is robust while the policy is still
+    # learning the tool-call format) ---
+    cleaned = _THOUGHT_RE.sub("", completion_text).strip()
+    if cleaned.endswith("</s>"):
+        cleaned = cleaned[:-4].strip()
+    if "Action:" in cleaned:
+        tail = cleaned.split("Action:")[-1].strip()
+        m = re.match(r"\s*(-?\d+)", tail)
+        if m:
+            return m.group(1)
+    matches = re.findall(r"-?\d+", cleaned)
+    return matches[-1] if matches else cleaned.strip()
 
 
-import json as _json
+def is_valid_tool_call(completion_text: str) -> bool:
+    """True iff the completion contains a parseable ``game_action`` tool call.
+
+    Useful for format-rate metrics / reward shaping: the evaluator only accepts
+    completions for which this is True.
+    """
+    return _action_id_from_tool_call(completion_text or "") is not None
 
 
 def assistant_action_message(action_id) -> dict:
-    """Assistant turn that COMMITS the move via a game_action tool call.
+    """Build an assistant turn that submits ``action_id`` as a tool call.
 
-    We put the tool call in the assistant CONTENT as the model's NATIVE
-    serialization (Qwen / Hermes `<tool_call>{...}</tool_call>`), NOT in a
-    `tool_calls` field. Why:
-      * The tournament base model is Qwen3-4B-Instruct-2507; SGLang serves it
-        with the 'qwen25' tool-call parser, which extracts exactly this
-        <tool_call> JSON block from the generated text.
-      * Keeping it as plain content means the existing assistant-masking and the
-        whole text pipeline (_clean / dedup / windowing / save) work unchanged —
-        no dependency on how a tokenizer renders a structured `tool_calls` field
-        (which cannot be verified without the real tokenizer).
-    At eval, the model emits this same block, SGLang parses action_id -> a legal
-    move is committed instead of a forfeit.
+    Used by environments that replay an expert/teacher move into the message
+    history so the recorded assistant turns match the inference-time dialect.
     """
-    try:
-        aid = int(action_id)
-    except (TypeError, ValueError):
-        aid = action_id
-    payload = _json.dumps({"name": GAME_ACTION_TOOL_NAME, "arguments": {"action_id": aid}})
+    payload = {"name": "game_action", "arguments": {"action_id": int(action_id)}}
     return {
         "role": "assistant",
-        "content": f"<tool_call>\n{payload}\n</tool_call>",
+        "content": "<tool_call>\n" + json.dumps(payload) + "\n</tool_call>",
     }
-
-
-def extract_action_id(assistant_content: str):
-    """Pull the action_id back out of a native tool-call assistant content
-    (used by data-balancing). Returns str(action_id) or '' if not parseable."""
-    import re as _re
-    m = _re.search(r'"action_id"\s*:\s*(-?\d+)', assistant_content or "")
-    return m.group(1) if m else ""
-
-
-# ---------------------------------------------------------------------------
-# Per-game user-prompt builders (reuse pvp_format reformatters, new assembly)
-# ---------------------------------------------------------------------------
-
-def build_user_prompt_liars_dice(env_obs: str, player_id: int = 0) -> str:
-    state_desc, actions = reformat_liars_dice_observation(env_obs, player_id)
-    return build_user_prompt(state_desc, player_id, actions)
-
-
-def build_user_prompt_leduc_poker(env_obs: str, player_id: int = 0) -> str:
-    state_desc, actions = reformat_leduc_poker_observation(env_obs, player_id)
-    return build_user_prompt(state_desc, player_id, actions)
-
-
-def build_user_prompt_gin_rummy(env_obs: str, player_id: int = 0) -> str:
-    state_desc, actions = reformat_gin_rummy_observation(env_obs, player_id)
-    return build_user_prompt(state_desc, player_id, actions)
-
-
-# System prompts (cached at import)
-SYSTEM_PROMPT_LIARS_DICE = build_system_prompt("liars_dice") if _PROMPTS_PATH.exists() else None
-SYSTEM_PROMPT_LEDUC_POKER = build_system_prompt("leduc_poker") if _PROMPTS_PATH.exists() else None
-SYSTEM_PROMPT_GIN_RUMMY = build_system_prompt("gin_rummy") if _PROMPTS_PATH.exists() else None
-SYSTEM_PROMPT_OTHELLO = build_system_prompt("othello") if _PROMPTS_PATH.exists() else None
