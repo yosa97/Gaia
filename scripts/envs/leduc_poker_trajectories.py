@@ -32,6 +32,14 @@ from envs.pvp_tool_format import (
     build_user_prompt_leduc_poker as build_pvp_user_prompt_leduc_poker,
     assistant_action_message,
 )
+from envs.pvp_memory_tools import (
+    default_memories,
+    eval_system_prompt,
+    build_assistant_turn,
+    LONGTERM_NOTE,
+)
+
+_MEMORY_TRAINING = os.environ.get("PVP_MEMORY_TRAINING", "0") == "1"
 
 _TIMEOUT = 2400
 # Dedup divergence: miner-unique seed for the per-game random action RNG. The
@@ -96,20 +104,32 @@ def generate_random_episode(
     # from teammates using the global RNG on the same game_id).
     rng = random.Random((game_id * 0x9E3779B1) ^ _MINER_SEED)
 
+    memories = default_memories() if _MEMORY_TRAINING else None
+    system_content = (
+        eval_system_prompt("leduc_poker", memories) if _MEMORY_TRAINING else _SYSTEM_PROMPT
+    )
+
     user_prompt = build_pvp_user_prompt_leduc_poker(raw_observation, player_id=player_id)
     messages: list[dict] = [
-        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "system", "content": system_content},
         {"role": "user",   "content": user_prompt},
     ]
 
     final_reward = 0.0
 
-    for _ in range(max_turn):
+    for _turn_idx in range(max_turn):
         # Random action from RAW observation (legal action IDs are in both
         # raw and PvP-formatted observations — the IDs themselves are unchanged)
         action = _random_action(raw_observation, rng=rng)
-        # SFT target = native game_action tool call (new eval).
-        messages.append(assistant_action_message(action))
+        # SFT target = native game_action tool call (new eval). First turn also
+        # writes one grounded long_term opponent note (memory mode only).
+        if _MEMORY_TRAINING:
+            mem_ops = (
+                [("long_term_append", 1, LONGTERM_NOTE["leduc_poker"])] if _turn_idx == 0 else None
+            )
+            messages.append(build_assistant_turn(action, memory_ops=mem_ops))
+        else:
+            messages.append(assistant_action_message(action))
 
         try:
             step_res = requests.post(

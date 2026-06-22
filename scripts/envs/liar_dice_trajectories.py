@@ -28,6 +28,16 @@ from envs.pvp_tool_format import (
     build_user_prompt_liars_dice as build_pvp_user_prompt_liars_dice,
     assistant_action_message,
 )
+# Memory-tool training (opt-in via PVP_MEMORY_TRAINING=1, default on): emit
+# eval-aligned trajectories that also teach the long_term memory-write format.
+from envs.pvp_memory_tools import (
+    default_memories,
+    eval_system_prompt,
+    build_assistant_turn,
+    LONGTERM_NOTE,
+)
+
+_MEMORY_TRAINING = os.environ.get("PVP_MEMORY_TRAINING", "0") == "1"
 
 _TIMEOUT = 2400
 # Dedup divergence: a miner-unique seed for the per-game action RNG. Teammates
@@ -119,17 +129,32 @@ def generate_expert_episode(
     # are reproducible, but different from teammates using the same game_id.
     rng = random.Random((game_id * 0x9E3779B1) ^ _MINER_SEED)
 
+    # Memory-augmented mode: per-episode memory areas + eval-aligned system
+    # prompt (rules + memory block + tool guidance). Baseline mode is unchanged.
+    memories = default_memories() if _MEMORY_TRAINING else None
+    system_content = (
+        eval_system_prompt("liars_dice", memories) if _MEMORY_TRAINING else _SYSTEM_PROMPT
+    )
+
     user_prompt = build_pvp_user_prompt_liars_dice(observation, player_id=player_id)
     messages: list[dict] = [
-        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "system", "content": system_content},
         {"role": "user",   "content": user_prompt},
     ]
 
-    for _ in range(max_turn):
+    for _turn_idx in range(max_turn):
         action = get_expert_action(messages, rng=rng)
         # SFT target = native game_action tool call (new eval). The env server
-        # still receives the raw action id below.
-        messages.append(assistant_action_message(action))
+        # still receives the raw action id below. In memory mode, the first turn
+        # also writes one grounded long_term opponent note so the policy learns
+        # the memory-write format alongside the move.
+        if _MEMORY_TRAINING:
+            mem_ops = (
+                [("long_term_append", 1, LONGTERM_NOTE["liars_dice"])] if _turn_idx == 0 else None
+            )
+            messages.append(build_assistant_turn(action, memory_ops=mem_ops))
+        else:
+            messages.append(assistant_action_message(action))
 
         try:
             step_res = requests.post(

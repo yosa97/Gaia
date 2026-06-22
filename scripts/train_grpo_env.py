@@ -43,6 +43,7 @@ from model_utility import is_reasoning_tokenizer
 from envs import GAMES_TO_TASK_ID_RANGE
 from envs.env_configs import EnvTrainingConfig, get_env_config
 from envs.pvp_tool_format import GAME_ACTION_TOOLS
+from envs.pvp_memory_tools import MEMORY_AND_GAME_TOOLS
 
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
 STANDARD_GRPO_EXTRA_COLUMN = "extra_data"
@@ -1179,8 +1180,19 @@ def main():
         # trained to answer in exactly the dialect the evaluator expects. The
         # masking paths in ActionMaskedGRPOTrainer already key off `self.tools`.
         if training_args.environment_name in GAMES_TO_TASK_ID_RANGE:
-            trainer.tools = GAME_ACTION_TOOLS
-            print(f"Enabled game_action tool-calling for env={training_args.environment_name}")
+            # Expose the SAME tool surface the evaluator provides: the memory
+            # tools (working/long_term rewrite/append) plus game_action. The
+            # chat template renders them so the policy is trained on the exact
+            # tool set it meets at eval and can learn to externalise opponent
+            # reads into persistent memory. game_action parsing is unchanged;
+            # memory tool calls are optional and never affect the move parse.
+            # Set PVP_MEMORY_TRAINING=0 to fall back to game_action only.
+            if os.environ.get("PVP_MEMORY_TRAINING", "0") == "1":
+                trainer.tools = MEMORY_AND_GAME_TOOLS
+                print(f"Enabled game_action + memory tools for env={training_args.environment_name}")
+            else:
+                trainer.tools = GAME_ACTION_TOOLS
+                print(f"Enabled game_action tool-calling for env={training_args.environment_name}")
 
         trainer.train()
     except Exception as e:

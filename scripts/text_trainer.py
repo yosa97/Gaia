@@ -196,10 +196,13 @@ def run_training(
             with open(log_path, "w") as f:
                 f.write("STARTING TRAINING")
 
+        # wandb rejects run IDs containing :;,#?/' — expected_repo_name is often a
+        # HF repo path like "user/model", so sanitise any unsafe char to "-".
+        _wandb_run_id = re.sub(r"[^A-Za-z0-9_.-]", "-", f"{task_id}_{expected_repo_name}")
         training_env_vars = {
             "WANDB_MODE": wandb_mode,
-            "WANDB_RUN_ID": f"{task_id}_{expected_repo_name}",
-            "WANDB_NAME": f"{task_id}_{expected_repo_name}",
+            "WANDB_RUN_ID": _wandb_run_id,
+            "WANDB_NAME": _wandb_run_id,
         }
         
         # Add API key - wandb expects WANDB_API_KEY

@@ -38,6 +38,14 @@ from envs.pvp_tool_format import (
     build_user_prompt_gin_rummy as build_pvp_user_prompt_gin_rummy,
     assistant_action_message,
 )
+from envs.pvp_memory_tools import (
+    default_memories,
+    eval_system_prompt,
+    build_assistant_turn,
+    LONGTERM_NOTE,
+)
+
+_MEMORY_TRAINING = os.environ.get("PVP_MEMORY_TRAINING", "0") == "1"
 
 _TIMEOUT = 2400
 # Dedup divergence: gin's expert is deterministic (optimal-deadwood DP), so its
@@ -471,20 +479,32 @@ def generate_expert_episode(
     # PvP eval alternates player perspectives. Use game_id parity.
     player_id = game_id % 2
 
+    memories = default_memories() if _MEMORY_TRAINING else None
+    system_content = (
+        eval_system_prompt("gin_rummy", memories) if _MEMORY_TRAINING else _SYSTEM_PROMPT
+    )
+
     user_prompt = build_pvp_user_prompt_gin_rummy(raw_observation, player_id=player_id)
     messages: list[dict] = [
-        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "system", "content": system_content},
         {"role": "user",   "content": user_prompt},
     ]
 
     # Side-channel: keep latest raw obs for the expert parser
     _last_raw_obs = raw_observation
 
-    for _ in range(max_turn):
+    for _turn_idx in range(max_turn):
         # Expert reads RAW env observation (not PvP-reformatted)
         action = _get_expert_action_from_raw(_last_raw_obs)
-        # SFT target = native game_action tool call (new eval).
-        messages.append(assistant_action_message(action))
+        # SFT target = native game_action tool call (new eval). First turn also
+        # writes one grounded long_term opponent note (memory mode only).
+        if _MEMORY_TRAINING:
+            mem_ops = (
+                [("long_term_append", 1, LONGTERM_NOTE["gin_rummy"])] if _turn_idx == 0 else None
+            )
+            messages.append(build_assistant_turn(action, memory_ops=mem_ops))
+        else:
+            messages.append(assistant_action_message(action))
 
         try:
             step_res = requests.post(
