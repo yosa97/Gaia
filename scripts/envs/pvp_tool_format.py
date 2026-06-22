@@ -39,6 +39,16 @@ import json
 import re
 from typing import Optional
 
+# Observation reformatters + cached eval rules live in pvp_format (parsing only,
+# no envs-package dependency → no circular import). The SFT trajectory builders
+# reuse these to turn a raw env observation into a tool-calling prompt.
+from envs.pvp_format import (
+    reformat_liars_dice_observation as _reformat_liars_dice,
+    reformat_leduc_poker_observation as _reformat_leduc_poker,
+    reformat_gin_rummy_observation as _reformat_gin_rummy,
+    _load_prompts as _load_pvp_prompts,
+)
+
 # A fixed, miner-specific seed. Kept here so every environment that wants a
 # reproducible-but-distinct RNG stream can import the same value. The concrete
 # number is arbitrary; what matters is that it is *ours* and not the upstream
@@ -194,3 +204,66 @@ def assistant_action_message(action_id) -> dict:
         "role": "assistant",
         "content": "<tool_call>\n" + json.dumps(payload) + "\n</tool_call>",
     }
+
+
+# ---------------------------------------------------------------------------
+# SFT trajectory prompt helpers
+# ---------------------------------------------------------------------------
+# The SFT expert-trajectory generators (liar_dice_trajectories.py,
+# gin_rummy_trajectories.py, leduc_poker_trajectories.py) build training
+# dialogues in the SAME tool-calling dialect the evaluator expects. They need a
+# per-game system prompt and a per-game user-prompt builder. We reuse the
+# observation reformatters from pvp_format (raw env obs -> state_desc +
+# legal-actions block) and wrap them in the tool-calling format defined above,
+# so the SFT assistant targets match exactly what the policy must emit at eval.
+
+
+def build_system_prompt(game_name: str) -> str:
+    """Per-game system prompt: canonical game rules + tool-calling output format.
+
+    Rules are taken from the cached eval prompt YAML (matching the evaluator's
+    wording); the output-format section is :data:`TOOL_GUIDANCE` rather than the
+    legacy "respond with ONLY the action ID" text. Falls back to a rules-less
+    prompt if the YAML is unavailable, so importing this module never fails.
+    """
+    try:
+        rules = (_load_pvp_prompts().get(f"{game_name}_rules", "") or "").strip()
+    except Exception:
+        rules = ""
+    rules_block = f"# Game Rules\n{rules}\n\n\n\n" if rules else ""
+    return f"You are playing {game_name}.\n\n{rules_block}" + TOOL_GUIDANCE
+
+
+SYSTEM_PROMPT_LIARS_DICE  = build_system_prompt("liars_dice")
+SYSTEM_PROMPT_LEDUC_POKER = build_system_prompt("leduc_poker")
+SYSTEM_PROMPT_GIN_RUMMY   = build_system_prompt("gin_rummy")
+SYSTEM_PROMPT_OTHELLO     = build_system_prompt("othello")
+
+
+def build_user_prompt(state_desc: str, player_id: int, legal_actions_block: str) -> str:
+    """Assemble a tool-calling user prompt: state + player + legal actions.
+
+    Mirrors the eval observation layout (Current State / Legal Actions) but ends
+    with a tool-call instruction instead of the legacy "Your choice (ID only):".
+    """
+    return (
+        f"Current State:\n{state_desc}\n\n"
+        f"You are Player {player_id}.\n"
+        f"Legal Actions:\n{legal_actions_block}\n\n"
+        "Choose one legal action by calling the game_action tool with its action_id."
+    )
+
+
+def build_user_prompt_liars_dice(env_obs: str, player_id: int = 0) -> str:
+    state_desc, actions = _reformat_liars_dice(env_obs, player_id)
+    return build_user_prompt(state_desc, player_id, actions)
+
+
+def build_user_prompt_leduc_poker(env_obs: str, player_id: int = 0) -> str:
+    state_desc, actions = _reformat_leduc_poker(env_obs, player_id)
+    return build_user_prompt(state_desc, player_id, actions)
+
+
+def build_user_prompt_gin_rummy(env_obs: str, player_id: int = 0) -> str:
+    state_desc, actions = _reformat_gin_rummy(env_obs, player_id)
+    return build_user_prompt(state_desc, player_id, actions)
