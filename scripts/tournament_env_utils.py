@@ -311,7 +311,7 @@ def adjust_curriculum_from_baseline(
         return False
     cur = int(getattr(args, "initial_max_turn") or 0)
     # Final max turn per env (mirrors curriculum factories):
-    final_map = {"gin_rummy": 30, "leduc_poker": 10, "liars_dice": 15}
+    final_map = {"gin_rummy": 30, "leduc_poker": 10, "liars_dice": 15, "othello": 64}
     final_max = final_map.get(env_name, max(cur * 2, 4))
     new_val = max(cur, (cur + final_max) // 2)
     if new_val == cur:

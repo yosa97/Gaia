@@ -125,7 +125,7 @@ echo "[env] Using environment servers: $ENV_SERVER_URLS"
 # Pre-flight: when the payload contains OpenSpiel games, verify at least one
 # env server is actually listening BEFORE downloading models / booting the
 # trainer. host.docker.internal == this host, so test via localhost here.
-if echo "$DATASET_TYPE" | grep -qE "liars_dice|gin_rummy|leduc_poker"; then
+if echo "$DATASET_TYPE" | grep -qE "liars_dice|gin_rummy|leduc_poker|othello"; then
   reachable=0
   IFS=',' read -ra _urls <<< "$ENV_SERVER_URLS"
   for u in "${_urls[@]}"; do

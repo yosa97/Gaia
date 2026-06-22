@@ -78,6 +78,12 @@ from envs.liar_dice_env import (
     rollout_reward_func                                        as _liar_reward,
     _curriculum_factory                                        as _liar_curriculum,
 )
+from envs.othello_env import (
+    rollout_full_prompt_and_completion_parallelized_curriculum as _othello_rollout_full,
+    rollout_last_prompt_and_completion_parallelized_curriculum as _othello_rollout_last,
+    rollout_reward_func                                        as _othello_reward,
+    _curriculum_factory                                        as _othello_curriculum,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +225,20 @@ _REGISTRY: dict[str, EnvTrainingConfig] = {
         num_generations=8,
         temperature=2.0,
         top_k=5,
+    ),
+    "othello": EnvTrainingConfig(
+        rollout_full=_othello_rollout_full,
+        rollout_last=_othello_rollout_last,
+        reward_func=_othello_reward,
+        curriculum_factory=_othello_curriculum,
+        # PvP board game: long episodes (up to ~60 placements), no MCTS
+        # shortcircuit, so allocate a larger context window and more rollout
+        # diversity — mirrors the other PvP opponent-modeling envs.
+        vllm_max_model_length=12288,
+        num_generations=8,
+        reasoning=ModeConfig(initial_max_turn=20, rollouts_per_stage=100),
+        no_mask=ModeConfig(initial_max_turn=20, rollouts_per_stage=100),
+        full_prompt=ModeConfig(initial_max_turn=20, rollouts_per_stage=100),
     ),
     "alfworld": EnvTrainingConfig(
         rollout_full=_alf_rollout_full,

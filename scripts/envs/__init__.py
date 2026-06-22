@@ -24,6 +24,11 @@ from envs.leduc_poker_env import (
     rollout_last_prompt_and_completion_parallelized_curriculum as leduc_poker_rollout_last_prompt_and_completion_parallelized_curriculum,
     rollout_reward_func as leduc_poker_rollout_reward_func,
 )
+from envs.othello_env import (
+    rollout_full_prompt_and_completion_parallelized_curriculum as othello_rollout_full_prompt_and_completion_parallelized_curriculum,
+    rollout_last_prompt_and_completion_parallelized_curriculum as othello_rollout_last_prompt_and_completion_parallelized_curriculum,
+    rollout_reward_func as othello_rollout_reward_func,
+)
 from envs.env_configs import EnvTrainingConfig, get_env_config
 from envs.shared_env import GAMES_TO_TASK_ID_RANGE
 from envs.sft_env_configs import supports_sft
@@ -45,6 +50,9 @@ __all__ = [
     "leduc_poker_rollout_full_prompt_and_completion_parallelized_curriculum",
     "leduc_poker_rollout_last_prompt_and_completion_parallelized_curriculum",
     "leduc_poker_rollout_reward_func",
+    "othello_rollout_full_prompt_and_completion_parallelized_curriculum",
+    "othello_rollout_last_prompt_and_completion_parallelized_curriculum",
+    "othello_rollout_reward_func",
     "EnvTrainingConfig",
     "get_env_config",
     "GAMES_TO_TASK_ID_RANGE",
