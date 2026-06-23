@@ -162,6 +162,10 @@ LONGTERM_NOTE = {
         "Opponent read: note whether they grab edges/corners early; prioritise "
         "corners, avoid squares adjacent to empty corners, and value mobility."
     ),
+    "goofspiel": (
+        "Opponent read: track which bid cards they have spent; commit high cards "
+        "to high-value prizes and save low cards for low prizes."
+    ),
 }
 
 

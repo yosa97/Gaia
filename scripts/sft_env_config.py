@@ -307,6 +307,16 @@ _ENV_GENERATE_ARGS: dict[str, dict] = {
     # per-env time budget is never the binding constraint.
     "intercode":   {"num_games": 11_000, "max_turn": 1,
                     "multi_env_min": 4_000},
+    # goofspiel: short simultaneous-bid game (max ~13 turns). Proportional-bid
+    # expert; plenty of games for a dense dataset.
+    "goofspiel":   {"num_games":  60_000, "max_turn":  14,
+                    "window_turns": 6,  "window_step": 2,
+                    "multi_env_min": 15_000},
+    # othello: up to ~60 placements/game; positional expert. Fewer games (longer
+    # episodes) but each yields many windows.
+    "othello":     {"num_games":  20_000, "max_turn":  64,
+                    "window_turns": 12, "window_step": 5,
+                    "multi_env_min":  8_000},
 }
 
 # Global fallback floor for envs without per-env multi_env_min

@@ -23,11 +23,17 @@ from typing import Callable
 from envs.liar_dice_trajectories   import generate_expert_episode as _liar_gen
 from envs.leduc_poker_trajectories import generate_expert_episode as _leduc_gen
 from envs.gin_rummy_trajectories   import generate_expert_episode as _gin_gen
+from envs.goof_spiel_trajectories  import generate_expert_episode as _goof_gen
+from envs.othello_trajectories     import generate_expert_episode as _othello_gen
 
 _SFT_REGISTRY: dict[str, Callable] = {
     "liars_dice":  _liar_gen,
     "leduc_poker": _leduc_gen,
     "gin_rummy":   _gin_gen,
+    # Tournament env names (validator sends "goofspiel", "othello"). Without
+    # these, a composite task containing them dropped both -> ValueError -> 0.
+    "goofspiel":   _goof_gen,
+    "othello":     _othello_gen,
 }
 
 # Envs whose SFT data comes from a standalone dataset builder instead of

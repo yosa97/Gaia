@@ -257,6 +257,9 @@ _VARIANT_OVERRIDES: dict[str, str] = {
      "gin_rummy":   "gin_rummy_opponent_modeling",
      "liars_dice":  "liars_dice_opponent_modeling",
      "leduc_poker": "leduc_poker_opponent_modeling",
+     # Tournament names this env "goofspiel"; the GRPO registry key is
+     # "goof_spiel". Map it so get_env_config("goofspiel") resolves too.
+     "goofspiel":   "goof_spiel",
 }
 
 

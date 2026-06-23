@@ -12,6 +12,9 @@ import requests
 
 GAMES_TO_TASK_ID_RANGE: dict[str, tuple[int, int]] = {
     "goof_spiel":  (0,         99_999_999),
+    # Tournament/eval names this env "goofspiel" (no underscore); alias it to the
+    # same task-id range so the validator's env name resolves everywhere.
+    "goofspiel":   (0,         99_999_999),
     "liars_dice":  (100000000, 199_999_999),
     "leduc_poker": (200000000, 299_999_999),
     "gin_rummy":   (300000000, 399_999_999),
